@@ -1,0 +1,55 @@
+{
+  "unit": "U76",
+  "name": "Retire overdue unclaimed one-shot jobs",
+  "defect_scenario": "UP.DS03",
+  "commands": [
+    {
+      "step": "RED_PHASE_BOUNDARY",
+      "command": "cargo test --test test_voice_cron persisted_oneshot_past_grace_is_retired -- --exact --nocapture",
+      "exit_code": 101,
+      "log": ".omo/evidence/hermes-parity-20260905/U76-resume-red.log",
+      "verified": true
+    },
+    {
+      "step": "GREEN_PHASE_BOUNDARY",
+      "command": "cargo test --test test_voice_cron persisted_oneshot_past_grace_is_retired -- --exact --nocapture",
+      "exit_code": 0,
+      "log": ".omo/evidence/hermes-parity-20260905/U76-resume-green.log",
+      "verified": true
+    },
+    {
+      "step": "RED_PHASE_RACE_CAS",
+      "command": "cargo test --test test_voice_cron overdue_oneshot_retirement_is_atomic_against_concurrent_claim_and_rearm -- --exact --nocapture",
+      "exit_code": 101,
+      "log": ".omo/evidence/hermes-parity-20260905/U76-resume-race-red.log",
+      "verified": true
+    },
+    {
+      "step": "GREEN_PHASE_RACE_CAS",
+      "command": "cargo test --test test_voice_cron overdue_oneshot_retirement_is_atomic_against_concurrent_claim_and_rearm -- --exact --nocapture",
+      "exit_code": 0,
+      "log": ".omo/evidence/hermes-parity-20260905/U76-resume-race-green.log",
+      "verified": true
+    },
+    {
+      "step": "ADJACENT_TESTS",
+      "command": "cargo test --test test_voice_cron && cargo test --test test_cron_schedule_parity --test test_cron_boundary_parity && cargo test --lib cron::",
+      "exit_code": 0,
+      "log": ".omo/evidence/hermes-parity-20260905/U76-resume-adjacent-cron.log",
+      "verified": true
+    },
+    {
+      "step": "BUILD",
+      "command": "cargo build",
+      "exit_code": 0,
+      "log": ".omo/evidence/hermes-parity-20260905/U76-resume-build.log",
+      "verified": true
+    },
+    {
+      "step": "RUSTFMT",
+      "command": "rustfmt --edition 2021 --check src/cron/scheduler.rs tests/test_voice_cron.rs",
+      "exit_code": 0,
+      "verified": true
+    }
+  ]
+}

@@ -119,7 +119,7 @@ cargo run -- migrate --dry-run
 cargo run -- migrate
 ```
 
-The compiled binary accepts the same subcommand (`omon-gateway migrate`). The default flow runs in this order:
+The compiled binary accepts the same subcommand (`omo-gateway migrate`). The default flow runs in this order:
 
 1. Import Hermes configuration from `$HERMES_HOME` (default: `~/.hermes`), including the root `.env`, `config.yaml`, and profile `.env` files.
 2. Authoritatively rewrite the gateway `.env`. If `.env` already exists, its complete previous contents are first copied to `.env.bak-<timestamp>`.
@@ -133,9 +133,9 @@ The backups and `.disabled` LaunchAgent files make the file cutover reversible; 
 
 | Command | Behavior |
 |---|---|
-| `omon-gateway migrate` | Full import and cutover. Writes the authoritative `.env`, imports cron jobs, empties backed-up Hermes cron stores after verification, and stops/disables the Hermes gateway. |
-| `omon-gateway migrate --dry-run` | Read-only projection of configuration, cron, process, and LaunchAgent changes. It performs zero writes and does not run cron synchronization or destructive side effects. |
-| `omon-gateway migrate --no-cutover` | Import only. Writes the gateway `.env` and synchronizes cron jobs, but does not empty Hermes cron stores or stop/disable Hermes services. |
+| `omo-gateway migrate` | Full import and cutover. Writes the authoritative `.env`, imports cron jobs, empties backed-up Hermes cron stores after verification, and stops/disables the Hermes gateway. |
+| `omo-gateway migrate --dry-run` | Read-only projection of configuration, cron, process, and LaunchAgent changes. It performs zero writes and does not run cron synchronization or destructive side effects. |
+| `omo-gateway migrate --no-cutover` | Import only. Writes the gateway `.env` and synchronizes cron jobs, but does not empty Hermes cron stores or stop/disable Hermes services. |
 
 Use `--no-cutover` when Hermes must remain available during a staged migration. Do not run both gateways against the same bot tokens and cron schedules after the final cutover.
 
@@ -150,12 +150,15 @@ The command performs these mappings automatically; this table is a reference, no
 | `$HERMES_HOME/.env` or profile `.env` | `DISCORD_ALLOWED_USERS` | `DISCORD_ALLOWED_USERS` | The root value wins; otherwise the first profile value is used. |
 | `$HERMES_HOME/.env` or profile `.env` | `DISCORD_FREE_RESPONSE_CHANNELS` | `DISCORD_FREE_RESPONSE_CHANNELS` | The root value wins; otherwise the first profile value is used. |
 | `$HERMES_HOME/.env` or profile `.env` | `DISCORD_HOME_CHANNEL` | `DISCORD_HOME_CHANNEL` | Preserved; the gateway also treats these as free-response channels at runtime. |
-| `$HERMES_HOME/config.yaml` | `model.default` | `DEFAULT_MODEL` | Preserves the configured model identifier. |
+| `$HERMES_HOME/.env` or `config.yaml` | `DISCORD_ALLOWED_CHANNELS` or `discord.allowed_channels` | `DISCORD_ALLOWED_CHANNELS` | Preserves allowed channel filters. |
+| `$HERMES_HOME/.env` or `config.yaml` | `DISCORD_IGNORED_CHANNELS` or `discord.ignored_channels` | `DISCORD_IGNORED_CHANNELS` | Preserves ignored channel filters. |
+| `$HERMES_HOME/.env` or `config.yaml` | `DISCORD_ALLOWED_ROLES` or `discord.allowed_roles` | `DISCORD_ALLOWED_ROLES` | Preserves authorized Discord role IDs. |
+| `$HERMES_HOME/config.yaml` | `model.default` / `model.name` / `model.model` | `DEFAULT_MODEL` | Preserves the configured model identifier. |
 | `$HERMES_HOME/config.yaml` | `model.base_url`, `model.api_key` | `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` | Used when the default model name starts with `claude`. |
 | `$HERMES_HOME/config.yaml` | `model.base_url`, `model.api_key` | `OPENAI_API_BASE`, `OPENAI_API_KEY` | Used for other model names. |
 | `$HERMES_HOME/.env` or `config.yaml` | `APPROVAL_MODE` or `approvals.mode` | `APPROVAL_MODE` | The root `.env` value wins; otherwise the YAML approval mode is used. |
 
-Only mapped keys are written to the authoritative `.env`; unrelated values from a previous gateway `.env` are available in its timestamped backup but are not carried forward automatically.
+Unmapped target keys from an existing gateway `.env` are preserved during merge; backups are recorded before any modifications.
 
 ### Cron stores, workspace, and skills
 

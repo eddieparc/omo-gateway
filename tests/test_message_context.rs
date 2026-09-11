@@ -379,3 +379,56 @@ async fn transcript_insert_trigger_populates_fts_index() {
     assert_eq!(hits[0].document.message_id, "400");
     assert_eq!(hits[0].document.metadata["source"], "transcript");
 }
+
+#[tokio::test]
+async fn replies_rejects_when_child_thread_or_parent_is_in_ignored_channels() {
+    let parent = metadata("21", Some("11"));
+    let mut thread = metadata("200", Some("11"));
+    thread.channel_kind = "PublicThread".into();
+    thread.parent_channel_id = Some("21".into());
+    thread.parent_channel_name = Some("forum".into());
+    thread.is_thread = true;
+    let reply = message("199", "200", "thread reply");
+    let api = MockDiscordApi::default()
+        .with_channel(parent, vec![message("200", "21", "starter")])
+        .with_channel(thread.clone(), vec![reply.clone()]);
+
+    // 1. Child thread "200" is ignored: must reject
+    let policy_child_ignored = MessageContextPolicy::new(vec![], vec!["200".into()]);
+    let (_db, provider_child) = provider(api.clone(), policy_child_ignored).await;
+
+    let res_child = provider_child
+        .query(
+            &session(Some("11"), "21"),
+            &MessageContextRequest::from_args(&json!({"operation":"replies","message_id":"200"}))
+                .unwrap(),
+        )
+        .await;
+
+    assert!(
+        res_child.is_err(),
+        "replies to thread 200 must be rejected when child thread is in ignored_channels"
+    );
+    let err_msg = res_child.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("ignored by policy"),
+        "Expected ignored by policy, got: {err_msg}"
+    );
+
+    // 2. Parent channel "21" is ignored: must reject
+    let policy_parent_ignored = MessageContextPolicy::new(vec![], vec!["21".into()]);
+    let (_db, provider_parent) = provider(api, policy_parent_ignored).await;
+
+    let res_parent = provider_parent
+        .query(
+            &session(Some("11"), "21"),
+            &MessageContextRequest::from_args(&json!({"operation":"replies","message_id":"200"}))
+                .unwrap(),
+        )
+        .await;
+
+    assert!(
+        res_parent.is_err(),
+        "replies in channel 21 must be rejected when parent is in ignored_channels"
+    );
+}

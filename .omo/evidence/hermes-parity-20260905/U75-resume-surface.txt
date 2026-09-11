@@ -1,0 +1,16 @@
+$ cargo test --lib drain_control::tests::drain_marker_expiry_local_surface -- --exact --nocapture
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 37s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+scan_completed=true payload={"action":"drain","requested_at":"2026-09-05T10:59:59Z","principal":"u75-surface","epoch":"","suppress_notification":true} T=2026-09-05 12:00:00 UTC active=false receiver=false
+scan_completed=true payload={"action":"drain","requested_at":"2026-09-05T12:00:00Z","principal":"u75-surface","epoch":"","suppress_notification":true} T=2026-09-05 12:00:00 UTC active=true state_change=true
+public_entry payload={"action":"drain","requested_at":"2026-09-05T15:03:40.682360+00:00","principal":"u75-public-entry","epoch":"","suppress_notification":true} watcher_active=true task_joined=true
+cleanup=closed empty_marker_directory=true
+test drain_control::tests::drain_marker_expiry_local_surface ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 319 filtered out; finished in 0.01s
+
+
+EXIT_CODE=0

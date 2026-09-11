@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use tokio::sync::RwLock;
 
 use crate::error::{OmonError, Result};
@@ -12,7 +12,10 @@ pub const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub const CODE_LENGTH: usize = 8;
 pub const CODE_TTL_SECONDS: i64 = 3600; // 1 hour
 pub const RATE_LIMIT_SECONDS: i64 = 600; // 10 minutes
+pub const LOCKOUT_DURATION_SECONDS: i64 = 900; // 15 minutes
 pub const MAX_FAILED_ATTEMPTS: i64 = 5;
+pub const MAX_PENDING_CODES: usize = 100;
+pub const DEFAULT_PLATFORM_KEY: &str = "discord";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PairingOutcome {
@@ -117,97 +120,371 @@ impl PairingStore {
         code
     }
 
-    /// Requests a one-time pairing code for an unauthorized user.
-    /// Reuses an unexpired active code if within the rate-limit window.
-    pub async fn request_pairing_code(&self, user_id: u64) -> Result<String> {
-        let now = Utc::now();
-        let user_id_str = user_id.to_string();
-
-        // Check if there is already an active, unexpired code for this user
-        let existing: Option<(String, DateTime<Utc>, DateTime<Utc>, i64)> = sqlx::query_as(
-            "SELECT code, created_at, expires_at, attempts FROM pairing_codes WHERE user_id = ? ORDER BY created_at DESC LIMIT 1"
+    /// Checks whether the platform is currently locked out at the given timestamp within a transaction.
+    async fn is_platform_locked_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row: Option<(DateTime<Utc>, i64)> = sqlx::query_as(
+            "SELECT locked_until, failed_attempts FROM pairing_platform_lockout WHERE platform_key = ?",
         )
-        .bind(&user_id_str)
+        .bind(DEFAULT_PLATFORM_KEY)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if let Some((locked_until, failed_attempts)) = row {
+            if failed_attempts >= MAX_FAILED_ATTEMPTS && now < locked_until {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Checks whether the platform is currently locked out at the given timestamp.
+    pub async fn is_platform_locked_at(&self, now: DateTime<Utc>) -> Result<bool> {
+        let row: Option<(DateTime<Utc>, i64)> = sqlx::query_as(
+            "SELECT locked_until, failed_attempts FROM pairing_platform_lockout WHERE platform_key = ?",
+        )
+        .bind(DEFAULT_PLATFORM_KEY)
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((code, created_at, expires_at, attempts)) = existing {
-            if attempts < MAX_FAILED_ATTEMPTS && expires_at > now {
-                // If created recently, reuse it (rate limit compliance)
-                if (now - created_at).num_seconds() < RATE_LIMIT_SECONDS {
-                    return Ok(Self::format_code(&code));
-                }
+        if let Some((locked_until, failed_attempts)) = row {
+            if failed_attempts >= MAX_FAILED_ATTEMPTS && now < locked_until {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Checks whether the platform is currently locked out.
+    pub async fn is_platform_locked(&self) -> Result<bool> {
+        self.is_platform_locked_at(Utc::now()).await
+    }
+
+    /// Internal helper to record a failed attempt atomically within a transaction.
+    /// Uses an atomic conditional UPSERT to eliminate lost increments and unique constraint races.
+    async fn record_failed_attempt_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let deadline = now + chrono::Duration::seconds(LOCKOUT_DURATION_SECONDS);
+        sqlx::query(
+            "INSERT INTO pairing_platform_lockout (platform_key, locked_until, failed_attempts)
+             VALUES (?, ?, 1)
+             ON CONFLICT(platform_key) DO UPDATE SET
+                 failed_attempts = CASE
+                     WHEN strftime('%s', ?) >= strftime('%s', pairing_platform_lockout.locked_until) AND pairing_platform_lockout.failed_attempts >= ? THEN 1
+                     ELSE pairing_platform_lockout.failed_attempts + 1
+                 END,
+                 locked_until = CASE
+                     WHEN strftime('%s', ?) >= strftime('%s', pairing_platform_lockout.locked_until) AND pairing_platform_lockout.failed_attempts >= ? THEN ?
+                     WHEN pairing_platform_lockout.failed_attempts + 1 >= ? THEN ?
+                     ELSE pairing_platform_lockout.locked_until
+                 END
+             WHERE platform_key = ?",
+        )
+        .bind(DEFAULT_PLATFORM_KEY)
+        .bind(now)
+        .bind(now)
+        .bind(MAX_FAILED_ATTEMPTS)
+        .bind(now)
+        .bind(MAX_FAILED_ATTEMPTS)
+        .bind(now)
+        .bind(MAX_FAILED_ATTEMPTS)
+        .bind(deadline)
+        .bind(DEFAULT_PLATFORM_KEY)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Records a failed approval attempt and triggers platform lockout if MAX_FAILED_ATTEMPTS reached.
+    pub async fn record_failed_attempt_at(&self, now: DateTime<Utc>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::record_failed_attempt_tx(&mut tx, now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Cleans up expired pairing codes within a transaction.
+    async fn cleanup_expired_codes_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        now: DateTime<Utc>,
+    ) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM pairing_codes WHERE expires_at <= ?")
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Cleans up expired pairing codes up to the given timestamp.
+    pub async fn cleanup_expired_codes_at(&self, now: DateTime<Utc>) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let affected = Self::cleanup_expired_codes_tx(&mut tx, now).await?;
+        tx.commit().await?;
+        Ok(affected)
+    }
+
+    /// Cleans up expired pairing codes globally.
+    pub async fn cleanup_expired_codes(&self) -> Result<u64> {
+        self.cleanup_expired_codes_at(Utc::now()).await
+    }
+
+    /// Internal transaction-scoped helper for requesting/issuing a pairing code.
+    /// Runs all operations within the provided transaction to prevent pool re-entrancy and races.
+    async fn request_pairing_code_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        user_id: u64,
+        now: DateTime<Utc>,
+    ) -> Result<String> {
+        if Self::is_platform_locked_tx(tx, now).await? {
+            return Err(OmonError::Approval(
+                "Pairing is locked out due to too many failed attempts".into(),
+            ));
+        }
+
+        let user_id_str = user_id.to_string();
+
+        // 1. Cleanup expired codes globally, propagating DB errors
+        Self::cleanup_expired_codes_tx(tx, now).await?;
+
+        // 2. Check if there is already an active, unexpired code for this user
+        let existing: Option<(String, DateTime<Utc>, DateTime<Utc>, i64)> = sqlx::query_as(
+            "SELECT code, created_at, expires_at, attempts FROM pairing_codes WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&user_id_str)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if let Some((code, _created_at, expires_at, attempts)) = existing {
+            if attempts >= MAX_FAILED_ATTEMPTS {
+                // If platform lockout has passed, this code row is expired/locked; delete it and allow new code issuance.
+                sqlx::query("DELETE FROM pairing_codes WHERE user_id = ?")
+                    .bind(&user_id_str)
+                    .execute(&mut **tx)
+                    .await?;
+            } else if expires_at > now {
+                return Ok(Self::format_code(&code));
             }
         }
 
-        // Delete any expired or previous codes for this user
-        let _ = sqlx::query("DELETE FROM pairing_codes WHERE user_id = ?")
+        // Delete any previous code for this user before enforcing capacity and inserting a new code
+        sqlx::query("DELETE FROM pairing_codes WHERE user_id = ?")
             .bind(&user_id_str)
-            .execute(&self.pool)
-            .await;
+            .execute(&mut **tx)
+            .await?;
+
+        // 3. Enforce bounded pending count, propagating count error
+        let active_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE expires_at > ?")
+                .bind(now)
+                .fetch_one(&mut **tx)
+                .await?;
+
+        if active_count as usize >= MAX_PENDING_CODES {
+            let to_evict = (active_count as usize - MAX_PENDING_CODES + 1) as i64;
+            sqlx::query(
+                "DELETE FROM pairing_codes WHERE code IN (
+                    SELECT code FROM pairing_codes WHERE expires_at > ? ORDER BY created_at ASC LIMIT ?
+                )",
+            )
+            .bind(now)
+            .bind(to_evict)
+            .execute(&mut **tx)
+            .await?;
+        }
 
         let raw_code = Self::generate_raw_code();
         let expires_at = now + chrono::Duration::seconds(CODE_TTL_SECONDS);
 
         sqlx::query(
-            "INSERT INTO pairing_codes (code, user_id, created_at, expires_at, attempts) VALUES (?, ?, ?, ?, 0)"
+            "INSERT INTO pairing_codes (code, user_id, created_at, expires_at, attempts) VALUES (?, ?, ?, ?, 0)",
         )
         .bind(&raw_code)
         .bind(&user_id_str)
         .bind(now)
         .bind(expires_at)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await
         .map_err(|e| OmonError::Database(format!("failed to store pairing code: {e}")))?;
 
         Ok(Self::format_code(&raw_code))
     }
 
-    /// Approves a pairing code entered by an operator.
-    pub async fn approve_code(
+    /// Requests a one-time pairing code for an unauthorized user at the specified timestamp.
+    /// Cleans up expired codes, enforces bounded pending capacity, and respects platform lockout.
+    pub async fn request_pairing_code_at(
+        &self,
+        user_id: u64,
+        now: DateTime<Utc>,
+    ) -> Result<String> {
+        let mut tx = self.pool.begin().await?;
+        let code = Self::request_pairing_code_tx(&mut tx, user_id, now).await?;
+        tx.commit().await?;
+        Ok(code)
+    }
+
+    /// Requests a one-time pairing code for an unauthorized user.
+    /// Reuses an unexpired active code if within the rate-limit window.
+    pub async fn request_pairing_code(&self, user_id: u64) -> Result<String> {
+        self.request_pairing_code_at(user_id, Utc::now()).await
+    }
+
+    /// Checks and records DM notification delivery with rate limiting.
+    /// Returns Ok(Some(code)) if notification should be sent, or Ok(None) if throttled/locked out.
+    ///
+    /// Clarification of attempt vs confirmed delivery timestamp:
+    /// `pairing_notifications.last_notified_at` records the notification decision attempt timestamp
+    /// (reservation) to linearize concurrent incoming messages prior to outbound Discord transport.
+    /// Confirmed delivery timestamps can be updated via `record_confirmed_delivery_at`.
+    pub async fn check_and_record_notification_at(
+        &self,
+        user_id: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+
+        if Self::is_platform_locked_tx(&mut tx, now).await? {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let user_id_str = user_id.to_string();
+
+        let paired: Option<(String,)> =
+            sqlx::query_as("SELECT user_id FROM paired_users WHERE user_id = ?")
+                .bind(&user_id_str)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        if paired.is_some() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        // Atomically check rate limit and claim notification attempt slot.
+        // If user was notified within RATE_LIMIT_SECONDS, rows_affected will be 0 (throttled).
+        let claim_res = sqlx::query(
+            "INSERT INTO pairing_notifications (user_id, last_notified_at)
+             VALUES (?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET last_notified_at = excluded.last_notified_at
+             WHERE (strftime('%s', ?) - strftime('%s', pairing_notifications.last_notified_at)) >= ?",
+        )
+        .bind(&user_id_str)
+        .bind(now)
+        .bind(now)
+        .bind(RATE_LIMIT_SECONDS)
+        .execute(&mut *tx)
+        .await?;
+
+        if claim_res.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        // Notification slot claimed; obtain active/new pairing code within the same transaction.
+        // Propagate any database error instead of swallowing it as throttled success.
+        let code = Self::request_pairing_code_tx(&mut tx, user_id, now).await?;
+
+        tx.commit().await?;
+
+        Ok(Some(code))
+    }
+
+    /// Confirms outbound delivery of a pairing notification at the specified timestamp.
+    /// Distinguishes the pre-transport attempt/throttle reservation timestamp from confirmed transport delivery.
+    pub async fn record_confirmed_delivery_at(
+        &self,
+        user_id: u64,
+        delivered_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let user_id_str = user_id.to_string();
+        sqlx::query(
+            "INSERT INTO pairing_notifications (user_id, last_notified_at) VALUES (?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET last_notified_at = excluded.last_notified_at",
+        )
+        .bind(&user_id_str)
+        .bind(delivered_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Checks and records DM notification delivery with rate limiting.
+    pub async fn check_and_record_notification(&self, user_id: u64) -> Result<Option<String>> {
+        self.check_and_record_notification_at(user_id, Utc::now())
+            .await
+    }
+
+    /// Approves a pairing code entered by an operator at the specified timestamp.
+    pub async fn approve_code_at(
         &self,
         input_code: &str,
         _operator_id: u64,
+        now: DateTime<Utc>,
     ) -> Result<PairingOutcome> {
         let normalized = Self::normalize_code(input_code);
         if normalized.is_empty() {
             return Ok(PairingOutcome::InvalidCode);
         }
 
-        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+
+        if Self::is_platform_locked_tx(&mut tx, now).await? {
+            tx.commit().await?;
+            return Ok(PairingOutcome::LockedOut);
+        }
+
         let record: Option<PairingCodeRow> = sqlx::query_as(
             "SELECT code, user_id, created_at, expires_at, attempts FROM pairing_codes WHERE code = ?",
         )
         .bind(&normalized)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         let Some(row) = record else {
-            // Increment attempts on any partial matches or record attempt
-            let _ =
-                sqlx::query("UPDATE pairing_codes SET attempts = attempts + 1 WHERE attempts < ?")
-                    .bind(MAX_FAILED_ATTEMPTS)
-                    .execute(&self.pool)
-                    .await;
+            Self::record_failed_attempt_tx(&mut tx, now).await?;
+            sqlx::query("UPDATE pairing_codes SET attempts = attempts + 1 WHERE attempts < ?")
+                .bind(MAX_FAILED_ATTEMPTS)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
             return Ok(PairingOutcome::InvalidCode);
         };
 
         if row.attempts >= MAX_FAILED_ATTEMPTS {
+            tx.commit().await?;
             return Ok(PairingOutcome::LockedOut);
         }
 
         if now > row.expires_at {
             // Delete expired code
-            let _ = sqlx::query("DELETE FROM pairing_codes WHERE code = ?")
+            sqlx::query("DELETE FROM pairing_codes WHERE code = ?")
                 .bind(&row.code)
-                .execute(&self.pool)
-                .await;
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
             return Ok(PairingOutcome::Expired);
         }
 
         let Ok(user_id) = row.user_id.parse::<u64>() else {
+            tx.commit().await?;
             return Ok(PairingOutcome::InvalidCode);
         };
+
+        // Atomically claim the code by deleting it.
+        // If concurrent approvals race for the same code, exactly one claims it.
+        let delete_res = sqlx::query("DELETE FROM pairing_codes WHERE code = ?")
+            .bind(&row.code)
+            .execute(&mut *tx)
+            .await?;
+
+        if delete_res.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(PairingOutcome::InvalidCode);
+        }
 
         // Insert into paired_users
         sqlx::query(
@@ -215,20 +492,33 @@ impl PairingStore {
         )
         .bind(&row.user_id)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| OmonError::Database(format!("failed to record paired user: {e}")))?;
 
-        // Remove the consumed code
-        let _ = sqlx::query("DELETE FROM pairing_codes WHERE code = ?")
-            .bind(&row.code)
-            .execute(&self.pool)
-            .await;
+        // Reset platform failed attempts on successful pairing
+        sqlx::query(
+            "INSERT INTO pairing_platform_lockout (platform_key, locked_until, failed_attempts) VALUES (?, ?, 0)
+             ON CONFLICT(platform_key) DO UPDATE SET failed_attempts = 0, locked_until = excluded.locked_until",
+        )
+        .bind(DEFAULT_PLATFORM_KEY)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
 
-        // Update in-memory cache
+        // Commit transaction before modifying in-memory cache
+        tx.commit().await?;
+
+        // Cache callbacks only after commit
         self.paired_cache.write().await.insert(user_id);
 
         Ok(PairingOutcome::Success { user_id })
+    }
+
+    /// Approves a pairing code entered by an operator.
+    pub async fn approve_code(&self, input_code: &str, operator_id: u64) -> Result<PairingOutcome> {
+        self.approve_code_at(input_code, operator_id, Utc::now())
+            .await
     }
 }
 
@@ -321,5 +611,459 @@ mod tests {
 
         let outcome = store.approve_code("LOCKOUT1", 11111).await.unwrap();
         assert_eq!(outcome, PairingOutcome::LockedOut);
+    }
+
+    #[tokio::test]
+    async fn pairing_throttles_notifications_on_repeated_rejected_dm() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = PairingStore::new(pool.clone());
+        store.init_cache().await.unwrap();
+
+        let user_id = 999888777_u64;
+        let t0 = Utc::now();
+
+        let mut sends = 0;
+        for _ in 0..2 {
+            if let Ok(Some(_code)) = store.check_and_record_notification_at(user_id, t0).await {
+                sends += 1;
+            }
+        }
+        assert_eq!(
+            sends, 1,
+            "repeated rejected DM at same timestamp must send only 1 notification, got {sends}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_preserves_lockout_across_fresh_requests() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = PairingStore::new(pool.clone());
+        store.init_cache().await.unwrap();
+
+        let user_id = 424242_u64;
+        let t0 = Utc::now();
+        let _code = store.request_pairing_code_at(user_id, t0).await.unwrap();
+
+        // 5 invalid operator approvals
+        for _ in 0..5 {
+            let outcome = store
+                .approve_code_at("WRONG_CODE", 11111, t0)
+                .await
+                .unwrap();
+            assert_eq!(outcome, PairingOutcome::InvalidCode);
+        }
+
+        // Fresh request by user while locked out
+        let t1 = t0 + chrono::Duration::seconds(10);
+        let fresh_dm = store
+            .check_and_record_notification_at(user_id, t1)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh_dm, None,
+            "fresh DM must not issue code while platform is locked out"
+        );
+
+        let fresh_result = store.request_pairing_code_at(user_id, t1).await;
+        assert!(
+            fresh_result.is_err(),
+            "fresh request while locked out must fail"
+        );
+
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT attempts FROM pairing_codes WHERE user_id = ?")
+                .bind(user_id.to_string())
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .unwrap_or(0);
+
+        assert_eq!(
+            attempts,
+            5,
+            "five invalid operator approvals then fresh DM must remain locked until deadline; baseline reset lockout with fresh code attempts=0"
+        );
+        assert!(
+            store.is_platform_locked_at(t1).await.unwrap(),
+            "platform must remain locked until deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_throttles_notifications_and_preserves_lockout() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = PairingStore::new(pool.clone());
+        store.init_cache().await.unwrap();
+
+        let user_id = 123456789_u64;
+        let t0 = Utc::now();
+
+        // Part 1: Repeated rejected DM at same injected timestamp => 1 send
+        let mut sends = 0;
+        let mut decisions = Vec::new();
+        for _ in 0..2 {
+            let decision = store
+                .check_and_record_notification_at(user_id, t0)
+                .await
+                .unwrap();
+            if decision.is_some() {
+                sends += 1;
+            }
+            decisions.push(decision);
+        }
+        assert_eq!(
+            sends, 1,
+            "repeated rejected DM at same timestamp must send only 1 notification, got {sends}"
+        );
+        assert!(decisions[0].is_some(), "first DM must yield a pairing code");
+        assert_eq!(
+            decisions[1], None,
+            "second DM at same timestamp must be throttled"
+        );
+
+        // Advance clock past rate limit window (600s) => second notification permitted
+        let t1 = t0 + chrono::Duration::seconds(RATE_LIMIT_SECONDS + 1);
+        let second_window = store
+            .check_and_record_notification_at(user_id, t1)
+            .await
+            .unwrap();
+        assert!(
+            second_window.is_some(),
+            "DM after rate limit window must be notified"
+        );
+
+        // Part 2: Five invalid operator approvals then fresh DM => locked until deadline
+        let active_code = store.request_pairing_code_at(user_id, t1).await.unwrap();
+        for _ in 0..5 {
+            let outcome = store
+                .approve_code_at("WRONG_CODE", 11111, t1)
+                .await
+                .unwrap();
+            assert_eq!(outcome, PairingOutcome::InvalidCode);
+        }
+
+        // 6th approval attempt must be locked out
+        let locked_check = store
+            .approve_code_at("WRONG_CODE", 11111, t1)
+            .await
+            .unwrap();
+        assert_eq!(locked_check, PairingOutcome::LockedOut);
+
+        // Approval of the actual code must also be locked out
+        let active_check = store
+            .approve_code_at(&active_code, 11111, t1)
+            .await
+            .unwrap();
+        assert_eq!(active_check, PairingOutcome::LockedOut);
+
+        // Fresh DM at t1 + 10s must remain locked out; cannot issue code with attempts=0
+        let t_dm = t1 + chrono::Duration::seconds(10);
+        let dm_decision = store
+            .check_and_record_notification_at(user_id, t_dm)
+            .await
+            .unwrap();
+        assert_eq!(
+            dm_decision, None,
+            "fresh DM must not issue prompt while locked out"
+        );
+
+        let fresh_request = store.request_pairing_code_at(user_id, t_dm).await;
+        assert!(
+            fresh_request.is_err(),
+            "requesting code while locked out must fail"
+        );
+
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT attempts FROM pairing_codes WHERE user_id = ?")
+                .bind(user_id.to_string())
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .unwrap_or(0);
+
+        assert_eq!(
+            attempts, 5,
+            "lockout must be preserved; fresh DM must not reset attempts to 0"
+        );
+        assert!(
+            store.is_platform_locked_at(t_dm).await.unwrap(),
+            "platform must remain locked until deadline"
+        );
+
+        // Advance clock past platform lockout deadline (900s)
+        let t_unlocked = t1 + chrono::Duration::seconds(LOCKOUT_DURATION_SECONDS + 1);
+        assert!(
+            !store.is_platform_locked_at(t_unlocked).await.unwrap(),
+            "platform lockout must expire after deadline"
+        );
+
+        // Fresh DM after deadline succeeds and issues code
+        let unlocked_dm = store
+            .check_and_record_notification_at(user_id, t_unlocked)
+            .await
+            .unwrap();
+        assert!(
+            unlocked_dm.is_some(),
+            "fresh DM after lockout deadline must succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_bounded_pending_count_and_expiry_cleanup() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = PairingStore::new(pool.clone());
+        store.init_cache().await.unwrap();
+
+        let t0 = Utc::now();
+
+        // Insert an expired code manually
+        let expired_time = t0 - chrono::Duration::hours(2);
+        sqlx::query(
+            "INSERT INTO pairing_codes (code, user_id, created_at, expires_at, attempts) VALUES ('OLD_EXP1', '99999', ?, ?, 0)",
+        )
+        .bind(expired_time - chrono::Duration::hours(1))
+        .bind(expired_time)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Cleanup expired codes
+        let cleaned = store.cleanup_expired_codes_at(t0).await.unwrap();
+        assert_eq!(cleaned, 1);
+
+        // Verify bounded capacity: insert MAX_PENDING_CODES
+        for i in 0..MAX_PENDING_CODES {
+            let uid = 10000 + i as u64;
+            let _ = store.request_pairing_code_at(uid, t0).await.unwrap();
+        }
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE expires_at > ?")
+                .bind(t0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, MAX_PENDING_CODES as i64);
+
+        // Request one more code -> oldest should be evicted, keeping count at MAX_PENDING_CODES
+        let _ = store.request_pairing_code_at(999999, t0).await.unwrap();
+        let count_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE expires_at > ?")
+                .bind(t0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count_after, MAX_PENDING_CODES as i64);
+    }
+
+    #[tokio::test]
+    async fn test_atomic_concurrent_notifications_single_send_decision() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store1 = PairingStore::new(pool.clone());
+        let store2 = PairingStore::new(pool.clone());
+        store1.init_cache().await.unwrap();
+
+        let user_id = 777111222_u64;
+        let t0 = Utc::now();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let s1 = store1.clone();
+        let s2 = store2.clone();
+
+        let h1 = tokio::spawn(async move {
+            b1.wait().await;
+            s1.check_and_record_notification_at(user_id, t0).await
+        });
+        let h2 = tokio::spawn(async move {
+            b2.wait().await;
+            s2.check_and_record_notification_at(user_id, t0).await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        let res1 = r1.unwrap().unwrap();
+        let res2 = r2.unwrap().unwrap();
+
+        let some_count = [&res1, &res2].iter().filter(|r| r.is_some()).count();
+        assert_eq!(
+            some_count, 1,
+            "concurrent same-time notifications must yield exactly 1 send decision, got {some_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_atomic_concurrent_failed_attempts_lockout() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = PairingStore::new(pool.clone());
+        store.init_cache().await.unwrap();
+
+        let t0 = Utc::now();
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let mut handles = Vec::new();
+
+        for _ in 0..5 {
+            let b = barrier.clone();
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                s.record_failed_attempt_at(t0).await
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        let (_locked_until, failed_attempts): (DateTime<Utc>, i64) = sqlx::query_as(
+            "SELECT locked_until, failed_attempts FROM pairing_platform_lockout WHERE platform_key = ?",
+        )
+        .bind(DEFAULT_PLATFORM_KEY)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            failed_attempts, 5,
+            "all 5 concurrent failed attempts must be recorded without lost increment, got {failed_attempts}"
+        );
+        assert!(
+            store.is_platform_locked_at(t0).await.unwrap(),
+            "platform must be locked out at t0 after 5 failed attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_atomic_concurrent_issuance_and_capacity() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = PairingStore::new(pool.clone());
+        store.init_cache().await.unwrap();
+
+        let user_id = 999111_u64;
+        let t0 = Utc::now();
+
+        // 1. Concurrent requests for the same user must return the identical active code
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let s1 = store.clone();
+        let s2 = store.clone();
+
+        let h1 = tokio::spawn(async move {
+            b1.wait().await;
+            s1.request_pairing_code_at(user_id, t0).await
+        });
+        let h2 = tokio::spawn(async move {
+            b2.wait().await;
+            s2.request_pairing_code_at(user_id, t0).await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        let code1 = r1.unwrap().unwrap();
+        let code2 = r2.unwrap().unwrap();
+
+        assert_eq!(
+            code1, code2,
+            "concurrent requests for same user must yield identical active code"
+        );
+
+        let user_code_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE user_id = ?")
+                .bind(user_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            user_code_count, 1,
+            "exactly 1 code row must exist for user, got {user_code_count}"
+        );
+
+        // 2. Capacity bound must not be breached under concurrent insertions at capacity limit
+        // Pre-fill to MAX_PENDING_CODES - 1
+        for i in 0..(MAX_PENDING_CODES - 1) {
+            let uid = 20000 + i as u64;
+            let _ = store.request_pairing_code_at(uid, t0).await.unwrap();
+        }
+
+        let barrier_cap = Arc::new(tokio::sync::Barrier::new(2));
+        let bc1 = barrier_cap.clone();
+        let bc2 = barrier_cap.clone();
+        let sc1 = store.clone();
+        let sc2 = store.clone();
+
+        let hc1 = tokio::spawn(async move {
+            bc1.wait().await;
+            sc1.request_pairing_code_at(888001, t0).await
+        });
+        let hc2 = tokio::spawn(async move {
+            bc2.wait().await;
+            sc2.request_pairing_code_at(888002, t0).await
+        });
+
+        let (rc1, rc2) = tokio::join!(hc1, hc2);
+        rc1.unwrap().unwrap();
+        rc2.unwrap().unwrap();
+
+        let total_pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pairing_codes WHERE expires_at > ?")
+                .bind(t0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            total_pending as usize <= MAX_PENDING_CODES,
+            "active pending count must not exceed capacity {MAX_PENDING_CODES}, got {total_pending}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_atomic_concurrent_approval_single_claim() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = PairingStore::new(pool.clone());
+        store.init_cache().await.unwrap();
+
+        let user_id = 555666777_u64;
+        let t0 = Utc::now();
+        let code = store.request_pairing_code_at(user_id, t0).await.unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let c1 = code.clone();
+        let c2 = code.clone();
+
+        let h1 = tokio::spawn(async move {
+            b1.wait().await;
+            s1.approve_code_at(&c1, 1001, t0).await
+        });
+        let h2 = tokio::spawn(async move {
+            b2.wait().await;
+            s2.approve_code_at(&c2, 1002, t0).await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        let out1 = r1.unwrap().unwrap();
+        let out2 = r2.unwrap().unwrap();
+
+        let success_count = [&out1, &out2]
+            .iter()
+            .filter(|o| matches!(o, PairingOutcome::Success { .. }))
+            .count();
+        let invalid_count = [&out1, &out2]
+            .iter()
+            .filter(|o| matches!(o, PairingOutcome::InvalidCode))
+            .count();
+
+        assert_eq!(
+            success_count, 1,
+            "exactly one concurrent approval must succeed"
+        );
+        assert_eq!(
+            invalid_count, 1,
+            "competing approval must receive InvalidCode (consumed)"
+        );
+        assert!(store.is_user_paired(user_id).await);
     }
 }

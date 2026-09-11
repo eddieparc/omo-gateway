@@ -1,0 +1,170 @@
+{
+  "phase": "hermes-parity-calendar-resumed-20260905",
+  "verification_role": "independent-verifier",
+  "tool_limitations": {
+    "apply_patch": "not exposed in tool schema; file read/write used for evidence artifacts; no source edits made",
+    "tool_monitor": "not exposed in tool schema; bounded bash commands used directly"
+  },
+  "overall_verdicts": {
+    "U46": "PASS",
+    "U47": "PASS",
+    "U76": "PASS"
+  },
+  "units": {
+    "U46": {
+      "id": "U46",
+      "title": "Validated timezone-aware schedules",
+      "findings": ["CR.C15", "CFG.C09"],
+      "verdict": "PASS",
+      "files_inspected": [
+        "src/cron/store.rs",
+        "src/cron/scheduler.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        "tests/test_cron_schedule_parity.rs"
+      ],
+      "commands": [
+        {
+          "command": "cargo test --test test_cron_schedule_parity imported_cron_retains_timezone -- --exact --nocapture",
+          "constituent": "CR.C15",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "calendar-resume-verification-u46.log"
+        },
+        {
+          "command": "cargo test --lib cron::store::tests::imports_timezone_and_rejects_invalid_schedule -- --exact --nocapture",
+          "constituent": "CFG.C09",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "calendar-resume-verification-u46.log"
+        },
+        {
+          "command": "cargo test --lib cron::scheduler::tests::next_run_tz_evaluates_wall_clock_and_tracks_dst_offset -- --exact --nocapture",
+          "constituent": "DST Wall-Clock Evaluation",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "calendar-resume-verification-u46.log"
+        },
+        {
+          "command": "cargo test --test test_cron_schedule_parity imported_cron_retains_timezone && cargo test --lib cron::store::tests::imports_timezone_and_rejects_invalid_schedule",
+          "constituent": "Manifest redCommand",
+          "exit_code": 0,
+          "passed": 2,
+          "failed": 0,
+          "log": "calendar-resume-verification-u46.log"
+        }
+      ]
+    },
+    "U47": {
+      "id": "U47",
+      "title": "Bad-job isolation and explicit rearming",
+      "findings": ["CR.C16"],
+      "verdict": "PASS",
+      "files_inspected": [
+        "src/cron/store.rs",
+        "src/cron/scheduler.rs",
+        "tests/test_cron_boundary_parity.rs"
+      ],
+      "commands": [
+        {
+          "command": "cargo test --test test_cron_boundary_parity sync_isolates_bad_jobs_and_rearms_changed_once -- --exact --nocapture",
+          "constituent": "CR.C16",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "calendar-resume-verification-u47.log"
+        },
+        {
+          "command": "cargo test --test test_cron_boundary_parity sync_isolates_bad_jobs_and_rearms_changed_once",
+          "constituent": "Manifest redCommand",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "calendar-resume-verification-u47.log"
+        }
+      ]
+    },
+    "U76": {
+      "id": "U76",
+      "title": "Retire overdue unclaimed one shot jobs",
+      "findings": ["UP.DS03"],
+      "verdict": "PASS",
+      "files_inspected": [
+        "src/cron/scheduler.rs",
+        "tests/test_voice_cron.rs"
+      ],
+      "commands": [
+        {
+          "command": "cargo test --test test_voice_cron persisted_oneshot_past_grace_is_retired -- --exact --nocapture",
+          "constituent": "UP.DS03",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "calendar-resume-verification-u76.log"
+        },
+        {
+          "command": "cargo test --test test_voice_cron persisted_oneshot_past_grace_is_retired",
+          "constituent": "Manifest redCommand",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "calendar-resume-verification-u76.log"
+        }
+      ]
+    }
+  },
+  "calendar_targets": [
+    {
+      "command": "cargo test --test test_cron_schedule_parity",
+      "exit_code": 0,
+      "passed": 1,
+      "failed": 0,
+      "log": "calendar-resume-verification-targets.log"
+    },
+    {
+      "command": "cargo test --test test_cron_boundary_parity",
+      "exit_code": 0,
+      "passed": 1,
+      "failed": 0,
+      "log": "calendar-resume-verification-targets.log"
+    },
+    {
+      "command": "cargo test --test test_voice_cron",
+      "exit_code": 0,
+      "passed": 10,
+      "failed": 0,
+      "log": "calendar-resume-verification-targets.log"
+    },
+    {
+      "command": "cargo test --lib cron::",
+      "exit_code": 0,
+      "passed": 39,
+      "failed": 0,
+      "log": "calendar-resume-verification-adjacent-cron.log"
+    }
+  ],
+  "build_and_style": {
+    "cargo_build": {
+      "command": "cargo build",
+      "exit_code": 0,
+      "log": "calendar-resume-verification-build.log"
+    },
+    "scoped_rustfmt": {
+      "command": "rustfmt --edition 2024 --check src/cron/scheduler.rs tests/test_cron_boundary_parity.rs tests/test_voice_cron.rs",
+      "exit_code": 0,
+      "log": "calendar-resume-verification-fmt.log"
+    }
+  },
+  "explicit_other_failures": {
+    "target": "tests/test_migrate.rs",
+    "command": "cargo test --test test_migrate",
+    "exit_code": 101,
+    "passed": 3,
+    "failed": 2,
+    "reason": "Migration subsystem step gateway-down fails to verify live Hermes gateway pid 4242. Owned by migration units U51/U55/U75; explicitly isolated and not considered a gate failure for calendar units.",
+    "log": "calendar-resume-verification-other-cron.log"
+  }
+}

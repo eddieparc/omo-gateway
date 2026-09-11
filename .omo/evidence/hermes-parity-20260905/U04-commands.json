@@ -1,0 +1,6 @@
+[
+  "cargo test --lib discord::approval::tests::approval_display_redacts_credentials_without_changing_execution -- --exact --nocapture",
+  "cargo test --lib security::approval_display -- --nocapture",
+  "cargo test --lib discord::approval::tests -- --nocapture",
+  "cargo build"
+]

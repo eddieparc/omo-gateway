@@ -16,7 +16,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use omon_gateway::{
-    CronJob, CronJobSpec, CronScheduler, InboundEvent, OmonError, OutboundAction,
+    readiness, CronJob, CronJobSpec, CronScheduler, InboundEvent, OmonError, OutboundAction,
     OutboundDispatcher, SessionKey, SessionMultiplexer, SmartApprovalGuard, ToolRegistry,
 };
 use parking_lot::Mutex;
@@ -97,9 +97,9 @@ impl DashboardSettings {
                 "dashboard port must be greater than zero".into(),
             ));
         }
-        if !self.insecure && !is_loopback_host(&self.host) {
+        if !is_loopback_host(&self.host) {
             return Err(OmonError::Config(format!(
-                "refusing to expose the unauthenticated dashboard on non-loopback host {}; pass --insecure or set DASHBOARD_INSECURE=true to acknowledge the risk",
+                "refusing to expose the unauthenticated dashboard on non-loopback host {}; public bind requires transport authentication which is not configured",
                 self.host
             )));
         }
@@ -133,7 +133,118 @@ fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
+    let host = host.trim_matches(|c| c == '[' || c == ']');
     host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn extract_host(host_str: &str) -> &str {
+    let host_str = host_str.trim();
+    if let Some(rest) = host_str.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    if host_str.matches(':').count() == 1 {
+        if let Some(colon) = host_str.rfind(':') {
+            return &host_str[..colon];
+        }
+    }
+    host_str
+}
+
+fn extract_port(host_str: &str) -> Option<u16> {
+    let host_str = host_str.trim();
+    if let Some(rest) = host_str.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let after = &rest[end + 1..];
+            if let Some(colon) = after.strip_prefix(':') {
+                return colon.parse::<u16>().ok();
+            }
+            return None;
+        }
+    }
+    if host_str.matches(':').count() == 1 {
+        if let Some(colon) = host_str.rfind(':') {
+            return host_str[colon + 1..].parse::<u16>().ok();
+        }
+    }
+    None
+}
+
+fn is_same_origin(origin_str: &str, host_header: &str) -> bool {
+    let Ok(uri) = origin_str.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if authority.as_str().eq_ignore_ascii_case(host_header) {
+        return true;
+    }
+    let Some(origin_host) = uri.host() else {
+        return false;
+    };
+    let host_only = extract_host(host_header);
+    if !origin_host.eq_ignore_ascii_case(host_only) {
+        return false;
+    }
+    let origin_port = uri.port_u16().or_else(|| match uri.scheme_str() {
+        Some("http") | Some("ws") => Some(80),
+        Some("https") | Some("wss") => Some(443),
+        _ => None,
+    });
+    let host_port = extract_port(host_header);
+    origin_port == host_port
+}
+
+async fn validate_host_and_origin(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let host_str = match request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(h) => h,
+        None => match request.uri().authority() {
+            Some(a) => a.as_str(),
+            None => {
+                return (StatusCode::BAD_REQUEST, "missing Host header").into_response();
+            }
+        },
+    };
+
+    let host = extract_host(host_str);
+    if !is_loopback_host(host) {
+        return (StatusCode::FORBIDDEN, "untrusted Host header").into_response();
+    }
+
+    let is_ws = request
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+
+    if is_ws {
+        let Some(origin_str) = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return (StatusCode::FORBIDDEN, "missing Origin on WebSocket upgrade").into_response();
+        };
+
+        if !is_same_origin(origin_str, host_str) {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin WebSocket upgrade rejected",
+            )
+                .into_response();
+        }
+    }
+
+    next.run(request).await
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -224,7 +335,8 @@ impl Visit for EventFieldVisitor {
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(field.name().to_owned(), Value::Bool(value));
+        self.fields
+            .insert(field.name().to_owned(), Value::Bool(value));
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
@@ -280,8 +392,7 @@ where
 
 pub fn init_tracing() {
     let logs = global_logs();
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
@@ -334,10 +445,6 @@ impl WebDashboardDispatcher {
         pending.sort_by_key(|entry| entry.created_at);
         pending
     }
-
-    pub async fn remove_pending(&self, request_id: Uuid) {
-        self.pending.write().await.remove(&request_id);
-    }
 }
 
 #[async_trait]
@@ -380,10 +487,7 @@ pub struct CompositeDispatcher {
 
 #[allow(dead_code)]
 impl CompositeDispatcher {
-    pub fn new(
-        primary: Arc<dyn OutboundDispatcher>,
-        dashboard: WebDashboardDispatcher,
-    ) -> Self {
+    pub fn new(primary: Arc<dyn OutboundDispatcher>, dashboard: WebDashboardDispatcher) -> Self {
         Self { primary, dashboard }
     }
 }
@@ -415,6 +519,8 @@ fn action_session(action: &OutboundAction) -> Option<&SessionKey> {
     }
 }
 
+pub type DiskSampler = Arc<dyn Fn(&Path) -> (Option<u64>, Option<u64>) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct DashboardState {
     pub pool: SqlitePool,
@@ -430,6 +536,7 @@ pub struct DashboardState {
     pub started_at: Instant,
     pub web_root: PathBuf,
     pub logs: DashboardLogStore,
+    pub disk_sampler: Option<DiskSampler>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -461,6 +568,26 @@ impl DashboardState {
             started_at: Instant::now(),
             web_root,
             logs: global_logs(),
+            disk_sampler: None,
+        }
+    }
+
+    pub fn with_disk_sampler<F>(mut self, sampler: F) -> Self
+    where
+        F: Fn(&Path) -> (Option<u64>, Option<u64>) + Send + Sync + 'static,
+    {
+        self.disk_sampler = Some(Arc::new(sampler));
+        self
+    }
+
+    pub fn sample_disk(&self) -> (Option<u64>, Option<u64>) {
+        if let Some(ref sampler) = self.disk_sampler {
+            sampler(&self.workspace_root)
+        } else {
+            (
+                fs2::total_space(&self.workspace_root).ok(),
+                fs2::available_space(&self.workspace_root).ok(),
+            )
         }
     }
 }
@@ -573,6 +700,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/status", get(api_status))
         .route("/api/health", get(api_health))
         .route("/api/readiness", get(api_readiness))
+        .route("/api/ready", get(api_readiness))
         .route("/api/sessions", get(list_sessions))
         .route(
             "/api/sessions/{id}",
@@ -580,11 +708,14 @@ pub fn router(state: DashboardState) -> Router {
         )
         .route("/api/sessions/{id}/messages", get(list_messages))
         .route("/api/sessions/{id}/chat", post(post_chat))
+        .route("/api/sessions/{id}/stop", post(stop_session))
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/cron/jobs", get(list_cron_jobs).post(create_cron_job))
         .route(
             "/api/cron/jobs/{id}",
-            get(get_cron_job).put(update_cron_job).delete(delete_cron_job),
+            get(get_cron_job)
+                .put(update_cron_job)
+                .delete(delete_cron_job),
         )
         .route("/api/cron/jobs/{id}/trigger", post(trigger_cron_job))
         .route("/api/cron/jobs/{id}/pause", post(pause_cron_job))
@@ -598,11 +729,15 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/approvals/{id}/resolve", post(resolve_approval))
         .route("/api/approvals/allowlist", get(list_approval_allowlist))
         .route("/api/bots", get(list_bots).post(create_bot))
-        .route("/api/bots/{id}", get(get_bot).put(update_bot).delete(delete_bot))
+        .route(
+            "/api/bots/{id}",
+            get(get_bot).put(update_bot).delete(delete_bot),
+        )
         .route("/api/logs", get(list_logs))
         .route("/api/logs/ws", get(logs_ws))
         .fallback(get(serve_static))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(validate_host_and_origin))
         .with_state(state)
 }
 
@@ -627,7 +762,10 @@ impl ApiError {
 
 impl From<OmonError> for ApiError {
     fn from(error: OmonError) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        match error {
+            OmonError::Config(msg) => Self::new(StatusCode::BAD_REQUEST, msg),
+            other => Self::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        }
     }
 }
 
@@ -664,8 +802,19 @@ async fn api_readiness(State(state): State<DashboardState>) -> Response {
         .await
         .is_ok();
     let workspace_ok = tokio::fs::metadata(&state.workspace_root).await.is_ok();
+    let (disk_total, disk_available) = state.sample_disk();
+    let disk_pressure = readiness::classify_disk_pressure_opt(disk_total, disk_available);
+    let disk_ok = workspace_ok && disk_pressure == "ok";
     let chat_ok = state.multiplexer.is_some();
-    let ready = db_ok && workspace_ok && chat_ok;
+    let appserver_url = state
+        .config
+        .get("appserver_url")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| std::env::var("OMON_APPSERVER_URL").ok());
+    let backend_check = readiness::probe_backend(appserver_url.as_deref()).await;
+    let backend_ok = backend_check.status == "ok";
+    let ready = db_ok && workspace_ok && disk_ok && (backend_ok || appserver_url.is_none());
     let status = if ready {
         StatusCode::OK
     } else {
@@ -678,7 +827,14 @@ async fn api_readiness(State(state): State<DashboardState>) -> Response {
             "checks": {
                 "database": db_ok,
                 "workspace": workspace_ok,
+                "disk": disk_ok,
                 "chat_runtime": chat_ok,
+                "backend": backend_ok,
+            },
+            "disk": {
+                "workspace_total_bytes": disk_total,
+                "workspace_available_bytes": disk_available,
+                "pressure": disk_pressure,
             }
         })),
     )
@@ -694,11 +850,29 @@ async fn api_status(State(state): State<DashboardState>) -> Result<Json<Value>, 
         .multiplexer
         .as_ref()
         .map_or(0, SessionMultiplexer::active_sessions);
-    let disk_total = fs2::total_space(&state.workspace_root).ok();
-    let disk_available = fs2::available_space(&state.workspace_root).ok();
+    let (disk_total, disk_available) = state.sample_disk();
     let memory_bytes = process_memory_bytes();
+    let (disk_headroom_status, disk_used_percent, disk_pressure) =
+        match (disk_total, disk_available) {
+            (Some(total), Some(avail)) => {
+                let (status, pct, pressure) = readiness::calculate_disk_headroom(
+                    total,
+                    avail,
+                    readiness::DISK_DEGRADED_PERCENT,
+                );
+                (status, Some(pct), pressure)
+            }
+            _ => ("degraded".to_string(), None, "unknown".to_string()),
+        };
+    let total_mb = disk_total.map(|t| t / readiness::DISK_BYTES_PER_MB);
+    let available_mb = disk_available.map(|a| a / readiness::DISK_BYTES_PER_MB);
+    let overall_status = if disk_headroom_status == "ok" {
+        "ok"
+    } else {
+        "degraded"
+    };
     Ok(Json(json!({
-        "status": "ok",
+        "status": overall_status,
         "uptime_seconds": state.started_at.elapsed().as_secs(),
         "bot_connections": state.bot_connections,
         "active_sessions": active_sessions,
@@ -715,8 +889,16 @@ async fn api_status(State(state): State<DashboardState>) -> Result<Json<Value>, 
             "process_bytes": memory_bytes,
         },
         "disk": {
+            "status": disk_headroom_status,
             "workspace_total_bytes": disk_total,
             "workspace_available_bytes": disk_available,
+            "total_bytes": disk_total,
+            "available_bytes": disk_available,
+            "total_mb": total_mb,
+            "available_mb": available_mb,
+            "free_mb": available_mb,
+            "used_percent": disk_used_percent,
+            "pressure": disk_pressure,
         },
         "pending_approvals": state.approvals.pending_count().await,
         "time": Utc::now(),
@@ -866,23 +1048,19 @@ async fn get_session(
     let row = fetch_session_row(&state.pool, &storage_id)
         .await?
         .ok_or_else(|| ApiError::not_found("session"))?;
-    let message_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM messages WHERE session_key = ?",
-    )
-    .bind(&storage_id)
-    .fetch_one(&state.pool)
-    .await?;
+    let message_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE session_key = ?")
+            .bind(&storage_id)
+            .fetch_one(&state.pool)
+            .await?;
     let mut view = row.view();
     if let Value::Object(ref mut object) = view {
         object.insert("message_count".into(), Value::Number(message_count.into()));
         object.insert(
             "active".into(),
-            Value::Bool(
-                state
-                    .multiplexer
-                    .as_ref()
-                    .is_some_and(|mux| parse_storage_key(&storage_id).is_some_and(|key| mux.contains_session(&key))),
-            ),
+            Value::Bool(state.multiplexer.as_ref().is_some_and(|mux| {
+                parse_storage_key(&storage_id).is_some_and(|key| mux.contains_session(&key))
+            })),
         );
     }
     Ok(Json(view))
@@ -930,12 +1108,10 @@ async fn list_messages(
     .bind(offset)
     .fetch_all(&state.pool)
     .await?;
-    let total = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM messages WHERE session_key = ?",
-    )
-    .bind(&storage_id)
-    .fetch_one(&state.pool)
-    .await?;
+    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE session_key = ?")
+        .bind(&storage_id)
+        .fetch_one(&state.pool)
+        .await?;
     let items = rows
         .into_iter()
         .map(|row| {
@@ -976,8 +1152,9 @@ async fn delete_session(
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatRequest {
-    message: String,
+pub(crate) struct ChatRequest {
+    #[serde(alias = "content")]
+    pub(crate) message: String,
 }
 
 async fn post_chat(
@@ -1009,6 +1186,24 @@ async fn post_chat(
         })),
     )
         .into_response())
+}
+
+async fn stop_session(
+    State(state): State<DashboardState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let key = resolve_session_key(&state.pool, &id).await?;
+    let Some(mux) = state.multiplexer.as_ref() else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "chat runtime is not configured",
+        ));
+    };
+    let stopped = mux.stop(&key).await.map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "stopped": stopped,
+        "session_id": key.storage_key(),
+    })))
 }
 
 async fn session_ws(
@@ -1053,7 +1248,7 @@ async fn handle_session_socket(
                         let text = text.as_str();
                         let parsed = serde_json::from_str::<Value>(text).unwrap_or_else(|_| json!({"type":"message","content":text}));
                         match parsed.get("type").and_then(Value::as_str).unwrap_or("message") {
-                            "message" => {
+                            "message" | "chat" => {
                                 let content = parsed.get("content").and_then(Value::as_str).unwrap_or_default().trim();
                                 if content.is_empty() {
                                     let _ = send_ws_error(&mut socket, "message must not be empty").await;
@@ -1129,22 +1324,14 @@ async fn send_ws_error(socket: &mut WebSocket, message: &str) -> Result<(), axum
 }
 
 fn web_session_key(id: &str) -> SessionKey {
-    SessionKey::new(
-        "web",
-        None::<String>,
-        id,
-        None::<String>,
-        "dashboard",
-    )
+    SessionKey::new("web", None::<String>, id, None::<String>, "dashboard")
 }
 
 async fn resolve_storage_id(pool: &SqlitePool, id: &str) -> Result<String, sqlx::Error> {
-    let exact = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM sessions WHERE session_key = ?",
-    )
-    .bind(id)
-    .fetch_one(pool)
-    .await?;
+    let exact = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE session_key = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
     if exact != 0 {
         return Ok(id.to_owned());
     }
@@ -1228,9 +1415,7 @@ struct CronJobInput {
     enabled: Option<bool>,
 }
 
-async fn list_cron_jobs(
-    State(state): State<DashboardState>,
-) -> Result<Json<Value>, ApiError> {
+async fn list_cron_jobs(State(state): State<DashboardState>) -> Result<Json<Value>, ApiError> {
     let jobs = sqlx::query_as::<_, CronJob>(
         "SELECT * FROM cron_jobs ORDER BY enabled DESC, next_run_at IS NULL, next_run_at, id",
     )
@@ -1572,39 +1757,11 @@ struct UpdateBotPayload {
 }
 
 async fn list_bots(State(state): State<DashboardState>) -> Result<Json<Value>, ApiError> {
-    let mut profiles = sqlx::query_as::<_, BotProfileRow>(
+    let profiles = sqlx::query_as::<_, BotProfileRow>(
         "SELECT bot_id, name, model, system_prompt, enabled_toolsets, custom_settings_json, created_at, updated_at FROM bot_profiles ORDER BY name ASC"
     )
     .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-
-    let mut configured_ids = HashSet::new();
-    for p in &profiles {
-        configured_ids.insert(p.bot_id.clone());
-    }
-
-    let known_bots = vec![
-        ("1465631383862120451", "wawabot"),
-        ("1529539440589013182", "실피"),
-        ("1529738312833830984", "에리스"),
-    ];
-
-    for (bid, bname) in known_bots {
-        if !configured_ids.contains(bid) {
-            let row = BotProfileRow {
-                bot_id: bid.to_string(),
-                name: bname.to_string(),
-                model: None,
-                system_prompt: None,
-                enabled_toolsets: None,
-                custom_settings_json: "{}".to_string(),
-                created_at: Utc::now().to_rfc3339(),
-                updated_at: Utc::now().to_rfc3339(),
-            };
-            profiles.push(row);
-        }
-    }
+    .await?;
 
     let items = profiles
         .into_iter()
@@ -1625,6 +1782,7 @@ async fn list_bots(State(state): State<DashboardState>) -> Result<Json<Value>, A
     Ok(Json(json!({
         "items": items,
         "total": items.len(),
+        "runtime_connections": state.bot_connections,
     })))
 }
 
@@ -1639,36 +1797,17 @@ async fn get_bot(
     .fetch_optional(&state.pool)
     .await?;
 
-    let item = match profile {
-        Some(b) => json!({
-            "bot_id": b.bot_id,
-            "name": b.name,
-            "model": b.model,
-            "system_prompt": b.system_prompt,
-            "enabled_toolsets": b.enabled_toolsets.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
-            "custom_settings": serde_json::from_str::<Value>(&b.custom_settings_json).unwrap_or_else(|_| json!({})),
-            "created_at": b.created_at,
-            "updated_at": b.updated_at,
-        }),
-        None => {
-            let default_name = match bot_id.as_str() {
-                "1465631383862120451" => "wawabot",
-                "1529539440589013182" => "실피",
-                "1529738312833830984" => "에리스",
-                _ => "Discord Bot",
-            };
-            json!({
-                "bot_id": bot_id,
-                "name": default_name,
-                "model": null,
-                "system_prompt": null,
-                "enabled_toolsets": null,
-                "custom_settings": {},
-                "created_at": Utc::now().to_rfc3339(),
-                "updated_at": Utc::now().to_rfc3339(),
-            })
-        }
-    };
+    let b = profile.ok_or_else(|| ApiError::not_found("bot profile"))?;
+    let item = json!({
+        "bot_id": b.bot_id,
+        "name": b.name,
+        "model": b.model,
+        "system_prompt": b.system_prompt,
+        "enabled_toolsets": b.enabled_toolsets.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+        "custom_settings": serde_json::from_str::<Value>(&b.custom_settings_json).unwrap_or_else(|_| json!({})),
+        "created_at": b.created_at,
+        "updated_at": b.updated_at,
+    });
 
     Ok(Json(item))
 }
@@ -1689,14 +1828,23 @@ async fn create_bot(
 ) -> Result<Json<Value>, ApiError> {
     let bot_id = payload.bot_id.trim();
     if bot_id.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bot_id cannot be empty"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bot_id cannot be empty",
+        ));
     }
     let name = payload.name.trim();
     if name.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "name cannot be empty"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "name cannot be empty",
+        ));
     }
     let toolsets_str = payload.enabled_toolsets.map(|ts| ts.join(","));
-    let settings_json = payload.custom_settings.map(|cs| cs.to_string()).unwrap_or_else(|| "{}".to_string());
+    let settings_json = payload
+        .custom_settings
+        .map(|cs| cs.to_string())
+        .unwrap_or_else(|| "{}".to_string());
     let now = Utc::now().to_rfc3339();
 
     sqlx::query(
@@ -1752,35 +1900,46 @@ async fn update_bot(
     AxumPath(bot_id): AxumPath<String>,
     Json(payload): Json<UpdateBotPayload>,
 ) -> Result<Json<Value>, ApiError> {
-    let name = payload.name.unwrap_or_else(|| match bot_id.as_str() {
-        "1465631383862120451" => "wawabot".to_string(),
-        "1529539440589013182" => "실피".to_string(),
-        "1529738312833830984" => "에리스".to_string(),
-        _ => "Discord Bot".to_string(),
-    });
+    let existing = sqlx::query_as::<_, BotProfileRow>(
+        "SELECT bot_id, name, model, system_prompt, enabled_toolsets, custom_settings_json, created_at, updated_at FROM bot_profiles WHERE bot_id = ?"
+    )
+    .bind(&bot_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("bot profile"))?;
+
+    let name = payload.name.unwrap_or(existing.name);
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "name cannot be empty",
+        ));
+    }
     let toolsets_str = payload.enabled_toolsets.map(|ts| ts.join(","));
-    let settings_json = payload.custom_settings.map(|cs| cs.to_string()).unwrap_or_else(|| "{}".to_string());
+    let settings_json = payload
+        .custom_settings
+        .map(|cs| cs.to_string())
+        .unwrap_or(existing.custom_settings_json);
     let now = Utc::now().to_rfc3339();
 
     sqlx::query(
-        "INSERT INTO bot_profiles (bot_id, name, model, system_prompt, enabled_toolsets, custom_settings_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(bot_id) DO UPDATE SET
-            name = excluded.name,
-            model = excluded.model,
-            system_prompt = excluded.system_prompt,
-            enabled_toolsets = excluded.enabled_toolsets,
-            custom_settings_json = excluded.custom_settings_json,
-            updated_at = excluded.updated_at"
+        "UPDATE bot_profiles SET
+            name = ?,
+            model = ?,
+            system_prompt = ?,
+            enabled_toolsets = ?,
+            custom_settings_json = ?,
+            updated_at = ?
+         WHERE bot_id = ?",
     )
-    .bind(&bot_id)
-    .bind(&name)
+    .bind(name)
     .bind(&payload.model)
     .bind(&payload.system_prompt)
     .bind(&toolsets_str)
     .bind(&settings_json)
     .bind(&now)
-    .bind(&now)
+    .bind(&bot_id)
     .execute(&state.pool)
     .await?;
 
@@ -1893,8 +2052,10 @@ async fn resolve_approval(
     if !state.approvals.resolve_custom_id(&custom_id).await {
         return Err(ApiError::not_found("approval request"));
     }
-    state.events.remove_pending(id).await;
-    Ok(Json(json!({"resolved": true, "id": id, "decision": suffix})))
+    // The requester's terminal event updates both dashboard and Discord UI.
+    Ok(Json(
+        json!({"resolved": true, "id": id, "decision": suffix}),
+    ))
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -1939,7 +2100,11 @@ async fn list_logs(
                 && search.as_deref().is_none_or(|search| {
                     entry.message.to_ascii_lowercase().contains(search)
                         || entry.target.to_ascii_lowercase().contains(search)
-                        || entry.fields.to_string().to_ascii_lowercase().contains(search)
+                        || entry
+                            .fields
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .contains(search)
                 })
         })
         .collect::<Vec<_>>();
@@ -1956,7 +2121,14 @@ async fn logs_ws(ws: WebSocketUpgrade, State(state): State<DashboardState>) -> R
 
 async fn handle_logs_socket(mut socket: WebSocket, logs: DashboardLogStore) {
     let tail = logs.snapshot();
-    for entry in tail.into_iter().rev().take(100).collect::<Vec<_>>().into_iter().rev() {
+    for entry in tail
+        .into_iter()
+        .rev()
+        .take(100)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         if socket
             .send(WsMessage::Text(
                 json!({"type":"log","entry":entry}).to_string().into(),
@@ -2028,9 +2200,9 @@ async fn serve_static(State(state): State<DashboardState>, uri: Uri) -> Response
 
 fn safe_relative_path(path: &Path) -> bool {
     !path.is_absolute()
-        && path.components().all(|component| {
-            matches!(component, Component::Normal(_) | Component::CurDir)
-        })
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 fn static_response(path: &Path, bytes: Vec<u8>) -> Response {
@@ -2047,10 +2219,9 @@ fn static_response(path: &Path, bytes: Vec<u8>) -> Response {
         _ => "application/octet-stream",
     };
     let mut response = Response::new(Body::from(bytes));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response
 }
 
@@ -2122,20 +2293,248 @@ mod tests {
         let app = router(test_state().await);
         let health = app
             .clone()
-            .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::HOST, "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
         assert_eq!(json_body(health).await["status"], "ok");
 
         let status = app
-            .oneshot(Request::builder().uri("/api/status").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .header(header::HOST, "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(status.status(), StatusCode::OK);
         let body = json_body(status).await;
         assert_eq!(body["database"]["sessions"], 0);
         assert_eq!(body["chat_available"], false);
+    }
+
+    #[tokio::test]
+    async fn approval_lifecycle_local_http_surface() {
+        use omon_gateway::discord::adapter::DiscordEgress;
+        use omon_gateway::discord::approval::{
+            ApprovalDecision, ApprovalError, ApprovalRequester, DiscordApprovalRequester,
+        };
+        use serenity::all::{HttpBuilder, Message};
+        use std::time::Duration;
+
+        // Given: the production router, reducer, composite dispatcher, guard,
+        // requester and Discord HTTP client. Only Discord's wire peer is local.
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state().await;
+        state.workspace_root = root.path().join("workspace");
+        state.web_root = root.path().join("web");
+        let (wire_tx, mut wire_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rest = Router::new().fallback(
+            move |method: axum::http::Method, uri: Uri, Json(body): Json<Value>| {
+                let tx = wire_tx.clone();
+                async move {
+                    tx.send((method, uri.path().to_owned(), body)).unwrap();
+                    let mut message = Message::default();
+                    message.id = serenity::all::MessageId::new(100);
+                    message.channel_id = serenity::all::ChannelId::new(43);
+                    Json(message)
+                }
+            },
+        );
+        let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest_addr = rest_listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let rest_shutdown = shutdown.clone();
+        let rest_task = tokio::spawn(async move {
+            axum::serve(rest_listener, rest)
+                .with_graceful_shutdown(rest_shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        let egress = Arc::new(DiscordEgress::new(Arc::new(
+            HttpBuilder::new("U03-local")
+                .proxy(format!("http://{rest_addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        )));
+        let requester = Arc::new(DiscordApprovalRequester::new(
+            state.approvals.clone(),
+            Duration::from_secs(60),
+        ));
+        requester
+            .set_dispatcher(Arc::new(CompositeDispatcher::new(
+                egress.clone(),
+                state.events.clone(),
+            )))
+            .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let app_shutdown = shutdown.clone();
+        let app_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(app_shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let session = SessionKey::new("discord", Some("guild"), "42", Some("43"), "7");
+        let mut preserves_content = true;
+        let mut events = state.events.subscribe();
+
+        for ending in [
+            "once", "session", "always", "deny", "drop", "clear", "cancel",
+        ] {
+            let key = session.clone();
+            let task_requester = requester.clone();
+            let task_key = key.clone();
+            if ending == "dead" {
+                egress.dead_targets().mark_dead(43, "fixture");
+            }
+            let task = tokio::spawn(async move {
+                task_requester
+                    .request_approval_scoped(
+                        &task_key,
+                        "rm -rf fixture",
+                        "display only",
+                        &format!("U03:{ending}"),
+                    )
+                    .await
+            });
+            let request_id = match tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                OutboundAction::ApprovalRequest { request_id, .. } => request_id,
+                other => panic!("unexpected event {other:?}"),
+            };
+            if ending != "dead" {
+                let (method, path, body) =
+                    tokio::time::timeout(Duration::from_secs(3), wire_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(method, axum::http::Method::POST);
+                assert!(path.ends_with("/channels/43/messages"));
+                assert_eq!(
+                    body["components"][0]["components"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    4
+                );
+                let pending: Value = client
+                    .get(format!("http://{addr}/api/approvals/pending"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(pending["items"][0]["id"], request_id.to_string());
+                assert_eq!(pending["pending_count"], 1);
+            }
+
+            // When: terminate via real HTTP resolution, caller cancellation,
+            // guard cleanup or failed dispatch. Subscriptions precede the action.
+            match ending {
+                "drop" => task.abort(),
+                "clear" => state.approvals.clear_session(&key).await,
+                "cancel" => state.approvals.cancel(request_id).await,
+                "dead" => {}
+                decision => {
+                    let response = client
+                        .post(format!("http://{addr}/api/approvals/{request_id}/resolve"))
+                        .json(&json!({"decision": decision}))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let result: Value = response.json().await.unwrap();
+                    assert_eq!(result["resolved"], true);
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap();
+            match ending {
+                "drop" => assert!(result.unwrap_err().is_cancelled()),
+                "clear" | "cancel" | "dead" => {
+                    assert_eq!(result.unwrap(), Err(ApprovalError::Cancelled))
+                }
+                "deny" => assert_eq!(result.unwrap(), Ok(ApprovalDecision::Deny { reason: None })),
+                _ => assert!(result.unwrap().unwrap().is_approved()),
+            }
+            assert!(
+                matches!(tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap(),
+                OutboundAction::ExpireApproval { request_id: id } if id == request_id)
+            );
+            if ending != "dead" {
+                let (method, path, body) =
+                    tokio::time::timeout(Duration::from_secs(3), wire_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                println!("AP08 local {ending} {method} {path} edit={body}");
+                assert_eq!(method, axum::http::Method::PATCH);
+                assert!(path.ends_with("/channels/43/messages/100"));
+                assert_eq!(body["components"], json!([]));
+                preserves_content &= body.get("content").is_none();
+            }
+            let pending: Value = client
+                .get(format!("http://{addr}/api/approvals/pending"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(pending["pending_count"], 0);
+            assert_eq!(pending["items"], json!([]));
+            assert_eq!(egress.approval_message_count().await, 0);
+            assert!(events.try_recv().is_err());
+            assert!(wire_rx.try_recv().is_err());
+            let duplicate = client
+                .post(format!("http://{addr}/api/approvals/{request_id}/resolve"))
+                .json(&json!({"decision":"once"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(duplicate.status(), StatusCode::NOT_FOUND);
+            println!("AP08 local {ending} guard=0 dashboard=0 egress=0 duplicate=404");
+        }
+
+        // Then: one terminal event cleans both real surfaces without overwriting
+        // a component interaction's decision. Close resources before assertion.
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(3), rest_task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), app_task)
+            .await
+            .unwrap()
+            .unwrap();
+        state.pool.close().await;
+        root.close().unwrap();
+        println!("AP08 local cleanup: listeners joined, DB closed, temp root removed; preserves_content={preserves_content}");
+        assert!(
+            preserves_content,
+            "terminal edit must not replace a resolution with expired content"
+        );
     }
 
     #[tokio::test]
@@ -2161,7 +2560,13 @@ mod tests {
         let app = router(state);
         let sessions = app
             .clone()
-            .oneshot(Request::builder().uri("/api/sessions?per_page=10").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions?per_page=10")
+                    .header(header::HOST, "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let body = json_body(sessions).await;
@@ -2172,6 +2577,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/sessions/test/messages")
+                    .header(header::HOST, "127.0.0.1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2191,8 +2597,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/cron/jobs")
+                    .header(header::HOST, "127.0.0.1")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"expression":"@every 5m","payload":{"content":"ping"}}"#))
+                    .body(Body::from(
+                        r#"{"expression":"@every 5m","payload":{"content":"ping"}}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2207,6 +2616,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/cron/jobs/{id}/pause"))
+                    .header(header::HOST, "127.0.0.1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2218,6 +2628,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/cron/jobs/{id}"))
+                    .header(header::HOST, "127.0.0.1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2231,13 +2642,243 @@ mod tests {
     async fn config_endpoint_never_exposes_provider_secret_values() {
         let app = router(test_state().await);
         let response = app
-            .oneshot(Request::builder().uri("/api/config").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::HOST, "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let body = json_body(response).await;
         let rendered = body.to_string();
         assert!(!rendered.contains("OPENAI_API_KEY"));
         assert_eq!(body["providers"]["openai_api_key_configured"], true);
+    }
+
+    #[tokio::test]
+    async fn disk_pressure_real_loopback_http_surface() {
+        let root = tempfile::tempdir().unwrap();
+        let sample_cell = Arc::new(Mutex::new((
+            Some(1000 * readiness::DISK_BYTES_PER_MB),
+            Some(200 * readiness::DISK_BYTES_PER_MB),
+        )));
+        let cell_clone = sample_cell.clone();
+
+        let mut state = test_state().await;
+        state.workspace_root = root.path().join("workspace");
+        tokio::fs::create_dir_all(&state.workspace_root)
+            .await
+            .unwrap();
+        state = state.with_disk_sampler(move |_| *cell_clone.lock());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let app_shutdown = shutdown.clone();
+        let app = router(state.clone());
+        let app_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(app_shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+
+        // 1. Critical headroom sample: 1000 MiB total, 200 MiB free (< 256 MiB floor)
+        *sample_cell.lock() = (
+            Some(1000 * readiness::DISK_BYTES_PER_MB),
+            Some(200 * readiness::DISK_BYTES_PER_MB),
+        );
+        let health = client
+            .get(format!("http://{addr}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["status"], "ok");
+
+        let status = client
+            .get(format!("http://{addr}/api/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status_body: Value = status.json().await.unwrap();
+        assert_eq!(status_body["status"], "degraded");
+        assert_eq!(status_body["disk"]["pressure"], "critical");
+        assert_eq!(status_body["disk"]["status"], "degraded");
+        assert_eq!(status_body["disk"]["used_percent"], 80.0);
+        assert_eq!(status_body["disk"]["total_mb"], 1000);
+        assert_eq!(status_body["disk"]["available_mb"], 200);
+        assert_eq!(
+            status_body["disk"]["workspace_total_bytes"],
+            1000 * 1024 * 1024
+        );
+        assert_eq!(
+            status_body["disk"]["workspace_available_bytes"],
+            200 * 1024 * 1024
+        );
+
+        let readiness = client
+            .get(format!("http://{addr}/api/readiness"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ready_body: Value = readiness.json().await.unwrap();
+        assert_eq!(ready_body["status"], "degraded");
+        assert_eq!(ready_body["checks"]["disk"], false);
+        assert_eq!(ready_body["disk"]["pressure"], "critical");
+
+        // 2. Large capacity with headroom: 1,000,000 MiB total, 50,000 MiB free (95% used, 50 GB free)
+        *sample_cell.lock() = (
+            Some(1000000 * readiness::DISK_BYTES_PER_MB),
+            Some(50000 * readiness::DISK_BYTES_PER_MB),
+        );
+        let health2 = client
+            .get(format!("http://{addr}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health2.status(), StatusCode::OK);
+
+        let status2 = client
+            .get(format!("http://{addr}/api/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status2.status(), StatusCode::OK);
+        let status2_body: Value = status2.json().await.unwrap();
+        assert_eq!(status2_body["status"], "ok");
+        assert_eq!(status2_body["disk"]["pressure"], "ok");
+        assert_eq!(status2_body["disk"]["status"], "ok");
+        assert_eq!(status2_body["disk"]["used_percent"], 95.0);
+        assert_eq!(status2_body["disk"]["total_mb"], 1000000);
+        assert_eq!(status2_body["disk"]["available_mb"], 50000);
+
+        let readiness2 = client
+            .get(format!("http://{addr}/api/readiness"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readiness2.status(), StatusCode::OK);
+        let ready2_body: Value = readiness2.json().await.unwrap();
+        assert_eq!(ready2_body["status"], "ready");
+        assert_eq!(ready2_body["checks"]["disk"], true);
+        assert_eq!(ready2_body["disk"]["pressure"], "ok");
+
+        // 3. Zero capacity sample: 0 total, 0 free
+        *sample_cell.lock() = (Some(0), Some(0));
+        let health3 = client
+            .get(format!("http://{addr}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health3.status(), StatusCode::OK);
+
+        let status3 = client
+            .get(format!("http://{addr}/api/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status3.status(), StatusCode::OK);
+        let status3_body: Value = status3.json().await.unwrap();
+        assert_eq!(status3_body["status"], "degraded");
+        assert_eq!(status3_body["disk"]["pressure"], "unknown");
+        assert_eq!(status3_body["disk"]["status"], "degraded");
+
+        let readiness3 = client
+            .get(format!("http://{addr}/api/readiness"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readiness3.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ready3_body: Value = readiness3.json().await.unwrap();
+        assert_eq!(ready3_body["status"], "degraded");
+        assert_eq!(ready3_body["checks"]["disk"], false);
+        assert_eq!(ready3_body["disk"]["pressure"], "unknown");
+
+        // 4. Unreadable filesystem sample: None, None
+        *sample_cell.lock() = (None, None);
+        let health4 = client
+            .get(format!("http://{addr}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health4.status(), StatusCode::OK);
+
+        let status4 = client
+            .get(format!("http://{addr}/api/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status4.status(), StatusCode::OK);
+        let status4_body: Value = status4.json().await.unwrap();
+        assert_eq!(status4_body["status"], "degraded");
+        assert_eq!(status4_body["disk"]["pressure"], "unknown");
+        assert!(status4_body["disk"]["workspace_total_bytes"].is_null());
+
+        let readiness4 = client
+            .get(format!("http://{addr}/api/readiness"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readiness4.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ready4_body: Value = readiness4.json().await.unwrap();
+        assert_eq!(ready4_body["status"], "degraded");
+        assert_eq!(ready4_body["checks"]["disk"], false);
+        assert_eq!(ready4_body["disk"]["pressure"], "unknown");
+
+        // 5. Elevated boundary sample: 4000 MiB total, 400 MiB free (< 512 MiB floor, 90% used)
+        *sample_cell.lock() = (
+            Some(4000 * readiness::DISK_BYTES_PER_MB),
+            Some(400 * readiness::DISK_BYTES_PER_MB),
+        );
+        let health5 = client
+            .get(format!("http://{addr}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health5.status(), StatusCode::OK);
+
+        let status5 = client
+            .get(format!("http://{addr}/api/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status5.status(), StatusCode::OK);
+        let status5_body: Value = status5.json().await.unwrap();
+        assert_eq!(status5_body["status"], "degraded");
+        assert_eq!(status5_body["disk"]["pressure"], "elevated");
+        assert_eq!(status5_body["disk"]["status"], "degraded");
+        assert_eq!(status5_body["disk"]["used_percent"], 90.0);
+
+        let readiness5 = client
+            .get(format!("http://{addr}/api/readiness"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readiness5.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ready5_body: Value = readiness5.json().await.unwrap();
+        assert_eq!(ready5_body["status"], "degraded");
+        assert_eq!(ready5_body["checks"]["disk"], false);
+        assert_eq!(ready5_body["disk"]["pressure"], "elevated");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(3), app_task)
+            .await
+            .unwrap()
+            .unwrap();
+        state.pool.close().await;
+        root.close().unwrap();
     }
 
     #[test]
@@ -2252,5 +2893,386 @@ mod tests {
         .with_bot_id("bot:4");
         let parsed = parse_storage_key(&original.storage_key()).expect("parse storage key");
         assert_eq!(parsed, original);
+    }
+
+    struct U65RecordingRunner {
+        events: tokio::sync::mpsc::UnboundedSender<InboundEvent>,
+    }
+
+    #[async_trait]
+    impl omon_gateway::AgentRunner for U65RecordingRunner {
+        async fn run(
+            &self,
+            _session: &mut omon_gateway::SessionContext,
+            event: InboundEvent,
+        ) -> omon_gateway::Result<()> {
+            let _ = self.events.send(event);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_rejects_untrusted_host_and_ws_origin() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state().await;
+        state.workspace_root = root.path().join("workspace");
+        state.web_root = root.path().join("web");
+        tokio::fs::create_dir_all(&state.workspace_root)
+            .await
+            .unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = Arc::new(U65RecordingRunner { events: event_tx });
+        let mux = SessionMultiplexer::new(
+            state.pool.clone(),
+            runner,
+            omon_gateway::MultiplexerConfig::default(),
+        );
+        state.multiplexer = Some(mux);
+
+        // 1. Verify public-bind refusal even with insecure=true
+        let invalid_settings = DashboardSettings {
+            enabled: true,
+            host: "0.0.0.0".into(),
+            port: 9119,
+            insecure: true,
+            web_root: root.path().join("web"),
+        };
+        let bind_rejected = invalid_settings.validate().is_err();
+        println!("U65 public bind with insecure=true rejected={bind_rejected}");
+
+        // Spawn real dashboard server on loopback
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let settings = DashboardSettings {
+            enabled: true,
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            insecure: false,
+            web_root: root.path().join("web"),
+        };
+        let shutdown = CancellationToken::new();
+        let server_handle = spawn_server(settings, state.clone(), shutdown.clone())
+            .await
+            .unwrap();
+
+        // 2. Untrusted HTTP Host denial
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET /api/sessions HTTP/1.1\r\nHost: evil.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut resp_bytes = Vec::new();
+        stream.read_to_end(&mut resp_bytes).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_bytes);
+        let http_status_line = resp_str.lines().next().unwrap_or_default().to_string();
+        println!("U65 HTTP GET /api/sessions Host=evil.test status_line={http_status_line}");
+
+        // 3. Untrusted WS Origin denial before data or admitted event
+        let mut evil_ws_req = format!("ws://{addr}/api/sessions/probe/ws")
+            .into_client_request()
+            .unwrap();
+        evil_ws_req.headers_mut().insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://evil.test"),
+        );
+        let mut admitted_evil = false;
+        let ws_evil_status: String;
+        match tokio_tungstenite::connect_async(evil_ws_req).await {
+            Ok((mut evil_ws, resp)) => {
+                ws_evil_status = resp.status().to_string();
+                println!(
+                    "U65 WS /api/sessions/probe/ws Origin=https://evil.test connected status={ws_evil_status}"
+                );
+                let _ = evil_ws.next().await;
+                let _ = evil_ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"type":"message","content":"probe"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await;
+                if let Ok(Some(ev)) =
+                    tokio::time::timeout(Duration::from_millis(500), event_rx.recv()).await
+                {
+                    println!("U65 WS evil origin admitted event={:?}", ev.content);
+                    admitted_evil = true;
+                }
+            }
+            Err(err) => {
+                ws_evil_status = err.to_string();
+                println!(
+                    "U65 WS /api/sessions/probe/ws Origin=https://evil.test rejected: {ws_evil_status}"
+                );
+            }
+        }
+
+        // 4. Local same-origin HTTP and WS work
+        let mut local_stream = TcpStream::connect(addr).await.unwrap();
+        let local_req =
+            format!("GET /api/sessions HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        local_stream.write_all(local_req.as_bytes()).await.unwrap();
+        let mut local_resp_bytes = Vec::new();
+        local_stream
+            .read_to_end(&mut local_resp_bytes)
+            .await
+            .unwrap();
+        let local_resp_str = String::from_utf8_lossy(&local_resp_bytes);
+        let local_http_status_line = local_resp_str
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        println!(
+            "U65 local HTTP GET /api/sessions Host={addr} status_line={local_http_status_line}"
+        );
+
+        let mut local_ws_req = format!("ws://{addr}/api/sessions/probe/ws")
+            .into_client_request()
+            .unwrap();
+        local_ws_req.headers_mut().insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_str(&format!("http://{addr}")).unwrap(),
+        );
+        let mut admitted_local = false;
+        match tokio_tungstenite::connect_async(local_ws_req).await {
+            Ok((mut local_ws, resp)) => {
+                println!("U65 local WS connected status={}", resp.status());
+                let _ = local_ws.next().await;
+                local_ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"type":"message","content":"probe"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if let Ok(Some(ev)) =
+                    tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await
+                {
+                    println!("U65 local WS admitted event={:?}", ev.content);
+                    admitted_local = true;
+                }
+            }
+            Err(err) => {
+                println!("U65 local WS failed err={err}");
+            }
+        }
+
+        // Clean up resources before assertions
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(3), server_handle).await;
+        state.pool.close().await;
+        root.close().unwrap();
+
+        // Assertions
+        assert!(
+            bind_rejected,
+            "public bind must be refused even when insecure=true"
+        );
+        assert!(
+            http_status_line.contains("403") || http_status_line.contains("400"),
+            "GET /api/sessions with Host: evil.test must be rejected with 400/403, got: {http_status_line}"
+        );
+        assert!(
+            !admitted_evil,
+            "WS with untrusted Origin must not admit event to runtime"
+        );
+        assert!(
+            ws_evil_status.contains("403") || ws_evil_status.contains("400"),
+            "WS with untrusted Origin must be rejected with 400/403, got: {ws_evil_status}"
+        );
+        assert!(
+            admitted_local,
+            "local same-origin WS must be accepted and admit message"
+        );
+    }
+
+    #[tokio::test]
+    async fn bot_profile_delete_stays_deleted() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state().await;
+        state.workspace_root = root.path().join("workspace");
+        state.web_root = root.path().join("web");
+        tokio::fs::create_dir_all(&state.workspace_root)
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let app_shutdown = shutdown.clone();
+        let app = router(state.clone());
+        let app_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(app_shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+
+        let bot_id = "1465631383862120451";
+
+        // 1. POST saved bot 1465631383862120451
+        let create_payload = json!({
+            "bot_id": bot_id,
+            "name": "wawabot-saved",
+            "model": "gpt-4o",
+            "system_prompt": "You are wawabot custom profile",
+            "enabled_toolsets": ["terminal", "file"]
+        });
+        let post_resp = client
+            .post(format!("http://{addr}/api/bots"))
+            .json(&create_payload)
+            .send()
+            .await
+            .unwrap();
+        let post_status = post_resp.status();
+        let post_body: Value = post_resp.json().await.unwrap();
+        println!("U69 POST /api/bots status={post_status} body={post_body}");
+
+        // BotsPage reload sequence: GET /api/bots after creation
+        let list_after_create_resp = client
+            .get(format!("http://{addr}/api/bots"))
+            .send()
+            .await
+            .unwrap();
+        let list_after_create: Value = list_after_create_resp.json().await.unwrap();
+        let created_in_list = list_after_create["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|b| b["bot_id"] == bot_id && b["name"] == "wawabot-saved")
+        });
+        println!("U69 GET /api/bots after create: created_in_list={created_in_list}");
+
+        // GET detail of created bot
+        let detail_resp = client
+            .get(format!("http://{addr}/api/bots/{bot_id}"))
+            .send()
+            .await
+            .unwrap();
+        let detail_status = detail_resp.status();
+        let detail_body: Value = detail_resp.json().await.unwrap();
+        println!(
+            "U69 GET /api/bots/{bot_id} status={detail_status} name={:?}",
+            detail_body["name"]
+        );
+
+        // 2. DELETE bot 1465631383862120451
+        let del_resp = client
+            .delete(format!("http://{addr}/api/bots/{bot_id}"))
+            .send()
+            .await
+            .unwrap();
+        let del_status = del_resp.status();
+        let del_body: Value = del_resp.json().await.unwrap();
+        println!("U69 DELETE /api/bots/{bot_id} status={del_status} body={del_body}");
+
+        // BotsPage reload sequence: GET /api/bots after delete
+        let list_after_delete_resp = client
+            .get(format!("http://{addr}/api/bots"))
+            .send()
+            .await
+            .unwrap();
+        let list_after_delete_status = list_after_delete_resp.status();
+        let list_after_delete: Value = list_after_delete_resp.json().await.unwrap();
+        let deleted_in_list = list_after_delete["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|b| b["bot_id"] == bot_id));
+        println!(
+            "U69 GET /api/bots after delete status={list_after_delete_status} deleted_in_list={deleted_in_list} (RED: synthetic row returns; GREEN: row absent)"
+        );
+
+        // GET detail of deleted bot
+        let detail_after_delete_resp = client
+            .get(format!("http://{addr}/api/bots/{bot_id}"))
+            .send()
+            .await
+            .unwrap();
+        let detail_after_delete_status = detail_after_delete_resp.status();
+        let detail_after_delete_body: Value = detail_after_delete_resp.json().await.unwrap();
+        println!(
+            "U69 GET /api/bots/{bot_id} after delete status={detail_after_delete_status} body={detail_after_delete_body} (RED: 200 fabricated; GREEN: 404)"
+        );
+
+        // GET detail of unknown bot
+        let unknown_resp = client
+            .get(format!("http://{addr}/api/bots/unknown-bot-999"))
+            .send()
+            .await
+            .unwrap();
+        let unknown_status = unknown_resp.status();
+        let unknown_body: Value = unknown_resp.json().await.unwrap();
+        println!(
+            "U69 GET /api/bots/unknown-bot-999 status={unknown_status} body={unknown_body} (RED: 200 fabricated; GREEN: 404)"
+        );
+
+        // 3. DB unavailable test
+        state.pool.close().await;
+        let db_down_resp = client
+            .get(format!("http://{addr}/api/bots"))
+            .send()
+            .await
+            .unwrap();
+        let db_down_status = db_down_resp.status();
+        let db_down_body: Value = db_down_resp.json().await.unwrap_or(json!({}));
+        let invented_inventory = db_down_body["items"]
+            .as_array()
+            .is_some_and(|arr| !arr.is_empty());
+        println!(
+            "U69 DB unavailable GET /api/bots status={db_down_status} invented_inventory={invented_inventory} (RED: 200 with fake rows; GREEN: error)"
+        );
+
+        // Clean up server resources before asserting
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(3), app_task).await;
+        root.close().unwrap();
+
+        // Assertions
+        assert_eq!(post_status, StatusCode::OK);
+        assert!(created_in_list, "created bot must be present in bot list");
+        assert_eq!(detail_status, StatusCode::OK);
+        assert_eq!(del_status, StatusCode::OK);
+
+        assert!(
+            !deleted_in_list,
+            "deleted bot 1465631383862120451 must NOT appear in bot list, but synthetic row was returned: {list_after_delete}"
+        );
+        assert_eq!(
+            detail_after_delete_status,
+            StatusCode::NOT_FOUND,
+            "GET detail of deleted bot must be 404 Not Found, got: {detail_after_delete_status}"
+        );
+        assert_eq!(
+            unknown_status,
+            StatusCode::NOT_FOUND,
+            "GET detail of unknown bot must be 404 Not Found, got: {unknown_status}"
+        );
+        assert_ne!(
+            db_down_status,
+            StatusCode::OK,
+            "DB unavailable must return error, not 200 OK"
+        );
+        assert!(
+            !invented_inventory,
+            "DB unavailable must not return invented inventory: {db_down_body}"
+        );
     }
 }

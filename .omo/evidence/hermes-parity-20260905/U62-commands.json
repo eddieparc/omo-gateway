@@ -1,0 +1,9 @@
+[
+  "cargo test --lib agent::omo_daemon::tests::daemon_restart_budget_and_unready_child -- --exact --nocapture",
+  "cargo test --lib agent::omo_daemon::tests::daemon_restart_budget_stops_spawn_failures -- --exact --nocapture",
+  "cargo test --lib agent::omo_daemon::tests::daemon_exiting_child_budget_local_surface -- --exact --nocapture",
+  "cargo test --lib agent::omo_daemon::tests::daemon_ensure_owned_local_surface -- --exact --nocapture",
+  "cargo test --lib agent::omo_daemon::tests -- --nocapture",
+  "cargo build --lib",
+  "git diff --check -- src/agent/omo_daemon.rs"
+]

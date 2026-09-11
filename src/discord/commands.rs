@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 
 use super::approval::SmartApprovalGuard;
 use super::attachments::AttachmentDownloader;
+use crate::storage::PendingWriteScope as PendingScope;
 use crate::{ChatMessage, LlmClient, OmonError, ProfileRouter, SessionKey, SessionMultiplexer};
 
 pub type CommandError = Box<dyn std::error::Error + Send + Sync>;
@@ -31,6 +32,8 @@ pub struct PoiseData {
     /// Thread IDs the bot is actively participating in (created or @mentioned).
     /// Kept in-memory: fast, zero-overhead, sufficient for active gateway runtime lifecycle.
     pub active_threads: Arc<RwLock<HashSet<u64>>>,
+    /// Durable thread ownership mapping (thread_id -> bot_id) cached in memory and backed by SQLite.
+    pub thread_owners: Arc<RwLock<HashMap<u64, u64>>>,
     pub thread_require_mention: bool,
     pub allow_bots: super::adapter::AllowBotsMode,
     pub channel_topic_context: bool,
@@ -41,6 +44,7 @@ pub struct PoiseData {
     pub approval_mentions: bool,
     pub approvals_deny: Vec<String>,
     pub runtime_footer: bool,
+    pub destructive_slash_confirm: bool,
     pub primary_bot_id: Option<u64>,
     pub attachment_downloader: Option<AttachmentDownloader>,
     pub tool_registry: crate::ToolRegistry,
@@ -77,6 +81,7 @@ impl PoiseData {
             allowed_channels: Vec::new(),
             ignored_channels: Vec::new(),
             active_threads: Arc::new(RwLock::new(HashSet::new())),
+            thread_owners: Arc::new(RwLock::new(HashMap::new())),
             thread_require_mention: false,
             allow_bots: super::adapter::AllowBotsMode::None,
             channel_topic_context: false,
@@ -87,6 +92,7 @@ impl PoiseData {
             approval_mentions: false,
             approvals_deny: Vec::new(),
             runtime_footer: false,
+            destructive_slash_confirm: true,
             primary_bot_id: None,
             attachment_downloader: None,
             tool_registry: crate::ToolRegistry::new(),
@@ -101,6 +107,44 @@ impl PoiseData {
         if let Ok(mut set) = self.active_threads.write() {
             set.insert(thread_id);
         }
+    }
+
+    pub fn mark_thread_owner(&self, thread_id: u64, bot_id: u64) {
+        if let Ok(mut map) = self.thread_owners.write() {
+            map.insert(thread_id, bot_id);
+        }
+        if let Ok(mut set) = self.active_threads.write() {
+            set.insert(thread_id);
+        }
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let _ = crate::Database::record_thread_owner(&pool, thread_id, bot_id).await;
+        });
+    }
+
+    pub async fn get_thread_owner_durable(&self, thread_id: u64) -> Option<u64> {
+        if let Ok(map) = self.thread_owners.read() {
+            if let Some(owner) = map.get(&thread_id).copied() {
+                return Some(owner);
+            }
+        }
+        if let Ok(Some(owner)) = crate::Database::get_thread_owner(&self.pool, thread_id).await {
+            if let Ok(mut map) = self.thread_owners.write() {
+                map.insert(thread_id, owner);
+            }
+            if let Ok(mut set) = self.active_threads.write() {
+                set.insert(thread_id);
+            }
+            return Some(owner);
+        }
+        None
+    }
+
+    pub fn get_thread_owner_cached(&self, thread_id: u64) -> Option<u64> {
+        self.thread_owners
+            .read()
+            .ok()
+            .and_then(|map| map.get(&thread_id).copied())
     }
 
     pub fn is_thread_active(&self, thread_id: u64) -> bool {
@@ -164,9 +208,6 @@ pub fn is_user_authorized(
     if allow_all_users {
         return true;
     }
-    if allowed_users.is_empty() && allowed_roles.is_empty() {
-        return true;
-    }
     if !allowed_users.is_empty() && allowed_users.contains(&user_id) {
         return true;
     }
@@ -174,6 +215,130 @@ pub fn is_user_authorized(
         return true;
     }
     false
+}
+
+/// Outcome of evaluating slash command admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandAdmissionResult {
+    Allowed,
+    UnauthorizedUser,
+    UnauthorizedChannel,
+    MissingGuildMetadata,
+}
+
+impl CommandAdmissionResult {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
+/// Evaluates whether a channel is admitted by channel allow/ignore lists.
+pub fn is_channel_authorized(
+    channel_id: u64,
+    parent_channel_id: Option<u64>,
+    allowed_channels: &[u64],
+    ignored_channels: &[u64],
+    is_dm: bool,
+) -> bool {
+    // 1. Blacklist: channel or its parent in ignored_channels -> rejected.
+    if ignored_channels.contains(&channel_id) {
+        return false;
+    }
+    if let Some(parent_id) = parent_channel_id {
+        if ignored_channels.contains(&parent_id) {
+            return false;
+        }
+    }
+
+    // 2. Whitelist: if allowed_channels is non-empty, guild channels must be in allowed_channels
+    // (or their parent must be in allowed_channels). DMs are exempt.
+    if !is_dm && !allowed_channels.is_empty() {
+        let channel_allowed = allowed_channels.contains(&channel_id);
+        let parent_allowed = parent_channel_id
+            .map(|pid| allowed_channels.contains(&pid))
+            .unwrap_or(false);
+        if !channel_allowed && !parent_allowed {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Channel identity and guild metadata resolution for slash command admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandChannelScope {
+    pub channel_id: u64,
+    pub parent_channel_id: Option<u64>,
+    pub is_dm: bool,
+    pub guild_metadata_available: bool,
+}
+
+impl CommandChannelScope {
+    pub fn guild(channel_id: u64, parent_channel_id: Option<u64>) -> Self {
+        Self {
+            channel_id,
+            parent_channel_id,
+            is_dm: false,
+            guild_metadata_available: true,
+        }
+    }
+
+    pub fn dm(channel_id: u64) -> Self {
+        Self {
+            channel_id,
+            parent_channel_id: None,
+            is_dm: true,
+            guild_metadata_available: true,
+        }
+    }
+
+    pub fn missing_guild_metadata(channel_id: u64) -> Self {
+        Self {
+            channel_id,
+            parent_channel_id: None,
+            is_dm: false,
+            guild_metadata_available: false,
+        }
+    }
+}
+
+/// Evaluates slash command admission at the command admission boundary.
+pub fn check_slash_admission(
+    user_id: u64,
+    is_paired: bool,
+    channel: CommandChannelScope,
+    config: &super::adapter::InboundFilterConfig<'_>,
+) -> CommandAdmissionResult {
+    if !channel.guild_metadata_available {
+        return CommandAdmissionResult::MissingGuildMetadata;
+    }
+
+    let user_authorized = is_paired
+        || config.paired_users.contains(&user_id)
+        || is_user_authorized(
+            user_id,
+            config.user_roles,
+            config.allowed_users,
+            config.allowed_roles,
+            config.allow_all_users,
+        );
+    if !user_authorized {
+        return CommandAdmissionResult::UnauthorizedUser;
+    }
+
+    let parent_id = channel.parent_channel_id.or(config.parent_channel_id);
+    if !is_channel_authorized(
+        channel.channel_id,
+        parent_id,
+        config.allowed_channels,
+        config.ignored_channels,
+        channel.is_dm,
+    ) {
+        return CommandAdmissionResult::UnauthorizedChannel;
+    }
+
+    CommandAdmissionResult::Allowed
 }
 
 pub async fn command_check(ctx: PoiseContext<'_>) -> Result<bool, CommandError> {
@@ -184,32 +349,117 @@ pub async fn command_check(ctx: PoiseContext<'_>) -> Result<bool, CommandError> 
         Some(member) => member.roles.iter().map(|r| r.get()).collect(),
         None => Vec::new(),
     };
-    if is_paired
-        || is_user_authorized(
-            user_id,
-            &user_roles,
-            &data.allowed_users,
-            &data.allowed_roles,
-            data.allow_all_users,
-        )
-    {
-        return Ok(true);
-    }
+    let channel_id = ctx.channel_id().get();
+    let channel_scope = if ctx.guild_id().is_some() {
+        match ctx.channel_id().to_channel(ctx.serenity_context()).await {
+            Ok(serenity::Channel::Guild(guild_channel)) => {
+                CommandChannelScope::guild(channel_id, guild_channel.parent_id.map(|id| id.get()))
+            }
+            _ => CommandChannelScope::missing_guild_metadata(channel_id),
+        }
+    } else {
+        CommandChannelScope::dm(channel_id)
+    };
 
-    ctx.send(
-        poise::CreateReply::default()
-            .content("You are not authorized to use this command.")
-            .ephemeral(true),
-    )
-    .await?;
-    Ok(false)
+    let config = super::adapter::InboundFilterConfig {
+        allowed_users: &data.allowed_users,
+        allowed_roles: &data.allowed_roles,
+        user_roles: &user_roles,
+        allow_all_users: data.allow_all_users,
+        allowed_channels: &data.allowed_channels,
+        ignored_channels: &data.ignored_channels,
+        ..Default::default()
+    };
+
+    match check_slash_admission(user_id, is_paired, channel_scope, &config) {
+        CommandAdmissionResult::Allowed => Ok(true),
+        CommandAdmissionResult::UnauthorizedUser => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content("You are not authorized to use this command.")
+                    .ephemeral(true),
+            )
+            .await?;
+            Ok(false)
+        }
+        CommandAdmissionResult::UnauthorizedChannel => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content("This command cannot be used in this channel.")
+                    .ephemeral(true),
+            )
+            .await?;
+            Ok(false)
+        }
+        CommandAdmissionResult::MissingGuildMetadata => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content("Channel authorization check failed.")
+                    .ephemeral(true),
+            )
+            .await?;
+            Ok(false)
+        }
+    }
+}
+
+enum PendingAction<'a> {
+    List,
+    Review(&'a str),
+    Approve(&'a str),
+    Reject(&'a str),
+}
+
+async fn pending_command(
+    pool: &SqlitePool,
+    scope: PendingScope<'_>,
+    action: PendingAction<'_>,
+) -> crate::Result<poise::CreateReply> {
+    let records = match action {
+        PendingAction::List => crate::storage::list_pending_writes_scoped(pool, scope).await?,
+        PendingAction::Review(id) => {
+            vec![crate::storage::get_pending_write_scoped(pool, id, scope).await?]
+        }
+        PendingAction::Approve(id) => {
+            let result = crate::storage::approve_pending_write_scoped(pool, id, scope).await?;
+            let content = if result.is_some() {
+                "Pending write approved."
+            } else {
+                "Pending write was already consumed."
+            };
+            return Ok(poise::CreateReply::default().content(content));
+        }
+        PendingAction::Reject(id) => {
+            let rejected = crate::storage::reject_pending_write_scoped(pool, id, scope).await?;
+            let content = if rejected {
+                "Pending write rejected."
+            } else {
+                "Pending write was already consumed."
+            };
+            return Ok(poise::CreateReply::default().content(content));
+        }
+    };
+    if records.is_empty() {
+        return Ok(poise::CreateReply::default().content("No pending writes in this scope."));
+    }
+    let content = serde_json::to_vec_pretty(&records)
+        .map_err(|error| OmonError::Database(error.to_string()))?;
+    Ok(poise::CreateReply::default()
+        .content(format!(
+            "{} pending write(s). Download the complete payloads before approving an ID.",
+            records.len()
+        ))
+        .attachment(serenity::CreateAttachment::bytes(
+            content,
+            "pending-writes.json",
+        )))
 }
 
 #[poise::command(slash_command)]
 /// Execute or inspect an OMO skill
 pub async fn skill(
     ctx: PoiseContext<'_>,
-    #[description = "Skill action: list, search, read, run, pending, approve, reject"]
+    #[description = "Skill action: list, search, read, run, pending, review, approve, reject"]
     action: String,
     #[description = "Skill name, query, or pending ID"] name_or_query: Option<String>,
 ) -> Result<(), CommandError> {
@@ -220,7 +470,7 @@ pub async fn skill(
 /// Execute, inspect, or manage capability skills
 pub async fn skills(
     ctx: PoiseContext<'_>,
-    #[description = "Skill action: list, search, read, run, pending, approve, reject"]
+    #[description = "Skill action: list, search, read, run, pending, review, approve, reject"]
     action: Option<String>,
     #[description = "Skill name, query, or pending ID"] name_or_query: Option<String>,
 ) -> Result<(), CommandError> {
@@ -239,62 +489,16 @@ async fn skill_dispatch(
     let pool = &data.pool;
 
     match action {
-        "pending" => {
-            let pending = crate::storage::list_pending_writes(pool, Some("skill")).await?;
-            if pending.is_empty() {
-                ctx.say("No pending skill writes.").await?;
-                return Ok(());
-            }
-            let mut lines = vec![format!("**Pending skill writes ({})**:", pending.len())];
-            for item in pending {
-                let payload_val: serde_json::Value =
-                    serde_json::from_str(&item.payload).unwrap_or(serde_json::json!({}));
-                let name = payload_val
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&item.id);
-                lines.push(format!("• `{}` — skill `{}`", item.id, name));
-            }
-            lines.push("\n*Apply: `/skills approve <id>` | Reject: `/skills reject <id>`*".into());
-            ctx.say(lines.join("\n")).await?;
-        }
-        "approve" | "apply" => {
+        "pending" | "review" | "approve" | "apply" | "reject" | "deny" | "drop" => {
             let id = query_val.trim();
-            if id.is_empty() {
-                ctx.say(
-                    "Please specify the pending skill write ID to approve: `/skills approve <id>`",
-                )
+            let action = match action {
+                "pending" if id.is_empty() => PendingAction::List,
+                "pending" | "review" => PendingAction::Review(id),
+                "approve" | "apply" => PendingAction::Approve(id),
+                _ => PendingAction::Reject(id),
+            };
+            ctx.send(pending_command(pool, PendingScope::Skills, action).await?)
                 .await?;
-                return Ok(());
-            }
-            match crate::storage::approve_pending_write(pool, id, None).await? {
-                Some(msg) => {
-                    ctx.say(format!("✅ {msg}")).await?;
-                }
-                None => {
-                    ctx.say(format!("Pending skill write `{id}` not found."))
-                        .await?;
-                }
-            }
-        }
-        "reject" | "deny" | "drop" => {
-            let id = query_val.trim();
-            if id.is_empty() {
-                ctx.say(
-                    "Please specify the pending skill write ID to reject: `/skills reject <id>`",
-                )
-                .await?;
-                return Ok(());
-            }
-            if crate::storage::reject_pending_write(pool, id).await? {
-                ctx.say(format!(
-                    "🗑️ Rejected and discarded pending skill write `{id}`."
-                ))
-                .await?;
-            } else {
-                ctx.say(format!("Pending skill write `{id}` not found."))
-                    .await?;
-            }
         }
         "list" => {
             let res = data
@@ -318,7 +522,12 @@ async fn skill_dispatch(
                         .filter_map(|s| s.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    ctx.say(format!("📚 **Available OMO Skills** ({total} total):\n`{list_str}`\n*(Use `/skill action:read name_or_query:<skill_name>` to inspect)*")).await?;
+                    let reply_text = format!(
+                        "📚 **Available OMO Skills** ({total} total):\n`{list_str}`\n*(Use `/skill action:read name_or_query:<skill_name>` to inspect)*"
+                    );
+                    for chunk in chunk_slash_reply(&reply_text, 2000) {
+                        ctx.say(chunk).await?;
+                    }
                 }
                 Err(e) => {
                     ctx.say(format!("❌ Failed to list skills: {e}")).await?;
@@ -367,11 +576,7 @@ async fn skill_dispatch(
                         .get("content")
                         .and_then(|v| v.as_str())
                         .unwrap_or("No content");
-                    let preview = if content.len() > 1800 {
-                        &content[..1800]
-                    } else {
-                        content
-                    };
+                    let preview = skill_read_preview(content);
                     ctx.say(format!(
                         "📖 **Skill: `{query_val}`**\n```markdown\n{preview}\n```"
                     ))
@@ -394,7 +599,7 @@ async fn skill_dispatch(
             let _ = data.multiplexer.route(event).await;
         }
         _ => {
-            ctx.say("Usage: `/skills action:<list|search|read|run|pending|approve|reject> name_or_query:<name_or_id>`")
+            ctx.say("Usage: `/skills action:<list|search|read|run|pending|review|approve|reject> name_or_query:<name_or_id>`")
                 .await?;
         }
     }
@@ -405,7 +610,7 @@ async fn skill_dispatch(
 /// Inspect or review persistent memories and pending memory writes
 pub async fn memory(
     ctx: PoiseContext<'_>,
-    #[description = "Memory action: pending, approve, reject, list"] action: Option<String>,
+    #[description = "Memory action: pending, review, approve, reject, list"] action: Option<String>,
     #[description = "Pending write ID or query"] id_or_query: Option<String>,
 ) -> Result<(), CommandError> {
     ctx.defer().await?;
@@ -414,53 +619,18 @@ pub async fn memory(
     let key = session_key(ctx).await?;
 
     match action_str.as_str() {
-        "pending" => {
-            let pending = crate::storage::list_pending_writes(pool, Some("memory")).await?;
-            if pending.is_empty() {
-                ctx.say("No pending memory writes.").await?;
-                return Ok(());
-            }
-            let mut lines = vec![format!("**Pending memory writes ({})**:", pending.len())];
-            for item in pending {
-                let payload_val: serde_json::Value =
-                    serde_json::from_str(&item.payload).unwrap_or(serde_json::json!({}));
-                let content = payload_val
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&item.payload);
-                let preview = preview_text(content, 80);
-                lines.push(format!("• `{}` — `{}`", item.id, preview));
-            }
-            lines.push("\n*Apply: `/memory approve <id>` | Reject: `/memory reject <id>`*".into());
-            ctx.say(lines.join("\n")).await?;
-        }
-        "approve" | "apply" => {
-            let Some(id) = id_or_query else {
-                ctx.say("Please specify the pending write ID to approve: `/memory approve <id>`")
-                    .await?;
-                return Ok(());
+        "pending" | "review" | "approve" | "apply" | "reject" | "deny" | "drop" => {
+            let id = id_or_query.as_deref().unwrap_or("").trim();
+            let action = match action_str.as_str() {
+                "pending" if id.is_empty() => PendingAction::List,
+                "pending" | "review" => PendingAction::Review(id),
+                "approve" | "apply" => PendingAction::Approve(id),
+                _ => PendingAction::Reject(id),
             };
-            match crate::storage::approve_pending_write(pool, &id, None).await? {
-                Some(msg) => {
-                    ctx.say(format!("✅ {msg}")).await?;
-                }
-                None => {
-                    ctx.say(format!("Pending write `{id}` not found.")).await?;
-                }
-            }
-        }
-        "reject" | "deny" | "drop" => {
-            let Some(id) = id_or_query else {
-                ctx.say("Please specify the pending write ID to reject: `/memory reject <id>`")
-                    .await?;
-                return Ok(());
-            };
-            if crate::storage::reject_pending_write(pool, &id).await? {
-                ctx.say(format!("🗑️ Rejected and discarded pending write `{id}`."))
-                    .await?;
-            } else {
-                ctx.say(format!("Pending write `{id}` not found.")).await?;
-            }
+            ctx.send(
+                pending_command(pool, PendingScope::Memory(&key.storage_key()), action).await?,
+            )
+            .await?;
         }
         _ => {
             let memories: Vec<(String, String)> = sqlx::query_as(
@@ -541,6 +711,16 @@ pub async fn cron(
     Ok(())
 }
 
+pub async fn execute_model_command(
+    data: &PoiseData,
+    key: &SessionKey,
+    name: &str,
+) -> Result<(), CommandError> {
+    ensure_session(&data.pool, key).await?;
+    data.multiplexer.set_model(key, name.to_string()).await?;
+    Ok(())
+}
+
 #[poise::command(slash_command)]
 /// Switch the model used by this Discord session.
 pub async fn model(
@@ -548,31 +728,37 @@ pub async fn model(
     #[description = "Model name"] name: String,
 ) -> Result<(), CommandError> {
     let key = session_key(ctx).await?;
-    ensure_session(&ctx.data().pool, &key).await?;
-    let state_json: String =
-        sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
-            .bind(key.storage_key())
-            .fetch_one(&ctx.data().pool)
-            .await?;
-    let mut state: crate::SessionState = serde_json::from_str(&state_json)?;
-    state.active_model = Some(name.clone());
-    sqlx::query(
-        "UPDATE sessions SET state_json = ?, updated_at = CURRENT_TIMESTAMP WHERE session_key = ?",
-    )
-    .bind(serde_json::to_string(&state)?)
-    .bind(key.storage_key())
-    .execute(&ctx.data().pool)
-    .await?;
+    execute_model_command(ctx.data(), &key, &name).await?;
     ctx.say(format!("Model switched to `{name}`.")).await?;
     Ok(())
 }
 
-#[poise::command(slash_command)]
-/// Clear conversation context and persistent memory for this session.
-pub async fn reset(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
-    let key = session_key(ctx).await?;
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResetCommandResult {
+    NeedsConfirmation,
+    Executed,
+}
+
+pub async fn execute_reset_command(
+    data: &PoiseData,
+    key: &SessionKey,
+    confirm: Option<bool>,
+) -> Result<ResetCommandResult, CommandError> {
+    if data.destructive_slash_confirm && confirm != Some(true) {
+        return Ok(ResetCommandResult::NeedsConfirmation);
+    }
+    reset_session(&data.pool, &data.approvals, key).await?;
+    let _ = data.multiplexer.reset(key).await;
+    Ok(ResetCommandResult::Executed)
+}
+
+pub async fn reset_session(
+    pool: &SqlitePool,
+    approvals: &SmartApprovalGuard,
+    key: &SessionKey,
+) -> Result<(), CommandError> {
     let storage_key = key.storage_key();
-    let mut transaction = ctx.data().pool.begin().await?;
+    let mut transaction = pool.begin().await?;
     sqlx::query("DELETE FROM messages WHERE session_key = ?")
         .bind(&storage_key)
         .execute(&mut *transaction)
@@ -581,20 +767,81 @@ pub async fn reset(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
         .bind(&storage_key)
         .execute(&mut *transaction)
         .await?;
-    sqlx::query("UPDATE sessions SET state_json = '{}', updated_at = CURRENT_TIMESTAMP WHERE session_key = ?")
-        .bind(&storage_key)
-        .execute(&mut *transaction)
-        .await?;
+    sqlx::query(
+        "UPDATE sessions SET state_json = '{}', updated_at = CURRENT_TIMESTAMP WHERE session_key = ?",
+    )
+    .bind(&storage_key)
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
-    ctx.say("Session context and memory cleared.").await?;
+
+    // Commit before guard/cache callbacks to prevent deadlock on max_connections(1)
+    approvals.clear_session(key).await;
     Ok(())
+}
+
+#[poise::command(slash_command)]
+/// Clear conversation context and persistent memory for this session.
+pub async fn reset(
+    ctx: PoiseContext<'_>,
+    #[description = "Confirm destruction (true/false)"] confirm: Option<bool>,
+) -> Result<(), CommandError> {
+    let key = session_key(ctx).await?;
+    let data = ctx.data();
+    match execute_reset_command(data, &key, confirm).await? {
+        ResetCommandResult::NeedsConfirmation => {
+            ctx.say("⚠️ This will permanently clear conversation context and memories for this session. Re-run `/reset confirm:true` to proceed.").await?;
+        }
+        ResetCommandResult::Executed => {
+            ctx.say("Session context and memory cleared.").await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn stop_session(
+    pool: &SqlitePool,
+    approvals: &SmartApprovalGuard,
+    multiplexer: &SessionMultiplexer,
+    key: &SessionKey,
+) -> Result<bool, CommandError> {
+    let interrupted = multiplexer.stop(key).await?;
+    let storage_key = key.storage_key();
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+            .bind(&storage_key)
+            .fetch_optional(pool)
+            .await?;
+    if let Some(state_json) = existing {
+        let mut state: crate::SessionState = serde_json::from_str(&state_json)?;
+        if state.yolo {
+            state.yolo = false;
+            sqlx::query(
+                "UPDATE sessions SET state_json = ?, updated_at = CURRENT_TIMESTAMP WHERE session_key = ?",
+            )
+            .bind(serde_json::to_string(&state)?)
+            .bind(&storage_key)
+            .execute(pool)
+            .await?;
+        }
+    }
+    // Commit/persist before guard/cache callbacks to prevent deadlock on max_connections(1)
+    // and ensure failed persistence never acknowledges unsaved change.
+    approvals.set_yolo(key, false).await;
+    Ok(interrupted)
 }
 
 #[poise::command(slash_command, prefix_command)]
 /// Stop the active agent turn for this Discord session and mark it suspended.
 pub async fn stop(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
     let key = session_key(ctx).await?;
-    let interrupted = ctx.data().multiplexer.stop(&key).await?;
+    let interrupted = stop_session(
+        &ctx.data().pool,
+        &ctx.data().approvals,
+        &ctx.data().multiplexer,
+        &key,
+    )
+    .await?;
     let message = if interrupted {
         "🛑 Stopped active turn and marked session suspended."
     } else {
@@ -645,25 +892,29 @@ pub async fn tools(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
 async fn session_key(ctx: PoiseContext<'_>) -> Result<SessionKey, CommandError> {
     let guild_id = ctx.guild_id().map(|id| id.to_string());
     let channel_id = ctx.channel_id();
-    let thread_id = if guild_id.is_some() {
+    let (session_channel_id, thread_id) = if guild_id.is_some() {
         match channel_id.to_channel(ctx.serenity_context()).await? {
             serenity::Channel::Guild(channel) if is_thread(channel.kind) => {
-                Some(channel_id.to_string())
+                // Match message ingress when parent metadata is unavailable.
+                (
+                    channel.parent_id.unwrap_or(channel_id),
+                    Some(channel_id.to_string()),
+                )
             }
-            _ => None,
+            _ => (channel_id, None),
         }
     } else {
-        None
+        (channel_id, None)
     };
-    let user_id = if thread_id.is_some() && !ctx.data().thread_sessions_per_user {
-        "shared".to_string()
+    let user_id = if guild_id.is_some() {
+        String::new()
     } else {
         ctx.author().id.to_string()
     };
     Ok(SessionKey::new(
         "discord",
         guild_id,
-        channel_id.to_string(),
+        session_channel_id.to_string(),
         thread_id,
         user_id,
     )
@@ -918,22 +1169,23 @@ pub async fn thread(
                 .create_thread(ctx.serenity_context(), builder)
                 .await?;
             let thread_id_u64 = created_thread.id.get();
-            ctx.data().mark_thread_active(thread_id_u64);
+            let bot_id = ctx.serenity_context().cache.current_user().id;
+            ctx.data().mark_thread_owner(thread_id_u64, bot_id.get());
 
             if let Some(starter_msg) = message.filter(|m| !m.trim().is_empty()) {
-                let user_id = if !ctx.data().thread_sessions_per_user {
-                    "shared".to_string()
+                let user_id = if ctx.guild_id().is_some() {
+                    String::new()
                 } else {
                     ctx.author().id.to_string()
                 };
                 let thread_key = SessionKey::new(
                     "discord",
                     ctx.guild_id().map(|id| id.to_string()),
-                    created_thread.id.to_string(),
+                    channel_id.to_string(),
                     Some(created_thread.id.to_string()),
                     user_id,
                 )
-                .with_bot_id(ctx.serenity_context().cache.current_user().id.to_string());
+                .with_bot_id(bot_id.to_string());
 
                 let event =
                     crate::InboundEvent::message(thread_key, ctx.id().to_string(), starter_msg);
@@ -986,40 +1238,44 @@ pub async fn deny(
     Ok(())
 }
 
-#[poise::command(slash_command)]
-/// Toggle YOLO mode (approval bypass) for this session.
-pub async fn yolo(
-    ctx: PoiseContext<'_>,
-    #[description = "Enable or disable YOLO mode (on/off)"] mode: Option<String>,
-) -> Result<(), CommandError> {
-    let key = session_key(ctx).await?;
-    ensure_session(&ctx.data().pool, &key).await?;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YoloOutcome {
+    pub enabled: bool,
+    pub message: String,
+}
+
+pub async fn yolo_toggle(
+    pool: &SqlitePool,
+    approvals: &SmartApprovalGuard,
+    key: &SessionKey,
+    mode: Option<&str>,
+) -> Result<YoloOutcome, CommandError> {
+    ensure_session(pool, key).await?;
+    let storage_key = key.storage_key();
     let state_json: String =
         sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
-            .bind(key.storage_key())
-            .fetch_one(&ctx.data().pool)
+            .bind(&storage_key)
+            .fetch_one(pool)
             .await?;
-    let mut state: crate::SessionState = serde_json::from_str(&state_json).unwrap_or_default();
-    let new_yolo = match mode
-        .as_deref()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
+    let mut state: crate::SessionState = serde_json::from_str(&state_json)?;
+    let effective = approvals.is_yolo(key).await;
+    let new_yolo = match mode.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("on" | "enable" | "true" | "yes" | "1") => true,
         Some("off" | "disable" | "false" | "no" | "0") => false,
-        _ => !state.yolo,
+        _ => !effective,
     };
     state.yolo = new_yolo;
     sqlx::query(
         "UPDATE sessions SET state_json = ?, updated_at = CURRENT_TIMESTAMP WHERE session_key = ?",
     )
     .bind(serde_json::to_string(&state)?)
-    .bind(key.storage_key())
-    .execute(&ctx.data().pool)
+    .bind(&storage_key)
+    .execute(pool)
     .await?;
 
-    ctx.data().approvals.set_yolo(&key, new_yolo).await;
+    // Commit/persist before guard/cache callbacks to prevent deadlock on max_connections(1)
+    // and ensure failed persistence never acknowledges unsaved change.
+    approvals.set_yolo(key, new_yolo).await;
 
     let status_str = if new_yolo { "enabled" } else { "disabled" };
     let note = if new_yolo {
@@ -1027,11 +1283,29 @@ pub async fn yolo(
     } else {
         ""
     };
+    Ok(YoloOutcome {
+        enabled: new_yolo,
+        message: format!("⚡ YOLO mode **{status_str}** for this session.{note}"),
+    })
+}
+
+#[poise::command(slash_command)]
+/// Toggle YOLO mode (approval bypass) for this session.
+pub async fn yolo(
+    ctx: PoiseContext<'_>,
+    #[description = "Enable or disable YOLO mode (on/off)"] mode: Option<String>,
+) -> Result<(), CommandError> {
+    let key = session_key(ctx).await?;
+    let outcome = yolo_toggle(
+        &ctx.data().pool,
+        &ctx.data().approvals,
+        &key,
+        mode.as_deref(),
+    )
+    .await?;
     ctx.send(
         poise::CreateReply::default()
-            .content(format!(
-                "⚡ YOLO mode **{status_str}** for this session.{note}"
-            ))
+            .content(outcome.message)
             .ephemeral(true),
     )
     .await?;
@@ -1116,6 +1390,21 @@ pub fn preview_text(text: &str, max_len: usize) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+pub fn skill_read_preview(content: &str) -> &str {
+    if content.len() <= 1800 {
+        return content;
+    }
+    let mut end = 1800;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[..end]
+}
+
+pub fn chunk_slash_reply(content: &str, limit: usize) -> Vec<String> {
+    crate::discord::chunk_markdown_paginated(content, limit, false)
 }
 
 pub fn build_compression_prompt(history: &[(String, String)]) -> String {
@@ -1209,6 +1498,78 @@ mod tests {
     use super::*;
     use crate::Database;
 
+    #[tokio::test]
+    async fn pending_review_preserves_session_kind_and_full_payload() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let pool = database.pool();
+        sqlx::query("INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json) VALUES ('A', 'discord', 'channel', 'owner', '{}')")
+            .execute(pool).await.unwrap();
+        let memory = serde_json::json!({
+            "session_key": "A", "content": "private-sentinel", "metadata": {}
+        });
+        let id = crate::storage::stage_pending_write(pool, "memory", &memory.to_string())
+            .await
+            .unwrap();
+        let mut failures = Vec::new();
+        for action in [PendingAction::List, PendingAction::Review(&id)] {
+            let reply = pending_command(pool, PendingScope::Memory("B"), action).await;
+            if let Ok(reply) = reply {
+                let data = format!(
+                    "{}{}",
+                    reply.content.unwrap_or_default(),
+                    reply
+                        .attachments
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(&a.data))
+                        .collect::<Vec<_>>()
+                        .join("")
+                );
+                if data.contains("private-sentinel") {
+                    failures.push("foreign session can review memory");
+                }
+            }
+        }
+        let result = pending_command(pool, PendingScope::Skills, PendingAction::Approve(&id)).await;
+        if result.is_ok() {
+            failures.push("skills approval accepts memory kind");
+        }
+        let id = crate::storage::stage_pending_write(pool, "memory", &memory.to_string())
+            .await
+            .unwrap();
+        let _ = pending_command(pool, PendingScope::Memory("B"), PendingAction::Reject(&id)).await;
+        if crate::storage::get_pending_write(pool, &id)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            failures.push("foreign session can reject memory");
+        }
+        let content = format!("{}tail-sentinel", "한".repeat(2500));
+        let skill = serde_json::json!({"name": "review-skill", "content": content});
+        let id = crate::storage::stage_pending_write(pool, "skill", &skill.to_string())
+            .await
+            .unwrap();
+        let reply = pending_command(pool, PendingScope::Skills, PendingAction::Review(&id))
+            .await
+            .unwrap();
+        let downloaded: Option<Vec<crate::storage::PendingWrite>> = reply
+            .attachments
+            .first()
+            .and_then(|attachment| serde_json::from_slice(&attachment.data).ok());
+        if downloaded
+            .as_ref()
+            .and_then(|items| items.first())
+            .map(|record| record.payload.as_str())
+            != Some(skill.to_string().as_str())
+        {
+            failures.push("full skill payload is not downloadable");
+        }
+        assert!(reply.content.as_deref().unwrap_or("").chars().count() <= 2000);
+        pool.close().await;
+        println!("U08 boundary failures: {failures:?}");
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
     #[test]
     fn test_all_commands_count() {
         let commands = all();
@@ -1220,6 +1581,59 @@ mod tests {
         ] {
             assert!(names.contains(expected), "missing command {expected}");
         }
+    }
+
+    #[tokio::test]
+    async fn pending_owner_can_download_apply_and_reject_memory() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let pool = database.pool();
+        sqlx::query("INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json) VALUES ('owner-scope', 'discord', 'channel', 'owner', '{}')")
+            .execute(pool).await.unwrap();
+        let payload = serde_json::json!({
+            "session_key": "owner-scope",
+            "content": format!("{}tail", "한".repeat(2500)),
+            "metadata": {"source": "fixture"}
+        });
+        let id = crate::storage::stage_pending_write(pool, "memory", &payload.to_string())
+            .await
+            .unwrap();
+        for action in [PendingAction::List, PendingAction::Review(&id)] {
+            let reply = pending_command(pool, PendingScope::Memory("owner-scope"), action)
+                .await
+                .unwrap();
+            let records: Vec<crate::storage::PendingWrite> =
+                serde_json::from_slice(&reply.attachments[0].data).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].payload, payload.to_string());
+        }
+        pending_command(
+            pool,
+            PendingScope::Memory("owner-scope"),
+            PendingAction::Approve(&id),
+        )
+        .await
+        .unwrap();
+        let saved: String =
+            sqlx::query_scalar("SELECT content FROM memories WHERE session_key = 'owner-scope'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(saved, payload["content"].as_str().unwrap());
+        let id = crate::storage::stage_pending_write(pool, "memory", &payload.to_string())
+            .await
+            .unwrap();
+        pending_command(
+            pool,
+            PendingScope::Memory("owner-scope"),
+            PendingAction::Reject(&id),
+        )
+        .await
+        .unwrap();
+        assert!(crate::storage::get_pending_write(pool, &id)
+            .await
+            .unwrap()
+            .is_none());
+        pool.close().await;
     }
 
     #[test]
@@ -1539,5 +1953,314 @@ mod tests {
         assert!(!is_thread(serenity::ChannelType::Text));
         assert!(!is_thread(serenity::ChannelType::Voice));
         assert!(!is_thread(serenity::ChannelType::Private));
+    }
+
+    struct DummyRunner;
+    #[async_trait::async_trait]
+    impl crate::AgentRunner for DummyRunner {
+        async fn run(
+            &self,
+            _session: &mut crate::SessionContext,
+            _event: crate::InboundEvent,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn yolo_toggle_matches_effective_state_across_reset_and_restart() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let pool = database.pool();
+        let guard_1 = SmartApprovalGuard::new().with_pool(pool.clone());
+        let runner = Arc::new(DummyRunner);
+        let multiplexer =
+            SessionMultiplexer::new(pool.clone(), runner, crate::MultiplexerConfig::default());
+
+        let session_a = SessionKey::new(
+            "discord",
+            Some("guild-1"),
+            "chan-1",
+            None::<String>,
+            "user-1",
+        );
+        let session_b = SessionKey::new(
+            "discord",
+            Some("guild-1"),
+            "chan-2",
+            None::<String>,
+            "user-2",
+        );
+
+        let mut failures = Vec::new();
+
+        // 1. Initial toggle on session_a: enable YOLO
+        let outcome = yolo_toggle(pool, &guard_1, &session_a, Some("on"))
+            .await
+            .unwrap();
+        if !outcome.enabled || !outcome.message.contains("enabled") {
+            failures.push("initial enable did not return enabled outcome".to_string());
+        }
+        if !guard_1.is_yolo(&session_a).await {
+            failures.push("guard_1 effective yolo is false after enable".to_string());
+        }
+        if guard_1.is_yolo(&session_b).await {
+            failures.push("session_b unexpectedly has yolo enabled".to_string());
+        }
+
+        // Verify persisted state in DB for session_a
+        let state_json_a: String =
+            sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+                .bind(session_a.storage_key())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let state_a: crate::SessionState = serde_json::from_str(&state_json_a).unwrap();
+        if !state_a.yolo {
+            failures.push("persisted state in DB does not have yolo=true".to_string());
+        }
+
+        // 2. Process reload: create fresh guard with same SQLite pool and restore state
+        let guard_2 = SmartApprovalGuard::new().with_pool(pool.clone());
+        let loaded = guard_2.load_persisted_yolo().await.unwrap();
+        if loaded != 1 {
+            failures.push(format!("load_persisted_yolo returned {loaded}, expected 1"));
+        }
+        if !guard_2.is_yolo(&session_a).await {
+            failures.push("recreated guard does not restore persisted yolo (effective is false while persisted is true)".to_string());
+        }
+
+        // Toggle on session_a with guard_2 (mode None toggles against effective state)
+        let outcome_toggle = yolo_toggle(pool, &guard_2, &session_a, None).await.unwrap();
+        if outcome_toggle.enabled || !outcome_toggle.message.contains("disabled") {
+            failures.push("toggle from enabled state did not return disabled outcome".to_string());
+        }
+        if guard_2.is_yolo(&session_a).await {
+            failures.push("guard_2 effective yolo is true after toggle off".to_string());
+        }
+        let state_json_after: String =
+            sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+                .bind(session_a.storage_key())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let state_after: crate::SessionState = serde_json::from_str(&state_json_after).unwrap();
+        if state_after.yolo {
+            failures.push("persisted state in DB has yolo=true after toggle off".to_string());
+        }
+
+        // 2b. Twin-bot same-DM coords regression:
+        // Enable only bot84 in same DM coordinates.
+        // Recreate guard and restore persisted yolo.
+        // 84 must true; 42 and botless alias false.
+        let dm_bot84 = SessionKey::new(
+            "discord",
+            None::<String>,
+            "dm-chan-99",
+            None::<String>,
+            "dm-user-1",
+        )
+        .with_bot_id("84");
+        let dm_bot42 = SessionKey::new(
+            "discord",
+            None::<String>,
+            "dm-chan-99",
+            None::<String>,
+            "dm-user-1",
+        )
+        .with_bot_id("42");
+        let dm_botless = SessionKey::new(
+            "discord",
+            None::<String>,
+            "dm-chan-99",
+            None::<String>,
+            "dm-user-1",
+        );
+
+        let outcome_twin = yolo_toggle(pool, &guard_1, &dm_bot84, Some("on"))
+            .await
+            .unwrap();
+        if !outcome_twin.enabled {
+            failures.push("bot84 enable outcome was not enabled".to_string());
+        }
+        if !guard_1.is_yolo(&dm_bot84).await {
+            failures.push("guard_1 effective yolo is false for bot84".to_string());
+        }
+        if guard_1.is_yolo(&dm_bot42).await {
+            failures.push("guard_1 unexpectedly enabled yolo for bot42".to_string());
+        }
+        if guard_1.is_yolo(&dm_botless).await {
+            failures.push("guard_1 unexpectedly enabled yolo for botless alias".to_string());
+        }
+
+        let guard_twin = SmartApprovalGuard::new().with_pool(pool.clone());
+        let _ = guard_twin.load_persisted_yolo().await;
+        if !guard_twin.is_yolo(&dm_bot84).await {
+            failures.push("recreated guard does not restore persisted yolo for bot84".to_string());
+        }
+        if guard_twin.is_yolo(&dm_bot42).await {
+            failures.push("recreated guard unexpectedly restored yolo for bot42".to_string());
+        }
+        if guard_twin.is_yolo(&dm_botless).await {
+            failures
+                .push("recreated guard unexpectedly restored yolo for botless alias".to_string());
+        }
+
+        // 2c. Malformed session state must fail closed visibly, not silently skip/unwrap_or_default and erase other fields
+        let malformed_session = SessionKey::new(
+            "discord",
+            None::<String>,
+            "dm-chan-corrupt",
+            None::<String>,
+            "dm-user-corrupt",
+        )
+        .with_bot_id("84");
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json) VALUES (?, 'discord', 'dm-chan-corrupt', 'dm-user-corrupt', 'INVALID_JSON_CORRUPT')"
+        )
+        .bind(malformed_session.storage_key())
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let guard_corrupt = SmartApprovalGuard::new().with_pool(pool.clone());
+        let malformed_load = guard_corrupt.load_persisted_yolo().await;
+        if malformed_load.is_ok() {
+            failures.push("load_persisted_yolo unexpectedly succeeded when malformed session state was present".to_string());
+        }
+        if guard_corrupt.is_yolo(&malformed_session).await {
+            failures.push("guard unexpectedly granted yolo to malformed session".to_string());
+        }
+
+        let malformed_toggle = yolo_toggle(pool, &guard_1, &malformed_session, Some("on")).await;
+        if malformed_toggle.is_ok() {
+            failures
+                .push("yolo_toggle unexpectedly succeeded on malformed session state".to_string());
+        }
+        let raw_json_after: String =
+            sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+                .bind(malformed_session.storage_key())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        if raw_json_after != "INVALID_JSON_CORRUPT" {
+            failures
+                .push("yolo_toggle erased or rewrote malformed session state in DB".to_string());
+        }
+
+        let malformed_stop = stop_session(pool, &guard_1, &multiplexer, &malformed_session).await;
+        if malformed_stop.is_ok() {
+            failures
+                .push("stop_session unexpectedly succeeded on malformed session state".to_string());
+        }
+        let raw_json_after_stop: String =
+            sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+                .bind(malformed_session.storage_key())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        if raw_json_after_stop != "INVALID_JSON_CORRUPT" {
+            failures
+                .push("stop_session erased or rewrote malformed session state in DB".to_string());
+        }
+
+        sqlx::query("DELETE FROM sessions WHERE session_key = ?")
+            .bind(malformed_session.storage_key())
+            .execute(pool)
+            .await
+            .unwrap();
+
+        // 3. Reset lifecycle: re-enable yolo and add cached approval on session_a; session_b unaffected
+        yolo_toggle(pool, &guard_1, &session_a, Some("on"))
+            .await
+            .unwrap();
+        guard_1.approve_session(&session_a, "pattern:cmd1").await;
+
+        yolo_toggle(pool, &guard_1, &session_b, Some("on"))
+            .await
+            .unwrap();
+        guard_1.approve_session(&session_b, "pattern:cmd2").await;
+
+        reset_session(pool, &guard_1, &session_a).await.unwrap();
+
+        if guard_1.is_yolo(&session_a).await {
+            failures.push("reset did not clear guard yolo for session_a".to_string());
+        }
+        if guard_1.is_approved(&session_a, "pattern:cmd1").await {
+            failures.push("reset did not clear cached approval grant for session_a".to_string());
+        }
+        if !guard_1.is_yolo(&session_b).await {
+            failures.push("reset on session_a inadvertently cleared session_b yolo".to_string());
+        }
+        if !guard_1.is_approved(&session_b, "pattern:cmd2").await {
+            failures.push(
+                "reset on session_a inadvertently cleared session_b cached grant".to_string(),
+            );
+        }
+
+        // 4. Completed stop lifecycle: session_b has yolo enabled and active_model set
+        let state_json_b: String =
+            sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+                .bind(session_b.storage_key())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let mut state_b: crate::SessionState = serde_json::from_str(&state_json_b).unwrap();
+        state_b.active_model = Some("custom-model".to_string());
+        sqlx::query("UPDATE sessions SET state_json = ? WHERE session_key = ?")
+            .bind(serde_json::to_string(&state_b).unwrap())
+            .bind(session_b.storage_key())
+            .execute(pool)
+            .await
+            .unwrap();
+
+        stop_session(pool, &guard_1, &multiplexer, &session_b)
+            .await
+            .unwrap();
+
+        if guard_1.is_yolo(&session_b).await {
+            failures.push("completed stop did not disable guard yolo for session_b".to_string());
+        }
+        let state_json_b_stopped: String =
+            sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+                .bind(session_b.storage_key())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let state_b_stopped: crate::SessionState =
+            serde_json::from_str(&state_json_b_stopped).unwrap();
+        if state_b_stopped.yolo {
+            failures.push(
+                "completed stop did not disable persisted yolo in DB for session_b".to_string(),
+            );
+        }
+        if state_b_stopped.active_model.as_deref() != Some("custom-model") {
+            failures.push(
+                "completed stop failed to preserve other session state fields (active_model)"
+                    .to_string(),
+            );
+        }
+
+        // 5. Failed persistence must not acknowledge unsaved change
+        let closed_db = Database::connect("sqlite::memory:").await.unwrap();
+        let guard_closed = SmartApprovalGuard::new().with_pool(closed_db.pool().clone());
+        closed_db.pool().close().await;
+
+        let failed_result =
+            yolo_toggle(closed_db.pool(), &guard_closed, &session_a, Some("on")).await;
+        if failed_result.is_ok() {
+            failures
+                .push("failed persistence unexpectedly acknowledged unsaved change".to_string());
+        }
+        if guard_closed.is_yolo(&session_a).await {
+            failures.push("failed persistence modified runtime guard state".to_string());
+        }
+
+        database.pool().close().await;
+
+        println!("U11 constituent failures: {failures:#?}");
+        assert!(
+            failures.is_empty(),
+            "U11 constituent failures: {failures:#?}"
+        );
     }
 }

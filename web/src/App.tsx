@@ -556,7 +556,7 @@ function ChatPlaygroundPage({
       let accumulatedResponse = ''
 
       ws.onopen = () => {
-        ws.send(JSON.stringify({ type: 'chat', content: userText }))
+        ws.send(JSON.stringify({ type: 'message', content: userText }))
       }
 
       ws.onmessage = (event) => {
@@ -571,6 +571,24 @@ function ChatPlaygroundPage({
             loadMessages(currentSessionId)
             setIsSending(false)
             ws.close()
+          } else if (data.type === 'event' && data.event) {
+            const ev = data.event
+            if (ev.type === 'stream' && ev.chunk) {
+              accumulatedResponse = ev.chunk.content
+              if (ev.chunk.is_final) {
+                setStreamingContent('')
+                loadMessages(currentSessionId)
+                setIsSending(false)
+                ws.close()
+              } else {
+                setStreamingContent(accumulatedResponse)
+              }
+            } else if (ev.is_final || ev.type === 'final') {
+              setStreamingContent('')
+              loadMessages(currentSessionId)
+              setIsSending(false)
+              ws.close()
+            }
           } else if (data.type === 'error') {
             setIsSending(false)
             setStreamingContent('')
@@ -1418,8 +1436,26 @@ function LiveLogsPage() {
     ws.onclose = () => setConnected(false)
     ws.onmessage = (event) => {
       try {
-        const entry = JSON.parse(event.data)
-        setLogs((prev) => [...prev.slice(-400), entry])
+        const data = JSON.parse(event.data)
+        if (data && typeof data === 'object') {
+          if (data.type === 'log' && data.entry) {
+            setLogs((prev) => [...prev.slice(-400), data.entry])
+          } else if (data.type === 'warning' && data.message) {
+            setLogs((prev) => [
+              ...prev.slice(-400),
+              {
+                id: Date.now(),
+                timestamp: new Date().toISOString(),
+                level: 'WARN',
+                target: 'system',
+                message: data.message,
+                fields: {},
+              },
+            ])
+          } else if (data.message) {
+            setLogs((prev) => [...prev.slice(-400), data])
+          }
+        }
       } catch {}
     }
 

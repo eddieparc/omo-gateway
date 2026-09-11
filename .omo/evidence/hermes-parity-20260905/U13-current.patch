@@ -1,0 +1,2200 @@
+diff --git a/src/agent/backend.rs b/src/agent/backend.rs
+index b92e537..5086288 100644
+--- a/src/agent/backend.rs
++++ b/src/agent/backend.rs
+@@ -43,7 +43,10 @@ pub trait AgentBackend: Send + Sync + 'static {
+     ) -> Result<()> {
+         tokio::select! {
+             result = self.run(session, event) => result,
+-            _ = cancellation.cancelled() => Err(OmonError::Multiplexer("agent turn cancelled".into())),
++            _ = cancellation.cancelled() => {
++                let _ = self.cancel(session).await;
++                Err(OmonError::Multiplexer("agent turn cancelled".into()))
++            }
+         }
+     }
+ 
+diff --git a/src/agent/omo_backend.rs b/src/agent/omo_backend.rs
+index 533616e..8a2c361 100644
+--- a/src/agent/omo_backend.rs
++++ b/src/agent/omo_backend.rs
+@@ -32,11 +32,18 @@ type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::Tc
+ /// policy-denial loop otherwise burns the entire turn deadline flailing.
+ pub const APPROVAL_DENIAL_TURN_LIMIT: u32 = 5;
+ 
++#[derive(Clone, Debug)]
++pub struct ActiveTurn {
++    pub thread_id: String,
++    pub turn_id: String,
++}
++
+ pub struct OmoBackend {
+     pub config: OmoBackendConfig,
+     pub pool: Option<SqlitePool>,
+     pub dispatcher: Arc<dyn OutboundDispatcher>,
+     pub thread_ids: Arc<ParkingMutex<HashMap<String, String>>>,
++    pub active_turns: Arc<ParkingMutex<HashMap<String, ActiveTurn>>>,
+ }
+ 
+ impl OmoBackend {
+@@ -46,6 +53,7 @@ impl OmoBackend {
+             pool: None,
+             dispatcher,
+             thread_ids: Arc::new(ParkingMutex::new(HashMap::new())),
++            active_turns: Arc::new(ParkingMutex::new(HashMap::new())),
+         }
+     }
+ 
+@@ -386,17 +394,29 @@ impl OmoBackend {
+         let mut started_ids: std::collections::HashSet<String> = Default::default();
+         let mut approval_denials: u32 = 0;
+ 
+-        let started_at = std::time::Instant::now();
++        let started_at = tokio::time::Instant::now();
+         let mut turn_id: Option<String> = None;
+         let mut turn_started_ack = false;
+-        let mut last_activity_at = std::time::Instant::now();
++        let mut last_activity_at = tokio::time::Instant::now();
+         let effective_total_timeout = if is_cron_session {
+             self.config.total_timeout
+         } else {
+             self.config.total_timeout.min(Duration::from_secs(300))
+         };
++        // Silence budget for the streaming loop: doubles as the frame-wait
++        // backstop and the text-inactivity threshold. Pings wake the loop but
++        // never reset the text clock, so a pinging-but-wedged daemon fails
++        // here instead of riding the whole total deadline (the 1800s hang).
++        let silence_limit = if is_cron_session {
++            self.config.request_timeout.min(Duration::from_secs(300))
++        } else {
++            self.config.request_timeout.min(Duration::from_secs(120))
++        };
++        // An empty terminal inside this window is treated as the premature
++        // completion race and ignored; past it, empty means failed.
++        let no_content_grace = self.config.no_content_grace;
+ 
+-        while let Some(msg) = tokio::time::timeout(self.config.request_timeout, ws.next())
++        while let Some(msg) = tokio::time::timeout(silence_limit, ws.next())
+             .await
+             .map_err(|_| OmonError::Llm("timeout during turn streaming".into()))?
+         {
+@@ -405,271 +425,320 @@ impl OmoBackend {
+                     "timeout waiting for turn/start acknowledgement from omo app-server".into(),
+                 ));
+             }
+-            if last_activity_at.elapsed() > self.config.request_timeout {
++            if last_activity_at.elapsed() > silence_limit {
++                if let Some(turn_id) = &turn_id {
++                    let interrupt = json!({
++                        "jsonrpc": "2.0",
++                        "id": 9_003,
++                        "method": "turn/interrupt",
++                        "params": { "threadId": thread_id, "turnId": turn_id }
++                    });
++                    let _ = ws.send(Message::text(interrupt.to_string())).await;
++                }
++                self.active_turns.lock().remove(&session.key.storage_key());
+                 return Err(OmonError::Llm("timeout during turn streaming".into()));
+             }
+ 
+             let msg = msg.map_err(|e| OmonError::Llm(format!("ws streaming error: {e}")))?;
+-            if let Message::Text(text) = msg {
+-                last_activity_at = std::time::Instant::now();
+-                let val: Value = serde_json::from_str(text.as_str())
+-                    .map_err(|e| OmonError::Llm(format!("invalid json: {e}")))?;
+-                let method = val.get("method").and_then(Value::as_str).unwrap_or("");
+-
+-                if method != "turn/completed" && started_at.elapsed() > effective_total_timeout {
+-                    if let Some(turn_id) = &turn_id {
+-                        let interrupt = json!({
+-                            "jsonrpc": "2.0",
+-                            "id": 9_001,
+-                            "method": "turn/interrupt",
+-                            "params": { "threadId": thread_id, "turnId": turn_id }
+-                        });
+-                        let _ = ws.send(Message::text(interrupt.to_string())).await;
+-                        // Give the frame a moment to reach the daemon before the
+-                        // connection drops.
+-                        tokio::time::sleep(Duration::from_millis(100)).await;
+-                    }
+-                    return Err(OmonError::Llm(format!(
+-                        "turn exceeded total deadline of {:?}; turn/interrupt sent",
+-                        effective_total_timeout
+-                    )));
++            let val = match &msg {
++                Message::Text(text) => {
++                    last_activity_at = tokio::time::Instant::now();
++                    Some(
++                        serde_json::from_str::<Value>(text.as_str())
++                            .map_err(|e| OmonError::Llm(format!("invalid json: {e}")))?,
++                    )
++                }
++                _ => None,
++            };
++            // Deadline checks run on EVERY frame — ping/pong included — so a
++            // keepalive stream cannot mask a wedged turn past the cap.
++            let method = val
++                .as_ref()
++                .and_then(|v| v.get("method"))
++                .and_then(Value::as_str)
++                .unwrap_or("")
++                .to_owned();
++            if method != "turn/completed" && started_at.elapsed() > effective_total_timeout {
++                if let Some(turn_id) = &turn_id {
++                    let interrupt = json!({
++                        "jsonrpc": "2.0",
++                        "id": 9_001,
++                        "method": "turn/interrupt",
++                        "params": { "threadId": thread_id, "turnId": turn_id }
++                    });
++                    let _ = ws.send(Message::text(interrupt.to_string())).await;
++                    // Give the frame a moment to reach the daemon before the
++                    // connection drops.
++                    tokio::time::sleep(Duration::from_millis(100)).await;
+                 }
++                self.active_turns.lock().remove(&session.key.storage_key());
++                return Err(OmonError::Llm(format!(
++                    "turn exceeded total deadline of {:?}; turn/interrupt sent",
++                    effective_total_timeout
++                )));
++            }
+ 
+-                if val.get("id").and_then(Value::as_u64) == Some(3) {
+-                    if let Some(error) = val.get("error") {
+-                        return Err(OmonError::Llm(format!("turn/start error: {error}")));
+-                    }
+-                    turn_started_ack = true;
+-                    if let Some(id) = val.pointer("/result/turn/id").and_then(Value::as_str) {
+-                        turn_id = Some(id.to_string());
+-                    }
+-                    continue;
++            let Some(val) = val else {
++                continue;
++            };
++
++            if val.get("method").is_none()
++                && val.get("id").and_then(Value::as_u64) == Some(3)
++                && !turn_started_ack
++            {
++                if let Some(error) = val.get("error") {
++                    return Err(OmonError::Llm(format!("turn/start error: {error}")));
+                 }
++                let id = val
++                    .pointer("/result/turn/id")
++                    .and_then(Value::as_str)
++                    .filter(|id| !id.is_empty())
++                    .ok_or_else(|| {
++                        OmonError::Llm("turn/start acknowledgement missing turn id".into())
++                    })?;
++                let turn_id_str = id.to_string();
++                self.active_turns.lock().insert(
++                    session.key.storage_key(),
++                    ActiveTurn {
++                        thread_id: thread_id.clone(),
++                        turn_id: turn_id_str.clone(),
++                    },
++                );
++                turn_id = Some(turn_id_str);
++                turn_started_ack = true;
++                continue;
++            }
+ 
+-                if let (Some(req_id), Some(method)) =
+-                    (val.get("id"), val.get("method").and_then(Value::as_str))
+-                {
+-                    if is_approval_request(method) {
+-                        approval_denials += 1;
+-                        if approval_denials >= APPROVAL_DENIAL_TURN_LIMIT {
+-                            tracing::error!(
++            if let (Some(req_id), Some(method)) =
++                (val.get("id"), val.get("method").and_then(Value::as_str))
++            {
++                if is_approval_request(method) {
++                    approval_denials += 1;
++                    if approval_denials >= APPROVAL_DENIAL_TURN_LIMIT {
++                        tracing::error!(
+                                 denials = approval_denials,
+                                 "approval denial loop: aborting turn instead of flailing until the deadline"
+                             );
+-                            if let Some(turn_id) = &turn_id {
+-                                let interrupt = json!({
+-                                    "jsonrpc": "2.0",
+-                                    "id": 9_002,
+-                                    "method": "turn/interrupt",
+-                                    "params": { "threadId": thread_id, "turnId": turn_id }
+-                                });
+-                                let _ = ws.send(Message::text(interrupt.to_string())).await;
+-                            }
+-                            return Err(OmonError::Llm(format!(
++                        if let Some(turn_id) = &turn_id {
++                            let interrupt = json!({
++                                "jsonrpc": "2.0",
++                                "id": 9_002,
++                                "method": "turn/interrupt",
++                                "params": { "threadId": thread_id, "turnId": turn_id }
++                            });
++                            let _ = ws.send(Message::text(interrupt.to_string())).await;
++                        }
++                        self.active_turns.lock().remove(&session.key.storage_key());
++                        return Err(OmonError::Llm(format!(
+                                 "tool approval denied {approval_denials} times by gateway policy; turn aborted"
+                             )));
+-                        }
+-                        let _ = ws.send(approval_denial_response(req_id)).await;
+-                        continue;
+                     }
++                    let _ = ws.send(approval_denial_response(req_id)).await;
++                    continue;
+                 }
++            }
++
++            // Only the successful start response owns the active turn identity.
++            // Subscription replay (including thread idle without a turn ID) is
++            // not evidence that this turn has produced output or completed.
++            let frame_turn_id = val
++                .pointer("/params/turnId")
++                .or_else(|| val.pointer("/params/turn/id"))
++                .and_then(Value::as_str);
++            let turn_bearing = method.starts_with("turn/")
++                || method.starts_with("item/")
++                || method == "thread/status/changed"
++                || (method == "error"
++                    && (val.pointer("/params/turnId").is_some()
++                        || val.pointer("/params/turn").is_some()));
++            if turn_bearing
++                && (!turn_started_ack
++                    || val.pointer("/params/threadId").and_then(Value::as_str)
++                        != Some(thread_id.as_str())
++                    || frame_turn_id != turn_id.as_deref())
++            {
++                continue;
++            }
+ 
+-                match method {
+-                    "turn/started" => {
+-                        approval_denials = 0;
+-                        if let Some(tid) = val.pointer("/params/turnId").and_then(Value::as_str) {
+-                            turn_id = Some(tid.to_string());
++            match method.as_str() {
++                "turn/started" => {
++                    approval_denials = 0;
++                }
++                "item/started" | "item/completed" => {
++                    approval_denials = 0;
++                    let is_started =
++                        val.get("method").and_then(Value::as_str) == Some("item/started");
++                    let Some(item) = val.pointer("/params/item") else {
++                        continue;
++                    };
++                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
++
++                    if is_started && !item_id.is_empty() && started_ids.insert(item_id.to_string())
++                    {
++                        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
++                        if !matches!(item_type, "agentMessage" | "userMessage" | "reasoning" | "") {
++                            total_tool_calls += 1;
++                            let tool_name = item
++                                .get("command")
++                                .or_else(|| item.get("tool"))
++                                .or_else(|| item.get("name"))
++                                .or_else(|| item.get("path"))
++                                .and_then(Value::as_str)
++                                .unwrap_or(item_type);
++                            let short_name =
++                                tool_name.split_whitespace().next().unwrap_or(tool_name);
++                            *tool_call_counts.entry(short_name.to_string()).or_insert(0) += 1;
+                         }
+                     }
+-                    "item/started" | "item/completed" => {
+-                        approval_denials = 0;
+-                        let is_started =
+-                            val.get("method").and_then(Value::as_str) == Some("item/started");
+-                        let Some(item) = val.pointer("/params/item") else {
+-                            continue;
+-                        };
+-                        let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+-
+-                        if is_started && !item_id.is_empty() && started_ids.insert(item_id.to_string()) {
+-                            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+-                            if !matches!(item_type, "agentMessage" | "userMessage" | "reasoning" | "") {
+-                                total_tool_calls += 1;
+-                                let tool_name = item
+-                                    .get("command")
+-                                    .or_else(|| item.get("tool"))
+-                                    .or_else(|| item.get("name"))
+-                                    .or_else(|| item.get("path"))
+-                                    .and_then(Value::as_str)
+-                                    .unwrap_or(item_type);
+-                                let short_name = tool_name
+-                                    .split_whitespace()
+-                                    .next()
+-                                    .unwrap_or(tool_name);
+-                                *tool_call_counts.entry(short_name.to_string()).or_insert(0) += 1;
+-                            }
+-                        }
+ 
+-                        if !is_started {
+-                            match item.get("type").and_then(Value::as_str) {
+-                                Some("agentMessage") => {
+-                                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+-                                        full_content.clear();
+-                                        full_content.push_str(text);
+-                                    }
+-                                }
+-                                _ => {}
++                    if !is_started {
++                        if let Some("agentMessage") = item.get("type").and_then(Value::as_str) {
++                            if let Some(text) = item.get("text").and_then(Value::as_str) {
++                                full_content.clear();
++                                full_content.push_str(text);
+                             }
+                         }
+                     }
+-                    "item/agentMessage/delta" => {
+-                        if let Some(delta) = val.pointer("/params/delta").and_then(Value::as_str) {
+-                            if !delta.is_empty() {
+-                                full_content.push_str(delta);
+-                                let _ = self
+-                                    .emit_chunk(
+-                                        session,
+-                                        stream_id,
+-                                        sequence,
+-                                        full_content.clone(),
+-                                        false,
+-                                    )
+-                                    .await;
+-                                sequence = sequence.saturating_add(1);
+-                            }
++                }
++                "item/agentMessage/delta" => {
++                    if let Some(delta) = val.pointer("/params/delta").and_then(Value::as_str) {
++                        if !delta.is_empty() {
++                            full_content.push_str(delta);
++                            let _ = self
++                                .emit_chunk(
++                                    session,
++                                    stream_id,
++                                    sequence,
++                                    full_content.clone(),
++                                    false,
++                                )
++                                .await;
++                            sequence = sequence.saturating_add(1);
+                         }
+                     }
+-                    "turn/completed" | "thread/status/changed" => {
+-                        let is_terminal = if method == "turn/completed" {
+-                            let is_for_current_thread = val
+-                                .pointer("/params/threadId")
+-                                .and_then(Value::as_str)
+-                                .map(|id| id == thread_id)
+-                                .unwrap_or(true);
+-                            if !is_for_current_thread {
+-                                continue;
+-                            }
+-                            if val.pointer("/params/turn/status").and_then(Value::as_str) == Some("failed") {
+-                                let err_msg = val
+-                                    .pointer("/params/turn/error")
+-                                    .and_then(Value::as_str)
+-                                    .or_else(|| val.pointer("/params/turn/error/message").and_then(Value::as_str))
+-                                    .unwrap_or("turn failed");
+-                                return Err(OmonError::Llm(format!("omo turn failed: {err_msg}")));
+-                            }
+-                            true
+-                        } else if method == "thread/status/changed" {
+-                            let is_for_current_thread = val
+-                                .pointer("/params/threadId")
++                }
++                "turn/completed" => {
++                    self.active_turns.lock().remove(&session.key.storage_key());
++                    match val.pointer("/params/turn/status").and_then(Value::as_str) {
++                        Some("interrupted") => {
++                            return Err(OmonError::Llm("omo turn interrupted".into()));
++                        }
++                        Some("failed") => {
++                            let err_msg = val
++                                .pointer("/params/turn/error")
+                                 .and_then(Value::as_str)
+-                                .map(|id| id == thread_id)
+-                                .unwrap_or(false);
+-                            let is_idle = val.pointer("/params/status/type").and_then(Value::as_str) == Some("idle");
+-                            is_for_current_thread && is_idle
+-                        } else {
+-                            false
+-                        };
+-
+-                        if !is_terminal {
+-                            continue;
++                                .or_else(|| {
++                                    val.pointer("/params/turn/error/message")
++                                        .and_then(Value::as_str)
++                                })
++                                .unwrap_or("turn failed");
++                            return Err(OmonError::Llm(format!("omo turn failed: {err_msg}")));
+                         }
++                        Some("completed") => {}
++                        _ => continue,
++                    }
+ 
+-                        let has_content = !full_content.is_empty() || total_tool_calls > 0;
+-                        if !has_content {
+-                            // A terminal frame with no streamed content (observed:
+-                            // the daemon raced a premature turn/completed at +6s
+-                            // while the real turn was still running) must not end
+-                            // the turn — ignore premature completion and keep streaming.
++                    let has_content = !full_content.is_empty() || total_tool_calls > 0;
++                    if !has_content {
++                        // A terminal frame with no streamed content is only
++                        // ignored during the startup race window (observed:
++                        // the daemon raced a premature turn/completed at +6s
++                        // while the real turn was still running). Past that
++                        // window an empty terminal is a real empty turn —
++                        // e.g. an upstream LLM failure the daemon recorded
++                        // as a successful empty completion — and must fail
++                        // the turn instead of stalling until the deadline.
++                        if started_at.elapsed() < no_content_grace {
+                             continue;
+                         }
++                        return Err(OmonError::Llm(
++                            "omo turn ended with no content (likely upstream LLM failure)".into(),
++                        ));
++                    }
+ 
+-                        let rendered = if is_cron_session || total_tool_calls == 0 {
+-                            if full_content.trim().is_empty() {
+-                                "✅ Done.".to_string()
+-                            } else {
+-                                full_content.clone()
+-                            }
++                    let rendered = if is_cron_session || total_tool_calls == 0 {
++                        if full_content.trim().is_empty() {
++                            "✅ Done.".to_string()
+                         } else {
+-                            let breakdown: Vec<String> = tool_call_counts
+-                                .iter()
+-                                .map(|(tool, count)| {
+-                                    if *count > 1 {
+-                                        format!("`{tool}` ×{count}")
+-                                    } else {
+-                                        format!("`{tool}`")
+-                                    }
+-                                })
+-                                .collect();
+-                            let summary_badge = if breakdown.is_empty() {
+-                                format!("-# 🛠️ 도구 {total_tool_calls}회 실행됨")
+-                            } else {
+-                                format!(
+-                                    "-# 🛠️ 도구 {total_tool_calls}회 실행 ({})",
+-                                    breakdown.join(", ")
+-                                )
+-                            };
+-
+-                            if full_content.trim().is_empty() {
+-                                format!("✅ Done.\n\n{summary_badge}")
+-                            } else {
+-                                format!("{}\n\n{}", full_content, summary_badge)
+-                            }
+-                        };
+-                        // A terminal frame with no streamed content (observed:
+-                        // the daemon raced a premature turn/completed at +6s
+-                        // while the real turn was still running) must not end
+-                        // the turn — record a success whose delivery is empty
+-                        // or fail it outright. Ignore the frame and keep
+-                        // streaming until real completion or the deadlines.
+-                        let delivered = self
+-                            .emit_chunk(session, stream_id, sequence, rendered.clone(), true)
+-                            .await;
+-                        if let Some(pool) = &self.pool {
+-                            ensure_session_row(pool, session).await?;
+-                            persist_message(pool, session, &rendered).await?;
++                            full_content.clone()
+                         }
+-                        if delivered.is_ok() {
+-                            if let Some(ack_command) = session
+-                                .state
+-                                .metadata
+-                                .get("cron_ack_command")
+-                                .and_then(Value::as_str)
+-                                .filter(|command| !command.trim().is_empty())
+-                            {
+-                                crate::cron::ack::run_ack_logged(ack_command).await;
+-                            }
++                    } else {
++                        let breakdown: Vec<String> = tool_call_counts
++                            .iter()
++                            .map(|(tool, count)| {
++                                if *count > 1 {
++                                    format!("`{tool}` ×{count}")
++                                } else {
++                                    format!("`{tool}`")
++                                }
++                            })
++                            .collect();
++                        let summary_badge = if breakdown.is_empty() {
++                            format!("-# 🛠️ 도구 {total_tool_calls}회 실행됨")
++                        } else {
++                            format!(
++                                "-# 🛠️ 도구 {total_tool_calls}회 실행 ({})",
++                                breakdown.join(", ")
++                            )
++                        };
++
++                        if full_content.trim().is_empty() {
++                            format!("✅ Done.\n\n{summary_badge}")
++                        } else {
++                            format!("{}\n\n{}", full_content, summary_badge)
+                         }
+-                        return Ok(());
++                    };
++                    let delivered = self
++                        .emit_chunk(session, stream_id, sequence, rendered.clone(), true)
++                        .await;
++                    if let Some(pool) = &self.pool {
++                        ensure_session_row(pool, session).await?;
++                        persist_message(pool, session, &rendered).await?;
+                     }
+-                    "error" | "turn/error" => {
+-                        let is_turn_error = val.pointer("/params/turnId").is_some()
+-                            || val.pointer("/params/turn").is_some()
+-                            || method == "turn/error";
+-                        if !is_turn_error {
+-                            tracing::warn!(
+-                                %thread_id,
+-                                ?val,
+-                                "non-fatal notification error from omo app-server; continuing turn"
+-                            );
+-                            continue;
+-                        }
+-                        let err_msg = val
+-                            .pointer("/params/message")
+-                            .or_else(|| val.pointer("/params/error"))
+-                            .or_else(|| val.pointer("/params/error/message"))
++                    if delivered.is_ok() {
++                        if let Some(ack_command) = session
++                            .state
++                            .metadata
++                            .get("cron_ack_command")
+                             .and_then(Value::as_str)
+-                            .unwrap_or("unknown error from omo app-server");
+-                        return Err(OmonError::Llm(format!(
+-                            "omo app-server turn error: {err_msg}"
+-                        )));
++                            .filter(|command| !command.trim().is_empty())
++                        {
++                            crate::cron::ack::run_ack_logged(ack_command).await;
++                        }
+                     }
+-                    _ => {}
++                    return Ok(());
+                 }
++                "error" | "turn/error" => {
++                    let is_turn_error = val.pointer("/params/turnId").is_some()
++                        || val.pointer("/params/turn").is_some()
++                        || method == "turn/error";
++                    if !is_turn_error {
++                        tracing::warn!(
++                            %thread_id,
++                            ?val,
++                            "non-fatal notification error from omo app-server; continuing turn"
++                        );
++                        continue;
++                    }
++                    self.active_turns.lock().remove(&session.key.storage_key());
++                    let err_msg = val
++                        .pointer("/params/message")
++                        .or_else(|| val.pointer("/params/error"))
++                        .or_else(|| val.pointer("/params/error/message"))
++                        .and_then(Value::as_str)
++                        .unwrap_or("unknown error from omo app-server");
++                    return Err(OmonError::Llm(format!(
++                        "omo app-server turn error: {err_msg}"
++                    )));
++                }
++                _ => {}
+             }
+         }
+         // Reaching the end of the stream without a terminal frame means the
+         // daemon connection closed mid-turn. Failing here (retryable — the
+         // message matches the connection-error retry contract) prevents a
+         // silent Ok with whatever partial content was collected.
++        self.active_turns.lock().remove(&session.key.storage_key());
+         Err(OmonError::Llm(
+             "connection closed before turn completion".into(),
+         ))
+@@ -696,12 +765,79 @@ impl AgentBackend for OmoBackend {
+                     || msg.contains("failed to connect to omo app-server")
+         );
+         if retryable {
+-            tracing::warn!("omo daemon connection reset or refused mid-turn; retrying once after cooldown");
++            tracing::warn!(
++                "omo daemon connection reset or refused mid-turn; retrying once after cooldown"
++            );
+             tokio::time::sleep(Duration::from_millis(500)).await;
+             return self.run_once(session, event).await;
+         }
+         outcome
+     }
++
++    async fn cancel(&self, session: &SessionContext) -> Result<()> {
++        let active = self.active_turns.lock().remove(&session.key.storage_key());
++        let Some(active) = active else {
++            return Ok(());
++        };
++
++        // Bounded cancellation: reserve up to 5s for interrupt/terminal cleanup
++        let cancel_timeout = self.config.request_timeout.min(Duration::from_secs(5));
++        tokio::time::timeout(cancel_timeout, async {
++            let mut ws = self.connect_ws().await?;
++            self.do_initialize(&mut ws).await?;
++
++            let interrupt_id = 9_001u64;
++            let interrupt = json!({
++                "jsonrpc": "2.0",
++                "id": interrupt_id,
++                "method": "turn/interrupt",
++                "params": {
++                    "threadId": active.thread_id,
++                    "turnId": active.turn_id,
++                }
++            });
++            ws.send(Message::text(interrupt.to_string()))
++                .await
++                .map_err(|e| OmonError::Llm(format!("failed to send turn/interrupt: {e}")))?;
++
++            while let Some(msg) = ws.next().await {
++                let msg = msg
++                    .map_err(|e| OmonError::Llm(format!("ws error during turn/interrupt: {e}")))?;
++                if let Message::Text(text) = msg {
++                    let val: Value = serde_json::from_str(&text).map_err(|e| {
++                        OmonError::Llm(format!("invalid json in interrupt ack: {e}"))
++                    })?;
++                    if val.get("id").and_then(Value::as_u64) == Some(interrupt_id) {
++                        if let Some(error) = val.get("error") {
++                            return Err(OmonError::Llm(format!(
++                                "turn/interrupt error from peer: {error}"
++                            )));
++                        }
++                        return Ok(());
++                    }
++                    if val.get("method").and_then(Value::as_str) == Some("turn/completed") {
++                        let status = val.pointer("/params/turn/status").and_then(Value::as_str);
++                        let frame_turn = val
++                            .pointer("/params/turn/id")
++                            .or_else(|| val.pointer("/params/turnId"))
++                            .and_then(Value::as_str);
++                        if (frame_turn == Some(&active.turn_id) || frame_turn.is_none())
++                            && (status == Some("interrupted")
++                                || status == Some("completed")
++                                || status == Some("failed"))
++                        {
++                            return Ok(());
++                        }
++                    }
++                }
++            }
++            Err(OmonError::Llm(
++                "connection closed before turn/interrupt acknowledged".into(),
++            ))
++        })
++        .await
++        .map_err(|_| OmonError::Llm("timeout waiting for turn/interrupt acknowledgement".into()))?
++    }
+ }
+ 
+ async fn ensure_session_row(pool: &sqlx::SqlitePool, session: &SessionContext) -> Result<()> {
+diff --git a/src/multiplexer/actor.rs b/src/multiplexer/actor.rs
+index 2a3e2ed..6d3685e 100644
+--- a/src/multiplexer/actor.rs
++++ b/src/multiplexer/actor.rs
+@@ -235,26 +235,27 @@ impl SessionActor {
+                                         .await;
+                                 }
+                             }
++                            self.release_typing().await;
+                         }
+                         TurnOutcome::Stopped(reply) => {
+                             self.context.state.suspended = true;
+                             self.dirty = true;
+-                            self.interrupt_turn(
+-                                event_id,
+-                                delivery_id.as_deref(),
+-                                "stopped by user",
+-                            )
+-                            .await;
++                            let cancel_res = self
++                                .interrupt_turn(event_id, delivery_id.as_deref(), "stopped by user")
++                                .await;
++                            self.release_typing().await;
+                             let _ = self.flush_if_dirty().await;
+-                            let _ = reply.send(Ok(true));
++                            let _ = reply.send(cancel_res.map(|_| true));
+                         }
+                         TurnOutcome::Shutdown => {
+-                            self.interrupt_turn(
+-                                event_id,
+-                                delivery_id.as_deref(),
+-                                "session actor shutting down",
+-                            )
+-                            .await;
++                            let _ = self
++                                .interrupt_turn(
++                                    event_id,
++                                    delivery_id.as_deref(),
++                                    "session actor shutting down",
++                                )
++                                .await;
++                            self.release_typing().await;
+                             if let Err(error) = crate::storage::mark_session_resume_pending(
+                                 &self.pool,
+                                 &self.context.key.storage_key(),
+@@ -278,6 +279,7 @@ impl SessionActor {
+                         )
+                         .await;
+                     }
++                    self.release_typing().await;
+                     let _ = self.flush_if_dirty().await;
+                     let _ = reply.send(Ok(false));
+                 }
+@@ -323,8 +325,14 @@ impl SessionActor {
+         }
+     }
+ 
+-    async fn interrupt_turn(&self, event_id: uuid::Uuid, delivery_id: Option<&str>, reason: &str) {
+-        if let Err(error) = self.runner.cancel(&self.context).await {
++    async fn interrupt_turn(
++        &self,
++        event_id: uuid::Uuid,
++        delivery_id: Option<&str>,
++        reason: &str,
++    ) -> Result<()> {
++        let cancel_res = self.runner.cancel(&self.context).await;
++        if let Err(ref error) = cancel_res {
+             tracing::warn!(session = %self.context.key, %error, "runner cancellation cleanup failed");
+         }
+         if let Err(error) = self.rollback_partial_history(event_id).await {
+@@ -337,6 +345,20 @@ impl SessionActor {
+             }
+         }
+         tracing::info!(session = %self.context.key, %reason, "agent turn interrupted");
++        cancel_res
++    }
++
++    async fn release_typing(&self) {
++        if !self.context.key.user_id.starts_with("cron:") {
++            if let Some(dispatcher) = &self.dispatcher {
++                let _ = dispatcher
++                    .dispatch(crate::OutboundAction::Typing {
++                        session: self.context.key.clone(),
++                        active: false,
++                    })
++                    .await;
++            }
++        }
+     }
+ 
+     async fn rollback_partial_history(&self, event_id: uuid::Uuid) -> Result<()> {
+@@ -938,4 +960,372 @@ mod tests {
+             "Delivery ledger claim must be marked delivered"
+         );
+     }
++
++    #[tokio::test]
++    async fn turn_terminal_paths_release_typing() {
++        let db = Database::connect("sqlite::memory:").await.unwrap();
++
++        // 1. Success path: normal completion releases typing
++        {
++            let key = test_session("typing-success");
++            let dispatcher = Arc::new(CapturingDispatcher::default());
++            let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
++            let backend = Arc::new(ScriptedFakeBackend {
++                pool: db.pool().clone(),
++                dispatcher: dispatcher.clone(),
++                chunks_to_emit: vec!["done".to_string()],
++                final_assistant_message: "done".to_string(),
++                completed: completed_tx,
++            });
++
++            let (cmd_tx, cmd_rx) = mpsc::channel(32);
++            let actor = SessionActor::load(
++                key.clone(),
++                cmd_rx,
++                backend,
++                Some(dispatcher.clone()),
++                db.pool().clone(),
++                None,
++            )
++            .await
++            .unwrap();
++
++            let handle = tokio::spawn(actor.run());
++            cmd_tx
++                .send(ActorCommand::Event(Box::new(InboundEvent::message(
++                    key.clone(),
++                    "msg-success",
++                    "hello",
++                ))))
++                .await
++                .unwrap();
++
++            completed_rx.recv().await.unwrap();
++            drop(cmd_tx);
++            handle.await.unwrap();
++
++            let actions = dispatcher.actions.lock().await;
++            let typing_events: Vec<bool> = actions
++                .iter()
++                .filter_map(|action| match action {
++                    OutboundAction::Typing { session, active } if session == &key => Some(*active),
++                    _ => None,
++                })
++                .collect();
++            assert_eq!(
++                typing_events,
++                vec![true, false],
++                "success path must start and release typing"
++            );
++        }
++
++        // 2. Error path: runner error releases typing
++        {
++            struct FailingRunner;
++            #[async_trait]
++            impl AgentRunner for FailingRunner {
++                async fn run(
++                    &self,
++                    _session: &mut SessionContext,
++                    _event: InboundEvent,
++                ) -> Result<()> {
++                    Err(OmonError::Llm("runner exploded".into()))
++                }
++            }
++
++            let key = test_session("typing-error");
++            let dispatcher = Arc::new(CapturingDispatcher::default());
++            let (cmd_tx, cmd_rx) = mpsc::channel(32);
++            let actor = SessionActor::load(
++                key.clone(),
++                cmd_rx,
++                Arc::new(FailingRunner),
++                Some(dispatcher.clone()),
++                db.pool().clone(),
++                None,
++            )
++            .await
++            .unwrap();
++
++            let handle = tokio::spawn(actor.run());
++            cmd_tx
++                .send(ActorCommand::Event(Box::new(InboundEvent::message(
++                    key.clone(),
++                    "msg-error",
++                    "explode",
++                ))))
++                .await
++                .unwrap();
++
++            let (reply_tx, reply_rx) = oneshot::channel();
++            cmd_tx
++                .send(ActorCommand::Stop { reply: reply_tx })
++                .await
++                .unwrap();
++            let _ = reply_rx.await.unwrap();
++            drop(cmd_tx);
++            handle.await.unwrap();
++
++            let actions = dispatcher.actions.lock().await;
++            let typing_events: Vec<bool> = actions
++                .iter()
++                .filter_map(|action| match action {
++                    OutboundAction::Typing { session, active } if session == &key => Some(*active),
++                    _ => None,
++                })
++                .collect();
++            assert_eq!(
++                typing_events,
++                vec![true, false],
++                "error path must start and release typing"
++            );
++        }
++
++        // 3. Stop path: user stop cancels turn and releases typing
++        {
++            let key = test_session("typing-stop");
++            let dispatcher = Arc::new(CapturingDispatcher::default());
++            let (started_tx, mut started_rx) = mpsc::unbounded_channel();
++            let barrier = Arc::new(Barrier::new(2));
++            let runner = Arc::new(TurnRecordingRunner {
++                started: started_tx,
++                barrier: barrier.clone(),
++                completed: mpsc::unbounded_channel().0,
++            });
++
++            let (cmd_tx, cmd_rx) = mpsc::channel(32);
++            let actor = SessionActor::load(
++                key.clone(),
++                cmd_rx,
++                runner,
++                Some(dispatcher.clone()),
++                db.pool().clone(),
++                None,
++            )
++            .await
++            .unwrap();
++
++            let handle = tokio::spawn(actor.run());
++            cmd_tx
++                .send(ActorCommand::Event(Box::new(InboundEvent::message(
++                    key.clone(),
++                    "msg-stop",
++                    "blocking",
++                ))))
++                .await
++                .unwrap();
++
++            started_rx.recv().await.unwrap();
++
++            let (reply_tx, reply_rx) = oneshot::channel();
++            cmd_tx
++                .send(ActorCommand::Stop { reply: reply_tx })
++                .await
++                .unwrap();
++            assert!(reply_rx.await.unwrap().unwrap());
++
++            drop(cmd_tx);
++            handle.await.unwrap();
++
++            let actions = dispatcher.actions.lock().await;
++            let typing_events: Vec<bool> = actions
++                .iter()
++                .filter_map(|action| match action {
++                    OutboundAction::Typing { session, active } if session == &key => Some(*active),
++                    _ => None,
++                })
++                .collect();
++            assert_eq!(
++                typing_events,
++                vec![true, false],
++                "stop path must start and release typing"
++            );
++        }
++
++        // 4. Shutdown path: dropping cmd channel while turn is running releases typing
++        {
++            let key = test_session("typing-shutdown");
++            let dispatcher = Arc::new(CapturingDispatcher::default());
++            let (started_tx, mut started_rx) = mpsc::unbounded_channel();
++            let barrier = Arc::new(Barrier::new(2));
++            let runner = Arc::new(TurnRecordingRunner {
++                started: started_tx,
++                barrier: barrier.clone(),
++                completed: mpsc::unbounded_channel().0,
++            });
++
++            let (cmd_tx, cmd_rx) = mpsc::channel(32);
++            let actor = SessionActor::load(
++                key.clone(),
++                cmd_rx,
++                runner,
++                Some(dispatcher.clone()),
++                db.pool().clone(),
++                None,
++            )
++            .await
++            .unwrap();
++
++            let handle = tokio::spawn(actor.run());
++            cmd_tx
++                .send(ActorCommand::Event(Box::new(InboundEvent::message(
++                    key.clone(),
++                    "msg-shutdown",
++                    "blocking",
++                ))))
++                .await
++                .unwrap();
++
++            started_rx.recv().await.unwrap();
++            drop(cmd_tx);
++            handle.await.unwrap();
++
++            let actions = dispatcher.actions.lock().await;
++            let typing_events: Vec<bool> = actions
++                .iter()
++                .filter_map(|action| match action {
++                    OutboundAction::Typing { session, active } if session == &key => Some(*active),
++                    _ => None,
++                })
++                .collect();
++            assert_eq!(
++                typing_events,
++                vec![true, false],
++                "shutdown path must start and release typing"
++            );
++        }
++
++        // 5. Lane isolation: stopping lane A does not release typing for active lane B
++        {
++            let key_a = test_session("typing-lane-a");
++            let key_b = test_session("typing-lane-b");
++            let dispatcher = Arc::new(CapturingDispatcher::default());
++
++            let (started_a_tx, mut started_a_rx) = mpsc::unbounded_channel();
++            let (started_b_tx, mut started_b_rx) = mpsc::unbounded_channel();
++            let barrier_a = Arc::new(Barrier::new(2));
++            let barrier_b = Arc::new(Barrier::new(2));
++
++            let runner_a = Arc::new(TurnRecordingRunner {
++                started: started_a_tx,
++                barrier: barrier_a.clone(),
++                completed: mpsc::unbounded_channel().0,
++            });
++            let runner_b = Arc::new(TurnRecordingRunner {
++                started: started_b_tx,
++                barrier: barrier_b.clone(),
++                completed: mpsc::unbounded_channel().0,
++            });
++
++            let (cmd_a_tx, cmd_a_rx) = mpsc::channel(32);
++            let (cmd_b_tx, cmd_b_rx) = mpsc::channel(32);
++
++            let actor_a = SessionActor::load(
++                key_a.clone(),
++                cmd_a_rx,
++                runner_a,
++                Some(dispatcher.clone()),
++                db.pool().clone(),
++                None,
++            )
++            .await
++            .unwrap();
++
++            let actor_b = SessionActor::load(
++                key_b.clone(),
++                cmd_b_rx,
++                runner_b,
++                Some(dispatcher.clone()),
++                db.pool().clone(),
++                None,
++            )
++            .await
++            .unwrap();
++
++            let handle_a = tokio::spawn(actor_a.run());
++            let handle_b = tokio::spawn(actor_b.run());
++
++            cmd_a_tx
++                .send(ActorCommand::Event(Box::new(InboundEvent::message(
++                    key_a.clone(),
++                    "msg-a",
++                    "blocking",
++                ))))
++                .await
++                .unwrap();
++            cmd_b_tx
++                .send(ActorCommand::Event(Box::new(InboundEvent::message(
++                    key_b.clone(),
++                    "msg-b",
++                    "blocking",
++                ))))
++                .await
++                .unwrap();
++
++            started_a_rx.recv().await.unwrap();
++            started_b_rx.recv().await.unwrap();
++
++            let (reply_a_tx, reply_a_rx) = oneshot::channel();
++            cmd_a_tx
++                .send(ActorCommand::Stop { reply: reply_a_tx })
++                .await
++                .unwrap();
++            assert!(reply_a_rx.await.unwrap().unwrap());
++
++            {
++                let actions = dispatcher.actions.lock().await;
++                let typing_a: Vec<bool> = actions
++                    .iter()
++                    .filter_map(|action| match action {
++                        OutboundAction::Typing { session, active } if session == &key_a => {
++                            Some(*active)
++                        }
++                        _ => None,
++                    })
++                    .collect();
++                let typing_b: Vec<bool> = actions
++                    .iter()
++                    .filter_map(|action| match action {
++                        OutboundAction::Typing { session, active } if session == &key_b => {
++                            Some(*active)
++                        }
++                        _ => None,
++                    })
++                    .collect();
++
++                assert_eq!(
++                    typing_a,
++                    vec![true, false],
++                    "lane A stopped and released typing"
++                );
++                assert_eq!(
++                    typing_b,
++                    vec![true],
++                    "lane B typing must remain active while lane A stopped"
++                );
++            }
++
++            barrier_b.wait().await;
++            drop(cmd_a_tx);
++            drop(cmd_b_tx);
++            handle_a.await.unwrap();
++            handle_b.await.unwrap();
++
++            let actions = dispatcher.actions.lock().await;
++            let typing_b: Vec<bool> = actions
++                .iter()
++                .filter_map(|action| match action {
++                    OutboundAction::Typing { session, active } if session == &key_b => {
++                        Some(*active)
++                    }
++                    _ => None,
++                })
++                .collect();
++            assert_eq!(
++                typing_b,
++                vec![true, false],
++                "lane B completed and released typing"
++            );
++        }
++    }
+ }
+diff --git a/tests/test_omo_backend.rs b/tests/test_omo_backend.rs
+index 9fff28d..c02a3c1 100644
+--- a/tests/test_omo_backend.rs
++++ b/tests/test_omo_backend.rs
+@@ -4,22 +4,169 @@ use std::sync::Arc;
+ use async_trait::async_trait;
+ use futures_util::{SinkExt, StreamExt};
+ use omon_gateway::{
+-    AgentBackend, InboundEvent, OmoBackend, OmoBackendConfig, OmonError, OutboundAction,
+-    OutboundDispatcher, SessionContext, SessionKey, StreamChunk,
++    AgentBackend, Database, InboundEvent, MultiplexerConfig, OmoBackend, OmoBackendConfig,
++    OmonError, OutboundAction, OutboundDispatcher, SessionContext, SessionKey, SessionMultiplexer,
++    StreamChunk,
+ };
+ use parking_lot::Mutex as ParkingMutex;
+ use serde_json::{json, Value};
+ use tokio::net::TcpListener;
+ use tokio_tungstenite::tungstenite::Message;
+ 
++// Public backend entry point over a real loopback WebSocket. Each script is a
++// new subscription to r1, so completed t1 frames can replay while t2 is active.
++async fn run_correlated_frames(frames: Vec<Value>) -> (omon_gateway::Result<()>, Vec<StreamChunk>) {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
++    let peer = tokio::spawn(async move {
++        let (socket, _) = listener.accept().await.unwrap();
++        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
++        for method in ["initialize", "thread/resume", "turn/start"] {
++            let message = ws.next().await.unwrap().unwrap();
++            let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
++            assert_eq!(request["method"], method);
++            if method != "initialize" {
++                assert_eq!(request["params"]["threadId"], "r1");
++            }
++            if method != "turn/start" {
++                ws.send(Message::text(
++                    json!({"jsonrpc":"2.0", "id":request["id"],
++                    "result":{"thread":{"id":"r1"}}})
++                    .to_string(),
++                ))
++                .await
++                .unwrap();
++            }
++        }
++        for frame in frames {
++            ws.feed(Message::text(frame.to_string())).await.unwrap();
++        }
++        ws.flush().await.unwrap();
++        stop_rx.await.unwrap();
++    });
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    let backend = OmoBackend::new(
++        OmoBackendConfig::new(format!("ws://{address}")),
++        dispatcher.clone(),
++    );
++    let key = SessionKey::new("local", None::<String>, "u12", None::<String>, "user");
++    let mut session = SessionContext::new(key.clone());
++    session
++        .state
++        .metadata
++        .insert("omo_thread_id".into(), json!("r1"));
++    let result = tokio::time::timeout(
++        std::time::Duration::from_secs(5),
++        backend.run(&mut session, InboundEvent::message(key, "u12", "probe")),
++    )
++    .await;
++    stop_tx.send(()).unwrap();
++    tokio::time::timeout(std::time::Duration::from_secs(5), peer)
++        .await
++        .unwrap()
++        .unwrap();
++    (
++        result.expect("bounded backend completion"),
++        dispatcher.stream_chunks(),
++    )
++}
++
++fn correlation_ack() -> Value {
++    json!({"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"t2","status":"inProgress"}}})
++}
++
++fn correlation_delta(thread: &str, turn: &str, text: &str) -> Value {
++    json!({"jsonrpc":"2.0","method":"item/agentMessage/delta",
++        "params":{"threadId":thread,"turnId":turn,"itemId":"m1","delta":text}})
++}
++
++fn correlation_terminal(turn: &str, status: &str) -> Value {
++    json!({"jsonrpc":"2.0","method":"turn/completed",
++        "params":{"threadId":"r1","turn":{"id":turn,"status":status,"error":{"message":"failure-sentinel"}}}})
++}
++
++#[tokio::test]
++async fn rejects_foreign_and_stale_turn_frames() {
++    let (result, chunks) = run_correlated_frames(vec![
++        correlation_ack(),
++        correlation_delta("r9", "t9", "SECRET"),
++        correlation_terminal("t1", "completed"),
++        correlation_delta("r1", "t2", "OK"),
++        correlation_terminal("t2", "completed"),
++    ])
++    .await;
++    assert!(result.is_ok(), "{result:?}");
++    assert_eq!(
++        chunks
++            .iter()
++            .filter(|c| c.is_final)
++            .map(|c| c.content.as_str())
++            .collect::<Vec<_>>(),
++        vec!["OK"]
++    );
++    assert!(chunks.iter().all(|c| !c.content.contains("SECRET")));
++}
++
++#[tokio::test]
++async fn correlation_requires_ack_and_ignores_subscription_replay() {
++    let replay = vec![
++        correlation_delta("r1", "t2", "SECRET"),
++        correlation_terminal("t2", "completed"),
++        correlation_ack(),
++        correlation_delta("r1", "t2", "O"),
++        json!({"method":"thread/status/changed","params":{"threadId":"r1","status":{"type":"idle"}}}),
++        json!({"method":"turn/started","params":{"threadId":"r1","turnId":"t1"}}),
++        correlation_delta("r1", "t1", "SECRET"),
++        json!({"method":"item/started","params":{"threadId":"r9","turnId":"t9","item":{"id":"tool","type":"commandExecution","command":"SECRET"}}}),
++        json!({"method":"item/completed","params":{"threadId":"r1","turnId":"t1","item":{"type":"agentMessage","text":"SECRET"}}}),
++        json!({"method":"turn/error","params":{"threadId":"r9","turnId":"t9","message":"SECRET"}}),
++        json!({"method":"error","params":{"threadId":"r1","turn":{"id":"t1"},"message":"SECRET"}}),
++        json!({"method":"item/agentMessage/delta","params":{"delta":"SECRET"}}),
++        json!({"method":"turn/completed","params":{"turn":{"id":"t2","status":"completed"}}}),
++        correlation_delta("r1", "t2", "K"),
++        correlation_terminal("t2", "completed"),
++    ];
++    let (result, chunks) = run_correlated_frames(replay).await;
++    assert!(result.is_ok(), "{result:?}");
++    assert_eq!(
++        chunks
++            .iter()
++            .filter(|c| c.is_final)
++            .map(|c| c.content.as_str())
++            .collect::<Vec<_>>(),
++        vec!["OK"]
++    );
++    assert!(chunks.iter().all(|c| !c.content.contains("SECRET")));
++}
++
++#[tokio::test]
++async fn correlation_distinguishes_interrupted_and_failed() {
++    for status in ["interrupted", "failed"] {
++        let (result, chunks) = run_correlated_frames(vec![
++            correlation_ack(),
++            correlation_delta("r1", "t2", "partial"),
++            correlation_terminal("t2", status),
++        ])
++        .await;
++        let error = result.expect_err(status);
++        assert!(error.to_string().contains(status), "{error}");
++        assert!(!chunks.iter().any(|c| c.is_final));
++    }
++}
++
+ struct CapturingDispatcher {
+     actions: ParkingMutex<Vec<OutboundAction>>,
++    tool_started: ParkingMutex<Option<tokio::sync::oneshot::Sender<()>>>,
++    turn_started_tx: ParkingMutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+ }
+ 
+ impl CapturingDispatcher {
+     fn new() -> Self {
+         Self {
+             actions: ParkingMutex::new(Vec::new()),
++            tool_started: ParkingMutex::new(None),
++            turn_started_tx: ParkingMutex::new(None),
+         }
+     }
+ 
+@@ -38,7 +185,21 @@ impl CapturingDispatcher {
+ #[async_trait]
+ impl OutboundDispatcher for CapturingDispatcher {
+     async fn dispatch(&self, action: OutboundAction) -> omon_gateway::Result<()> {
++        let tool_started = matches!(&action, OutboundAction::Stream { chunk, .. }
++            if !chunk.is_final && chunk.content.ends_with("U12_TOOL_STARTED"));
++        if let OutboundAction::Stream { chunk, .. } = &action {
++            if let Some(tx) = self.turn_started_tx.lock().as_ref() {
++                let _ = tx.send(chunk.content.clone());
++            }
++        }
+         self.actions.lock().push(action);
++        if tool_started {
++            if let Some(sender) = self.tool_started.lock().take() {
++                sender
++                    .send(())
++                    .expect("tool-start subscriber still waiting");
++            }
++        }
+         Ok(())
+     }
+ }
+@@ -314,8 +475,19 @@ impl FakeAppServer {
+                                         .send(Message::text(approval_req.to_string()))
+                                         .await;
+ 
+-                                    // Small delay to allow client to process approval request before ending turn
+-                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
++                                    // Observe the exact denial before publishing completion.
++                                    let response = tokio::time::timeout(
++                                        std::time::Duration::from_secs(5),
++                                        ws_stream.next(),
++                                    )
++                                    .await
++                                    .unwrap()
++                                    .unwrap()
++                                    .unwrap();
++                                    let response: Value =
++                                        serde_json::from_str(response.to_text().unwrap()).unwrap();
++                                    assert_eq!(response["id"], 999);
++                                    ar.lock().push(response);
+ 
+                                     // Stream item/agentMessage/delta chunks
+                                     let emit_activity = ea.load(Ordering::SeqCst);
+@@ -724,12 +896,141 @@ async fn spawn_empty_turn_completed_server() -> u16 {
+     port
+ }
+ 
+-async fn spawn_tool_after_agent_message_server() -> u16 {
++/// Like [`spawn_empty_turn_completed_server`], but the content-less terminal
++/// arrives only after `delay_ms`, so the configured empty-terminal grace
++/// window has already elapsed when it lands.
++async fn spawn_delayed_empty_turn_completed_server(delay_ms: u64) -> u16 {
+     let listener = TcpListener::bind("127.0.0.1:0")
+         .await
+         .expect("bind free port");
+     let port = listener.local_addr().expect("local addr").port();
+     tokio::spawn(async move {
++        let Ok((stream, _)) = listener.accept().await else {
++            return;
++        };
++        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
++            return;
++        };
++        while let Some(Ok(Message::Text(text))) = ws.next().await {
++            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
++                continue;
++            };
++            let id = request
++                .get("id")
++                .and_then(Value::as_u64)
++                .unwrap_or_default();
++            match request.get("method").and_then(Value::as_str) {
++                Some("initialize") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
++                        ))
++                        .await;
++                }
++                Some("thread/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-1"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                }
++                Some("turn/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
++                    let done = json!({
++                        "jsonrpc":"2.0","method":"turn/completed",
++                        "params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}
++                    });
++                    let _ = ws.send(Message::text(done.to_string())).await;
++                }
++                _ => continue,
++            }
++        }
++    });
++    port
++}
++
++/// Completes the handshake and then emits only WebSocket ping frames: this
++/// is the keepalive-alive-but-wedged daemon shape that must still hit the
++/// whole-turn deadline.
++async fn spawn_pinging_idle_server() -> u16 {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind free port");
++    let port = listener.local_addr().expect("local addr").port();
++    tokio::spawn(async move {
++        let Ok((stream, _)) = listener.accept().await else {
++            return;
++        };
++        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
++            return;
++        };
++        while let Some(Ok(Message::Text(text))) = ws.next().await {
++            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
++                continue;
++            };
++            let id = request
++                .get("id")
++                .and_then(Value::as_u64)
++                .unwrap_or_default();
++            match request.get("method").and_then(Value::as_str) {
++                Some("initialize") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
++                        ))
++                        .await;
++                }
++                Some("thread/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-1"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                }
++                Some("turn/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                    // Keepalive pings forever; zero turn events ever arrive.
++                    loop {
++                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++                        if ws
++                            .send(Message::Ping(b"keepalive".to_vec().into()))
++                            .await
++                            .is_err()
++                        {
++                            break;
++                        }
++                    }
++                }
++                _ => continue,
++            }
++        }
++    });
++    port
++}
++
++async fn spawn_tool_after_agent_message_server(
++    release: tokio::sync::oneshot::Receiver<()>,
++    stop: tokio::sync::oneshot::Receiver<()>,
++    peers: &mut tokio::task::JoinSet<()>,
++) -> u16 {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind free port");
++    let port = listener.local_addr().expect("local addr").port();
++    peers.spawn(async move {
+         let Ok((stream, _)) = listener.accept().await else {
+             return;
+         };
+@@ -764,32 +1065,41 @@ async fn spawn_tool_after_agent_message_server() -> u16 {
+                     let _ = ws.send(Message::text(response.to_string())).await;
+                     let intent = json!({
+                         "jsonrpc":"2.0","method":"item/completed",
+-                        "params":{"item":{"type":"agentMessage","id":"intent","text":"I read this as the digest task."}}
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","item":{"type":"agentMessage","id":"intent","text":"I read this as the digest task."}}
+                     });
+                     let _ = ws.send(Message::text(intent.to_string())).await;
+                     let tool_started = json!({
+                         "jsonrpc":"2.0","method":"item/started",
+-                        "params":{"item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"inProgress"}}
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"inProgress"}}
+                     });
+                     let _ = ws.send(Message::text(tool_started.to_string())).await;
+ 
+-                    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
++                    // No tool-start dispatch exists; this ordered delta witnesses
++                    // processing of the preceding correlated tool-start frame.
++                    let processed = json!({
++                        "method":"item/agentMessage/delta",
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","itemId":"intent","delta":"U12_TOOL_STARTED"}
++                    });
++                    ws.send(Message::text(processed.to_string())).await.unwrap();
++                    release.await.expect("release held tool result");
+ 
+                     let tool_completed = json!({
+                         "jsonrpc":"2.0","method":"item/completed",
+-                        "params":{"item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"completed"}}
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"completed"}}
+                     });
+                     let _ = ws.send(Message::text(tool_completed.to_string())).await;
+                     let digest = json!({
+                         "jsonrpc":"2.0","method":"item/completed",
+-                        "params":{"item":{"type":"agentMessage","id":"digest","text":"## Actual digest body"}}
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","item":{"type":"agentMessage","id":"digest","text":"## Actual digest body"}}
+                     });
+                     let _ = ws.send(Message::text(digest.to_string())).await;
+                     let idle = json!({
+-                        "jsonrpc":"2.0","method":"thread/status/changed",
+-                        "params":{"threadId":"thread-tool-sequence","status":{"type":"idle"}}
++                        "jsonrpc":"2.0","method":"turn/completed",
++                        "params":{"threadId":"thread-tool-sequence","turn":{"id":"turn-tool-sequence","status":"completed"}}
+                     });
+                     let _ = ws.send(Message::text(idle.to_string())).await;
++                    stop.await.expect("backend finished before peer shutdown");
++                    return;
+                 }
+                 _ => {}
+             }
+@@ -824,7 +1134,7 @@ async fn test_omo_backend_surfaces_turn_start_rpc_error_immediately() {
+ }
+ 
+ #[tokio::test]
+-async fn test_omo_backend_completes_from_final_agent_message_when_turn_terminal_is_missing() {
++async fn test_omo_backend_requires_turn_terminal_even_after_final_agent_message() {
+     let server = FakeAppServer::spawn_without_turn_completed().await;
+     let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{}", server.port))
+         .with_request_timeout(std::time::Duration::from_millis(800));
+@@ -841,31 +1151,102 @@ async fn test_omo_backend_completes_from_final_agent_message_when_turn_terminal_
+         .await;
+ 
+     assert!(
+-        result.is_ok(),
+-        "missing terminal fallback failed: {result:?}"
++        result.is_err(),
++        "uncorrelated idle must not finalize: {result:?}"
+     );
+     let chunks = dispatcher.stream_chunks();
+-    let final_chunk = chunks.last().expect("final fallback chunk");
+-    assert!(final_chunk.is_final);
+-    assert_eq!(final_chunk.content, "Hello World!");
++    assert!(!chunks.iter().any(|chunk| chunk.is_final));
+ }
+ 
+ #[tokio::test]
+ async fn test_omo_backend_waits_for_final_message_after_tool_activity() {
+-    let port = spawn_tool_after_agent_message_server().await;
++    // Positive witness: the same interval must age the real backend clock.
++    run_quiet_tool_interval(false).await;
++    run_quiet_tool_interval(true).await;
++}
++
++async fn run_quiet_tool_interval(clock_witness: bool) {
++    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
++    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
++    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
++    let mut peers = tokio::task::JoinSet::new();
++    let port = spawn_tool_after_agent_message_server(release_rx, stop_rx, &mut peers).await;
+     let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
+-        .with_request_timeout(std::time::Duration::from_secs(3));
++        .with_request_timeout(std::time::Duration::from_secs(3))
++        .with_no_content_grace(std::time::Duration::from_secs(1))
++        .with_total_timeout(std::time::Duration::from_secs(if clock_witness {
++            1
++        } else {
++            10
++        }));
+     let dispatcher = Arc::new(CapturingDispatcher::new());
++    *dispatcher.tool_started.lock() = Some(started_tx);
+     let backend = OmoBackend::new(config, dispatcher.clone());
+     let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+     let mut session = SessionContext::new(session_key.clone());
+ 
+-    let result = backend
+-        .run(
+-            &mut session,
+-            InboundEvent::message(session_key, "msg", "digest"),
+-        )
+-        .await;
++    let run = backend.run(
++        &mut session,
++        InboundEvent::message(session_key, "msg", "digest"),
++    );
++    tokio::pin!(run);
++    tokio::select! {
++        biased;
++        result = &mut run => panic!("backend ended before tool-start witness: {result:?}"),
++        started = tokio::time::timeout(std::time::Duration::from_secs(5), started_rx) => {
++            started.expect("bounded tool-start dispatch").expect("tool-start recorded");
++        }
++    }
++
++    // Pause after real socket I/O, avoiding auto-advance during the handshake.
++    // Poll the actual run, not a JoinHandle: expired fallback timers must run.
++    tokio::time::pause();
++    let quiet_started = tokio::time::Instant::now();
++    tokio::time::advance(std::time::Duration::from_millis(1_200)).await;
++    assert!(
++        futures_util::poll!(&mut run).is_pending(),
++        "backend ended during held tool"
++    );
++    assert!(!dispatcher
++        .stream_chunks()
++        .iter()
++        .any(|chunk| chunk.is_final));
++    assert!(quiet_started.elapsed() > std::time::Duration::from_millis(1_100));
++    assert!(quiet_started.elapsed() > backend.config.no_content_grace);
++    println!(
++        "U12 quiet: processed tool-start; virtual_ms=1200; backend=pending; finals=0; result=held"
++    );
++    tokio::time::resume();
++
++    release_tx
++        .send(())
++        .expect("release correlated completion/digest/terminal");
++    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut run)
++        .await
++        .expect("bounded final digest");
++    stop_tx
++        .send(())
++        .expect("stop peer after backend completion");
++    tokio::time::timeout(std::time::Duration::from_secs(5), peers.join_next())
++        .await
++        .expect("bounded peer cleanup")
++        .expect("one peer")
++        .expect("peer succeeded");
++    assert!(peers.is_empty());
++
++    if clock_witness {
++        let error = result.expect_err("backend clock must age past the one-second deadline");
++        assert!(
++            error.to_string().contains("turn exceeded total deadline"),
++            "{error}"
++        );
++        assert!(!dispatcher
++            .stream_chunks()
++            .iter()
++            .any(|chunk| chunk.is_final));
++        println!("U12 clock witness: processed tool-start +1200ms exceeds grace=1000ms and backend deadline=1000ms; deadline error; finals=0");
++        return;
++    }
+ 
+     assert!(result.is_ok(), "tool sequence failed: {result:?}");
+     let final_chunk = dispatcher
+@@ -877,6 +1258,17 @@ async fn test_omo_backend_waits_for_final_message_after_tool_activity() {
+     assert!(!final_chunk
+         .content
+         .contains("I read this as the digest task"));
++    assert_eq!(
++        dispatcher
++            .stream_chunks()
++            .iter()
++            .filter(|chunk| chunk.is_final)
++            .count(),
++        1
++    );
++    println!(
++        "U12 quiet: released correlated completion/digest/terminal; actual digest final=1; peers=0"
++    );
+ }
+ 
+ #[tokio::test]
+@@ -1522,6 +1914,67 @@ async fn test_omo_backend_ignores_turn_completed_without_content() {
+     );
+ }
+ 
++#[tokio::test]
++async fn test_omo_backend_deadline_fires_on_ping_only_stream() {
++    // Regression for the 1800s no-response hang: keepalive pings kept the
++    // read loop awake while the daemon produced zero turn events, so the
++    // whole-turn deadline only fired on text frames and never happened. The
++    // deadline check must fire on non-text frames too.
++    let port = spawn_pinging_idle_server().await;
++    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
++        .with_request_timeout(std::time::Duration::from_secs(1))
++        .with_total_timeout(std::time::Duration::from_millis(150));
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    let backend = OmoBackend::new(config, dispatcher.clone());
++    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "user");
++    let mut session = SessionContext::new(session_key.clone());
++
++    let result = backend
++        .run(
++            &mut session,
++            InboundEvent::message(session_key, "msg", "hello"),
++        )
++        .await;
++
++    let err = result.expect_err("ping-only stream must hit the total deadline");
++    assert!(
++        err.to_string().contains("turn exceeded total deadline"),
++        "unexpected error: {err}"
++    );
++}
++
++#[tokio::test]
++async fn test_omo_backend_empty_terminal_past_grace_fails_fast() {
++    // Regression for the 53-minute silence: a daemon that records an upstream
++    // LLM failure as an empty successful completion must surface right after
++    // the grace window instead of stalling until the silence deadline.
++    let port = spawn_delayed_empty_turn_completed_server(400).await;
++    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
++        .with_request_timeout(std::time::Duration::from_secs(5))
++        .with_no_content_grace(std::time::Duration::from_millis(100));
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    let backend = OmoBackend::new(config, dispatcher.clone());
++    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "user");
++    let mut session = SessionContext::new(session_key.clone());
++
++    let result = backend
++        .run(
++            &mut session,
++            InboundEvent::message(session_key, "msg", "hello"),
++        )
++        .await;
++
++    let err = result.expect_err("empty terminal past grace must fail the turn");
++    assert!(
++        err.to_string().contains("no content"),
++        "unexpected error: {err}"
++    );
++    assert!(
++        dispatcher.stream_chunks().is_empty(),
++        "no final chunk may be emitted for an empty turn"
++    );
++}
++
+ #[tokio::test]
+ async fn test_omo_backend_runs_ack_command_after_cron_delivery() {
+     // Given: a cron session carrying an ack command, and a daemon whose turn
+@@ -1717,3 +2170,408 @@ async fn test_omo_backend_aborts_turn_on_repeated_approval_denials() {
+         "unexpected error: {error}"
+     );
+ }
++
++#[tokio::test]
++async fn stop_interrupts_remote_turn_before_ack() {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++
++    let (turn_ack_tx, mut turn_ack_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
++    let (interrupt_seen_tx, _interrupt_seen_rx) = tokio::sync::oneshot::channel::<()>();
++    let interrupt_seen_tx = Arc::new(tokio::sync::Mutex::new(Some(interrupt_seen_tx)));
++
++    let interrupt_received = Arc::new(AtomicBool::new(false));
++    let tool_completed = Arc::new(AtomicBool::new(false));
++    let peer_kept_work_alive = Arc::new(AtomicBool::new(false));
++
++    let ir_clone = interrupt_received.clone();
++    let _tc_clone = tool_completed.clone();
++    let pk_clone = peer_kept_work_alive.clone();
++
++    let peer_handle = tokio::spawn(async move {
++        let mut turn_in_progress = false;
++
++        while let Ok((socket, _)) = listener.accept().await {
++            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
++            while let Some(msg) = ws.next().await {
++                let Ok(Message::Text(text)) = msg else {
++                    continue;
++                };
++                let Ok(req) = serde_json::from_str::<Value>(&text) else {
++                    continue;
++                };
++                let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
++                let method = req.get("method").and_then(Value::as_str).unwrap_or("");
++
++                match method {
++                    "initialize" => {
++                        let resp = json!({"jsonrpc":"2.0","id":id,"result":{}});
++                        let _ = ws.send(Message::text(resp.to_string())).await;
++                    }
++                    "thread/resume" | "thread/start" => {
++                        let resp = json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"r1"}}});
++                        let _ = ws.send(Message::text(resp.to_string())).await;
++                    }
++                    "turn/start" => {
++                        assert_eq!(req["params"]["threadId"], "r1");
++                        turn_in_progress = true;
++                        let resp = json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"t1","status":"inProgress"}}});
++                        let _ = ws.send(Message::text(resp.to_string())).await;
++                        let delta = json!({
++                            "jsonrpc": "2.0",
++                            "method": "item/agentMessage/delta",
++                            "params": {
++                                "threadId": "r1",
++                                "turnId": "t1",
++                                "itemId": "m1",
++                                "delta": "WORK_STARTED"
++                            }
++                        });
++                        let _ = ws.send(Message::text(delta.to_string())).await;
++                    }
++                    "turn/interrupt" => {
++                        assert_eq!(
++                            req["params"]["threadId"], "r1",
++                            "interrupt threadId must match r1"
++                        );
++                        assert_eq!(
++                            req["params"]["turnId"], "t1",
++                            "interrupt turnId must match t1"
++                        );
++                        ir_clone.store(true, Ordering::SeqCst);
++                        turn_in_progress = false;
++
++                        let resp = json!({"jsonrpc":"2.0","id":id,"result":{}});
++                        let _ = ws.send(Message::text(resp.to_string())).await;
++
++                        let terminal = json!({
++                            "jsonrpc":"2.0",
++                            "method":"turn/completed",
++                            "params":{"threadId":"r1","turn":{"id":"t1","status":"interrupted"}}
++                        });
++                        let _ = ws.send(Message::text(terminal.to_string())).await;
++
++                        if let Some(tx) = interrupt_seen_tx.lock().await.take() {
++                            let _ = tx.send(());
++                        }
++                    }
++                    _ => {}
++                }
++            }
++            if turn_in_progress {
++                pk_clone.store(true, Ordering::SeqCst);
++            }
++        }
++    });
++
++    let db = Database::connect("sqlite::memory:").await.unwrap();
++    let key = SessionKey::new(
++        "discord",
++        Some("guild-u13"),
++        "channel-u13",
++        None::<String>,
++        "user-u13",
++    );
++    let mut initial_session = SessionContext::new(key.clone());
++    initial_session
++        .state
++        .metadata
++        .insert("omo_thread_id".into(), json!("r1"));
++    sqlx::query(
++        "INSERT INTO sessions (session_key, platform, guild_id, channel_id, user_id, state_json) VALUES (?, 'discord', 'guild-u13', 'channel-u13', 'user-u13', ?)"
++    )
++    .bind(key.storage_key())
++    .bind(serde_json::to_string(&initial_session.state).unwrap())
++    .execute(db.pool())
++    .await
++    .unwrap();
++
++    let config = OmoBackendConfig::new(format!("ws://{address}"))
++        .with_request_timeout(std::time::Duration::from_secs(5));
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    *dispatcher.turn_started_tx.lock() = Some(turn_ack_tx);
++    let backend =
++        Arc::new(OmoBackend::new(config, dispatcher.clone()).with_pool(db.pool().clone()));
++    let multiplexer = SessionMultiplexer::with_dispatcher(
++        db.pool().clone(),
++        backend.clone(),
++        Some(dispatcher.clone()),
++        MultiplexerConfig::default(),
++    );
++
++    let event = InboundEvent::message(key.clone(), "msg-u13", "execute long turn");
++    multiplexer.route(event).await.unwrap();
++
++    let received_chunk =
++        tokio::time::timeout(std::time::Duration::from_secs(5), turn_ack_rx.recv())
++            .await
++            .expect("bounded wait for turn start ack")
++            .expect("turn ack received");
++    assert_eq!(received_chunk, "WORK_STARTED");
++
++    let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), multiplexer.stop(&key))
++        .await
++        .expect("bounded stop")
++        .expect("stop succeeds");
++
++    assert!(stopped, "multiplexer.stop must return true for active turn");
++    assert!(
++        interrupt_received.load(Ordering::SeqCst),
++        "peer must receive turn/interrupt before stop reports success"
++    );
++    assert!(
++        peer_kept_work_alive.load(Ordering::SeqCst),
++        "peer must keep work alive across disconnect until interrupt"
++    );
++    assert!(
++        !tool_completed.load(Ordering::SeqCst),
++        "no post-stop tool completion"
++    );
++
++    let row: (String,) = sqlx::query_as("SELECT state_json FROM sessions WHERE session_key = ?")
++        .bind(key.storage_key())
++        .fetch_one(db.pool())
++        .await
++        .unwrap();
++    let loaded_state: omon_gateway::SessionState = serde_json::from_str(&row.0).unwrap();
++    assert_eq!(
++        loaded_state
++            .metadata
++            .get("omo_thread_id")
++            .and_then(Value::as_str),
++        Some("r1"),
++        "sticky binding to r1 must be preserved"
++    );
++
++    peer_handle.abort();
++}
++
++#[tokio::test]
++async fn stop_interrupts_remote_turn() {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++
++    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
++
++    let interrupt_a_seen = Arc::new(AtomicBool::new(false));
++    let ia_clone = interrupt_a_seen.clone();
++
++    let (b_release_tx, b_release_rx) = tokio::sync::oneshot::channel::<()>();
++    let b_release_rx = Arc::new(tokio::sync::Mutex::new(Some(b_release_rx)));
++
++    let peer_handle = tokio::spawn(async move {
++        while let Ok((socket, _)) = listener.accept().await {
++            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
++            let ia = ia_clone.clone();
++            let b_rx = b_release_rx.clone();
++
++            tokio::spawn(async move {
++                while let Some(msg) = ws.next().await {
++                    let Ok(Message::Text(text)) = msg else {
++                        continue;
++                    };
++                    let Ok(req) = serde_json::from_str::<Value>(&text) else {
++                        continue;
++                    };
++                    let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
++                    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
++
++                    match method {
++                        "initialize" => {
++                            let resp = json!({"jsonrpc":"2.0","id":id,"result":{}});
++                            let _ = ws.send(Message::text(resp.to_string())).await;
++                        }
++                        "thread/resume" | "thread/start" => {
++                            let thread_id = req["params"]["threadId"].as_str().unwrap_or("r1");
++                            let resp = json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":thread_id}}});
++                            let _ = ws.send(Message::text(resp.to_string())).await;
++                        }
++                        "turn/start" => {
++                            let thread_id = req["params"]["threadId"].as_str().unwrap_or("");
++                            let turn_id = if thread_id == "r1" { "t1" } else { "t2" };
++                            let resp = json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":turn_id,"status":"inProgress"}}});
++                            let _ = ws.send(Message::text(resp.to_string())).await;
++                            let delta_text = if thread_id == "r1" {
++                                "LANE_A_ACTIVE"
++                            } else {
++                                "LANE_B_ACTIVE"
++                            };
++                            let delta = json!({
++                                "jsonrpc": "2.0",
++                                "method": "item/agentMessage/delta",
++                                "params": {
++                                    "threadId": thread_id,
++                                    "turnId": turn_id,
++                                    "itemId": "m1",
++                                    "delta": delta_text
++                                }
++                            });
++                            let _ = ws.send(Message::text(delta.to_string())).await;
++
++                            if thread_id != "r1" {
++                                let rx = b_rx.lock().await.take();
++                                if let Some(rx) = rx {
++                                    let _ = rx.await;
++                                }
++                                let completed = json!({
++                                    "jsonrpc":"2.0","method":"turn/completed",
++                                    "params":{"threadId":"r2","turn":{"id":"t2","status":"completed"}}
++                                });
++                                let _ = ws.send(Message::text(completed.to_string())).await;
++                            }
++                        }
++                        "turn/interrupt" => {
++                            let thread_id = req["params"]["threadId"].as_str().unwrap_or("");
++                            let turn_id = req["params"]["turnId"].as_str().unwrap_or("");
++                            if thread_id == "r1" && turn_id == "t1" {
++                                ia.store(true, Ordering::SeqCst);
++                                let resp = json!({"jsonrpc":"2.0","id":id,"result":{}});
++                                let _ = ws.send(Message::text(resp.to_string())).await;
++                                let terminal = json!({
++                                    "jsonrpc":"2.0","method":"turn/completed",
++                                    "params":{"threadId":"r1","turn":{"id":"t1","status":"interrupted"}}
++                                });
++                                let _ = ws.send(Message::text(terminal.to_string())).await;
++                            }
++                        }
++                        _ => {}
++                    }
++                }
++            });
++        }
++    });
++
++    let db = Database::connect("sqlite::memory:").await.unwrap();
++    let key_a = SessionKey::new(
++        "discord",
++        Some("guild-1"),
++        "chan-1",
++        None::<String>,
++        "user-a",
++    );
++    let key_b = SessionKey::new(
++        "discord",
++        Some("guild-1"),
++        "chan-2",
++        None::<String>,
++        "user-b",
++    );
++
++    let mut session_a = SessionContext::new(key_a.clone());
++    session_a
++        .state
++        .metadata
++        .insert("omo_thread_id".into(), json!("r1"));
++    let mut session_b = SessionContext::new(key_b.clone());
++    session_b
++        .state
++        .metadata
++        .insert("omo_thread_id".into(), json!("r2"));
++
++    for (k, s) in [(&key_a, &session_a), (&key_b, &session_b)] {
++        sqlx::query(
++            "INSERT INTO sessions (session_key, platform, guild_id, channel_id, user_id, state_json) VALUES (?, 'discord', 'guild-1', ?, ?, ?)"
++        )
++        .bind(k.storage_key())
++        .bind(&k.channel_id)
++        .bind(&k.user_id)
++        .bind(serde_json::to_string(&s.state).unwrap())
++        .execute(db.pool())
++        .await
++        .unwrap();
++    }
++
++    let config = OmoBackendConfig::new(format!("ws://{address}"))
++        .with_request_timeout(std::time::Duration::from_secs(5));
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    *dispatcher.turn_started_tx.lock() = Some(chunk_tx);
++    let backend =
++        Arc::new(OmoBackend::new(config, dispatcher.clone()).with_pool(db.pool().clone()));
++    let multiplexer = SessionMultiplexer::with_dispatcher(
++        db.pool().clone(),
++        backend.clone(),
++        Some(dispatcher.clone()),
++        MultiplexerConfig::default(),
++    );
++
++    multiplexer
++        .route(InboundEvent::message(key_a.clone(), "msg-a", "turn A"))
++        .await
++        .unwrap();
++    multiplexer
++        .route(InboundEvent::message(key_b.clone(), "msg-b", "turn B"))
++        .await
++        .unwrap();
++
++    let mut seen_a = false;
++    let mut seen_b = false;
++    while !seen_a || !seen_b {
++        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), chunk_rx.recv())
++            .await
++            .expect("bounded delta recv")
++            .expect("delta received");
++        if chunk == "LANE_A_ACTIVE" {
++            seen_a = true;
++        } else if chunk == "LANE_B_ACTIVE" {
++            seen_b = true;
++        }
++    }
++
++    let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), multiplexer.stop(&key_a))
++        .await
++        .expect("bounded stop")
++        .expect("stop succeeds");
++
++    assert!(stopped);
++    assert!(
++        interrupt_a_seen.load(Ordering::SeqCst),
++        "interrupt sent for lane A"
++    );
++
++    let actions = dispatcher.actions.lock().clone();
++    let typing_a: Vec<bool> = actions
++        .iter()
++        .filter_map(|action| match action {
++            OutboundAction::Typing { session, active } if session == &key_a => Some(*active),
++            _ => None,
++        })
++        .collect();
++    let typing_b: Vec<bool> = actions
++        .iter()
++        .filter_map(|action| match action {
++            OutboundAction::Typing { session, active } if session == &key_b => Some(*active),
++            _ => None,
++        })
++        .collect();
++
++    assert!(typing_a.contains(&true), "lane A started typing");
++    assert_eq!(
++        typing_a.last(),
++        Some(&false),
++        "lane A stopped and released typing"
++    );
++    assert!(typing_b.contains(&true), "lane B started typing");
++    assert_eq!(
++        typing_b.last(),
++        Some(&true),
++        "lane B typing still active while lane A stopped"
++    );
++
++    let _ = b_release_tx.send(());
++
++    let row_a: (String,) = sqlx::query_as("SELECT state_json FROM sessions WHERE session_key = ?")
++        .bind(key_a.storage_key())
++        .fetch_one(db.pool())
++        .await
++        .unwrap();
++    let state_a: omon_gateway::SessionState = serde_json::from_str(&row_a.0).unwrap();
++    assert_eq!(
++        state_a
++            .metadata
++            .get("omo_thread_id")
++            .and_then(Value::as_str),
++        Some("r1")
++    );
++
++    peer_handle.abort();
++}

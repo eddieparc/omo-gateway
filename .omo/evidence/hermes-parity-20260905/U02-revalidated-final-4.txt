@@ -1,0 +1,4 @@
+$ cargo build
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.30s
+
+EXIT_CODE=0

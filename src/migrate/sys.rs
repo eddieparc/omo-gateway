@@ -4,6 +4,9 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -23,6 +26,9 @@ pub enum MigrationOperation {
     LockAcquired(PathBuf),
     LockReleased(PathBuf),
     PidAlive(i32),
+    ProcessStartTime(i32),
+    ProcessCommandLine(i32),
+    Bootout(Vec<String>),
     Terminate(i32),
     Kill(i32),
     Sleep(Duration),
@@ -35,8 +41,48 @@ pub trait MigrationEnv: Send + Sync {
     fn read_to_string(&self, path: &Path) -> Result<String>;
     fn read(&self, path: &Path) -> Result<Vec<u8>>;
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()>;
+    /// Create a private file exclusively, choosing a new suffix on collision.
+    fn write_unique(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+        let _ = bytes;
+        Err(OmonError::Config(format!(
+            "exclusive migration writes unsupported for {}",
+            path.display()
+        )))
+    }
+
+    fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let name = path.file_name().ok_or_else(|| {
+            OmonError::Config(format!("invalid migration target: {}", path.display()))
+        })?;
+        let temporary = path.with_file_name(format!(
+            ".{}.tmp-omon-migration-{}",
+            name.to_string_lossy(),
+            uuid::Uuid::new_v4()
+        ));
+        let temporary = self.write_unique(&temporary, bytes)?;
+        if let Err(error) = self.rename(&temporary, path) {
+            self.remove_file(&temporary).map_err(|cleanup| {
+                OmonError::Config(format!("{error}; temporary cleanup failed: {cleanup}"))
+            })?;
+            return Err(error);
+        }
+        Ok(())
+    }
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
     fn remove_file(&self, path: &Path) -> Result<()>;
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+        let mut normalized = PathBuf::new();
+        for comp in path.components() {
+            match comp {
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => normalized.push(c),
+            }
+        }
+        Ok(normalized)
+    }
     fn acquire_jobs_lock(&self, path: &Path) -> Result<Box<dyn MigrationLock>>;
     fn exists(&self, path: &Path) -> bool;
     fn is_file(&self, path: &Path) -> bool;
@@ -48,11 +94,272 @@ pub trait MigrationEnv: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 
     fn pid_alive(&self, pid: i32) -> bool;
+    /// Unknown identity never authorizes a signal.
+    fn process_start_time(&self, _pid: i32) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    /// Live command-line probe; unknown identity never authorizes a signal.
+    fn process_command_line(&self, _pid: i32) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn terminate(&self, pid: i32) -> Result<()>;
     fn kill(&self, pid: i32) -> Result<()>;
     fn sleep(&self, duration: Duration);
 
     fn run_launchctl(&self, args: &[&str]) -> Result<LaunchctlOutput>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum WaitNotification {
+    Exited,
+    TimedOut,
+}
+
+#[cfg(target_os = "macos")]
+struct KqueueFd(libc::c_int);
+
+#[cfg(target_os = "macos")]
+impl KqueueFd {
+    fn new() -> Result<Self> {
+        let fd = unsafe { libc::kqueue() };
+        if fd < 0 {
+            Err(OmonError::Config(format!(
+                "kqueue creation failed: {}",
+                std::io::Error::last_os_error()
+            )))
+        } else {
+            Ok(Self(fd))
+        }
+    }
+
+    fn raw(&self) -> libc::c_int {
+        self.0
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for KqueueFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn default_wait_exit_notification(child_pid: i32, timeout: Duration) -> Result<WaitNotification> {
+    let kq = KqueueFd::new()?;
+
+    let ke = libc::kevent {
+        ident: child_pid as usize,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+
+    let reg = unsafe { libc::kevent(kq.raw(), &ke, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+
+    if reg < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(WaitNotification::Exited);
+        }
+        return Err(OmonError::Config(format!(
+            "failed to register kqueue for pid {child_pid}: {err}"
+        )));
+    }
+
+    let ts = libc::timespec {
+        tv_sec: timeout.as_secs() as _,
+        tv_nsec: timeout.subsec_nanos() as _,
+    };
+    let mut out_event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+    let n = unsafe {
+        libc::kevent(
+            kq.raw(),
+            std::ptr::null(),
+            0,
+            out_event.as_mut_ptr(),
+            1,
+            &ts,
+        )
+    };
+    if n < 0 {
+        return Err(OmonError::Config(format!(
+            "kevent wait failed for pid {child_pid}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if n == 0 {
+        return Ok(WaitNotification::TimedOut);
+    }
+
+    // SAFETY: n == 1, kevent populated out_event
+    let ev = unsafe { out_event.assume_init() };
+    if ev.flags & libc::EV_ERROR != 0 {
+        return Err(OmonError::Config(format!(
+            "kevent event error for pid {child_pid}: {}",
+            std::io::Error::from_raw_os_error(ev.data as i32)
+        )));
+    }
+    let ev_ident = ev.ident;
+    let ev_filter = ev.filter;
+    if ev_ident != child_pid as usize || ev_filter != libc::EVFILT_PROC {
+        return Err(OmonError::Config(format!(
+            "unexpected kevent for pid {child_pid}: ident {ev_ident} filter {ev_filter}"
+        )));
+    }
+    Ok(WaitNotification::Exited)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn default_wait_exit_notification(child_pid: i32, timeout: Duration) -> Result<WaitNotification> {
+    let start = std::time::Instant::now();
+    loop {
+        if unsafe { libc::kill(child_pid, 0) != 0 } {
+            return Ok(WaitNotification::Exited);
+        }
+        if start.elapsed() >= timeout {
+            return Ok(WaitNotification::TimedOut);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(windows)]
+fn default_wait_exit_notification(_child_pid: i32, _timeout: Duration) -> Result<WaitNotification> {
+    Ok(WaitNotification::Exited)
+}
+
+fn run_command_with_timeout(cmd: Command, timeout: Duration) -> Result<std::process::Output> {
+    run_command_with_timeout_impl(cmd, timeout, default_wait_exit_notification)
+}
+
+#[cfg(test)]
+fn run_command_with_timeout_injected(
+    cmd: Command,
+    timeout: Duration,
+    notifier: impl FnOnce(i32, Duration) -> Result<WaitNotification>,
+) -> Result<std::process::Output> {
+    run_command_with_timeout_impl(cmd, timeout, notifier)
+}
+
+fn run_command_with_timeout_impl(
+    mut cmd: Command,
+    timeout: Duration,
+    notifier: impl FnOnce(i32, Duration) -> Result<WaitNotification>,
+) -> Result<std::process::Output> {
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| OmonError::Config(format!("failed to spawn command: {error}")))?;
+
+    let child_pid = child.id() as i32;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        if let Some(mut s) = stdout {
+            std::io::Read::read_to_end(&mut s, &mut out)?;
+        }
+        Ok(out)
+    });
+
+    let stderr_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut err = Vec::new();
+        if let Some(mut s) = stderr {
+            std::io::Read::read_to_end(&mut s, &mut err)?;
+        }
+        Ok(err)
+    });
+
+    let wait_notification = notifier(child_pid, timeout);
+
+    let exit_status = match wait_notification {
+        Ok(WaitNotification::Exited) => child.wait().map_err(|e| {
+            OmonError::Config(format!("failed to wait on exited pid {child_pid}: {e}"))
+        }),
+        Ok(WaitNotification::TimedOut) => {
+            let kill_res = child.kill();
+            let wait_res = child.wait();
+            let mut errors = vec![format!(
+                "command pid {child_pid} timed out after {timeout:?}"
+            )];
+            if let Err(e) = kill_res {
+                if e.kind() != std::io::ErrorKind::NotFound
+                    && e.kind() != std::io::ErrorKind::InvalidInput
+                {
+                    errors.push(format!(
+                        "failed to kill timed out command pid {child_pid}: {e}"
+                    ));
+                }
+            }
+            if let Err(e) = wait_res {
+                errors.push(format!(
+                    "failed to reap killed command pid {child_pid}: {e}"
+                ));
+            }
+            Err(OmonError::Config(errors.join("; ")))
+        }
+        Err(notifier_err) => {
+            let kill_res = child.kill();
+            let wait_res = child.wait();
+            let mut errors = vec![notifier_err.to_string()];
+            if let Err(e) = kill_res {
+                if e.kind() != std::io::ErrorKind::NotFound
+                    && e.kind() != std::io::ErrorKind::InvalidInput
+                {
+                    errors.push(format!("failed to kill command pid {child_pid}: {e}"));
+                }
+            }
+            if let Err(e) = wait_res {
+                errors.push(format!("failed to reap command pid {child_pid}: {e}"));
+            }
+            Err(OmonError::Config(errors.join("; ")))
+        }
+    };
+
+    let stdout_join = stdout_reader.join();
+    let stderr_join = stderr_reader.join();
+
+    let stdout_res = stdout_join
+        .map_err(|_| OmonError::Config("stdout reader thread panicked".into()))
+        .and_then(|r| r.map_err(|e| OmonError::Config(format!("failed to read stdout: {e}"))));
+    let stderr_res = stderr_join
+        .map_err(|_| OmonError::Config("stderr reader thread panicked".into()))
+        .and_then(|r| r.map_err(|e| OmonError::Config(format!("failed to read stderr: {e}"))));
+
+    let status = match exit_status {
+        Ok(status) => status,
+        Err(err) => {
+            let mut msgs = vec![err.to_string()];
+            if let Err(e) = stdout_res {
+                msgs.push(e.to_string());
+            }
+            if let Err(e) = stderr_res {
+                msgs.push(e.to_string());
+            }
+            return Err(OmonError::Config(msgs.join("; ")));
+        }
+    };
+
+    match (stdout_res, stderr_res) {
+        (Ok(stdout), Ok(stderr)) => Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        (Err(e1), Err(e2)) => Err(OmonError::Config(format!("{e1}; {e2}"))),
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -69,6 +376,78 @@ impl Drop for OsMigrationLock {
 }
 
 impl MigrationEnv for OsEnv {
+    fn process_start_time(&self, pid: i32) -> Result<Option<u64>> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+            let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+                .map_err(|error| OmonError::Config(error.to_string()))?;
+            // SAFETY: the kernel receives an aligned writable buffer of exactly size bytes.
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if read != size {
+                return Err(OmonError::Config(format!(
+                    "cannot identify pid {pid}: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: proc_pidinfo returned the full initialized proc_bsdinfo structure.
+            let info = unsafe { info.assume_init() };
+            // Hermes uses round(psutil.create_time() * 100), including ties-to-even.
+            let epoch = info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1_000_000.0;
+            Ok(Some((epoch * 100.0).round_ties_even() as u64))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pid;
+            Err(OmonError::Config(
+                "verified process retirement requires macOS".into(),
+            ))
+        }
+    }
+
+    fn process_command_line(&self, pid: i32) -> Result<Option<String>> {
+        #[cfg(unix)]
+        {
+            let candidates = ["/bin/ps", "/usr/bin/ps"];
+            let ps_bin = candidates
+                .iter()
+                .find(|p| Path::new(p).is_file())
+                .copied()
+                .ok_or_else(|| {
+                    OmonError::Config(
+                        "trusted ps binary not found at /bin/ps or /usr/bin/ps".into(),
+                    )
+                })?;
+            let mut cmd = Command::new(ps_bin);
+            cmd.args(["-p", &pid.to_string(), "-o", "command="]);
+            match run_command_with_timeout(cmd, Duration::from_secs(5)) {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if text.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(text))
+                    }
+                }
+                Ok(_) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Ok(None)
+        }
+    }
+
     fn read_to_string(&self, path: &Path) -> Result<String> {
         std::fs::read_to_string(path).map_err(|error| fs_error("read", path, error))
     }
@@ -78,7 +457,37 @@ impl MigrationEnv for OsEnv {
     }
 
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        std::fs::write(path, bytes).map_err(|error| fs_error("write", path, error))
+        self.write_atomic(path, bytes)
+    }
+
+    fn write_unique(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+        let mut candidate = path.to_path_buf();
+        loop {
+            let mut opts = File::options();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let opened = opts.open(&candidate);
+            match opened {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                        self.remove_file(&candidate).map_err(|cleanup| {
+                            OmonError::Config(format!(
+                                "{error}; partial file cleanup failed: {cleanup}"
+                            ))
+                        })?;
+                        return Err(fs_error("write", &candidate, error));
+                    }
+                    return Ok(candidate);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let mut name = path.as_os_str().to_os_string();
+                    name.push(format!("-{}", uuid::Uuid::new_v4()));
+                    candidate = PathBuf::from(name);
+                }
+                Err(error) => return Err(fs_error("create", &candidate, error)),
+            }
+        }
     }
 
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
@@ -96,6 +505,26 @@ impl MigrationEnv for OsEnv {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(fs_error("remove", path, error)),
+        }
+    }
+
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+        if path.exists() {
+            std::fs::canonicalize(path).map_err(|error| fs_error("canonicalize", path, error))
+        } else if let Some(parent) = path.parent() {
+            if parent.exists() {
+                let canonical_parent = std::fs::canonicalize(parent)
+                    .map_err(|error| fs_error("canonicalize parent of", path, error))?;
+                if let Some(file_name) = path.file_name() {
+                    Ok(canonical_parent.join(file_name))
+                } else {
+                    Ok(canonical_parent)
+                }
+            } else {
+                Ok(path.to_path_buf())
+            }
+        } else {
+            Ok(path.to_path_buf())
         }
     }
 
@@ -140,8 +569,15 @@ impl MigrationEnv for OsEnv {
     }
 
     fn current_uid(&self) -> u32 {
-        // SAFETY: getuid has no preconditions and does not dereference pointers.
-        unsafe { libc::getuid() }
+        #[cfg(unix)]
+        {
+            // SAFETY: getuid has no preconditions and does not dereference pointers.
+            unsafe { libc::getuid() }
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
     }
 
     fn now(&self) -> DateTime<Utc> {
@@ -149,17 +585,40 @@ impl MigrationEnv for OsEnv {
     }
 
     fn pid_alive(&self, pid: i32) -> bool {
-        // SAFETY: signal 0 performs an existence/permission check and sends no signal.
-        let result = unsafe { libc::kill(pid, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        #[cfg(unix)]
+        {
+            // SAFETY: signal 0 performs an existence/permission check and sends no signal.
+            let result = unsafe { libc::kill(pid, 0) };
+            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+        #[cfg(not(unix))]
+        {
+            crate::ledger::is_process_alive(pid as u32)
+        }
     }
 
     fn terminate(&self, pid: i32) -> Result<()> {
-        send_signal(pid, libc::SIGTERM, "SIGTERM")
+        #[cfg(unix)]
+        {
+            send_signal(pid, libc::SIGTERM, "SIGTERM")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Ok(())
+        }
     }
 
     fn kill(&self, pid: i32) -> Result<()> {
-        send_signal(pid, libc::SIGKILL, "SIGKILL")
+        #[cfg(unix)]
+        {
+            send_signal(pid, libc::SIGKILL, "SIGKILL")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Ok(())
+        }
     }
 
     fn sleep(&self, duration: Duration) {
@@ -183,6 +642,7 @@ fn fs_error(operation: &str, path: &Path, error: std::io::Error) -> OmonError {
     OmonError::Config(format!("failed to {operation} {}: {error}", path.display()))
 }
 
+#[cfg(unix)]
 fn send_signal(pid: i32, signal: i32, name: &str) -> Result<()> {
     // SAFETY: libc::kill accepts a process id and signal number by value.
     if unsafe { libc::kill(pid, signal) } == 0 {
@@ -206,6 +666,8 @@ pub struct FakeMigrationEnv {
     now: Mutex<DateTime<Utc>>,
     current_uid: Mutex<u32>,
     alive_pids: Mutex<HashSet<i32>>,
+    process_starts: Mutex<HashMap<i32, u64>>,
+    process_cmdlines: Mutex<HashMap<i32, String>>,
     pid_death_after_sleeps: Mutex<HashMap<i32, usize>>,
     operations: Arc<Mutex<Vec<MigrationOperation>>>,
     terminate_calls: Mutex<Vec<i32>>,
@@ -215,6 +677,7 @@ pub struct FakeMigrationEnv {
     launchctl_calls: Mutex<Vec<Vec<String>>>,
     launchctl_response: Mutex<LaunchctlOutput>,
     launchctl_error: Mutex<Option<String>>,
+    aliases: Mutex<HashMap<PathBuf, PathBuf>>,
 }
 
 impl FakeMigrationEnv {
@@ -226,6 +689,8 @@ impl FakeMigrationEnv {
             now: Mutex::new(now),
             current_uid: Mutex::new(0),
             alive_pids: Mutex::new(HashSet::new()),
+            process_starts: Mutex::new(HashMap::new()),
+            process_cmdlines: Mutex::new(HashMap::new()),
             pid_death_after_sleeps: Mutex::new(HashMap::new()),
             operations: Arc::new(Mutex::new(Vec::new())),
             terminate_calls: Mutex::new(Vec::new()),
@@ -239,7 +704,12 @@ impl FakeMigrationEnv {
                 stderr: String::new(),
             }),
             launchctl_error: Mutex::new(None),
+            aliases: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn add_alias(&self, from: impl Into<PathBuf>, to: impl Into<PathBuf>) {
+        self.aliases.lock().insert(from.into(), to.into());
     }
 
     pub fn set_now(&self, now: DateTime<Utc>) {
@@ -259,7 +729,16 @@ impl FakeMigrationEnv {
     }
 
     pub fn set_pid_death_after_sleeps(&self, pid: i32, sleeps: usize) {
+        // Virtual-clock fixture: no wall-clock waiting.
         self.pid_death_after_sleeps.lock().insert(pid, sleeps);
+    }
+
+    pub fn set_process_start_time(&self, pid: i32, start_time: u64) {
+        self.process_starts.lock().insert(pid, start_time);
+    }
+
+    pub fn set_process_command_line(&self, pid: i32, cmdline: impl Into<String>) {
+        self.process_cmdlines.lock().insert(pid, cmdline.into());
     }
 
     pub fn operations(&self) -> Vec<MigrationOperation> {
@@ -344,6 +823,41 @@ impl Drop for FakeMigrationLock {
 }
 
 impl MigrationEnv for FakeMigrationEnv {
+    fn process_start_time(&self, pid: i32) -> Result<Option<u64>> {
+        self.operations
+            .lock()
+            .push(MigrationOperation::ProcessStartTime(pid));
+        Ok(self.process_starts.lock().get(&pid).copied())
+    }
+
+    fn process_command_line(&self, pid: i32) -> Result<Option<String>> {
+        self.operations
+            .lock()
+            .push(MigrationOperation::ProcessCommandLine(pid));
+        Ok(self.process_cmdlines.lock().get(&pid).cloned())
+    }
+
+    fn write_unique(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+        self.ensure_writable(path)?;
+        let mut candidate = path.to_path_buf();
+        let mut files = self.files.lock();
+        while files.contains_key(&candidate) {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(format!("-{}", uuid::Uuid::new_v4()));
+            candidate = PathBuf::from(name);
+        }
+        files.insert(candidate.clone(), bytes.to_vec());
+        drop(files);
+        self.record_parent_directories(&candidate);
+        self.write_calls
+            .lock()
+            .push((candidate.clone(), bytes.to_vec()));
+        self.operations
+            .lock()
+            .push(MigrationOperation::Write(candidate.clone()));
+        Ok(candidate)
+    }
+
     fn read_to_string(&self, path: &Path) -> Result<String> {
         String::from_utf8(self.read(path)?).map_err(|error| {
             OmonError::Config(format!(
@@ -397,6 +911,24 @@ impl MigrationEnv for FakeMigrationEnv {
             .lock()
             .push(MigrationOperation::RemoveFile(path.to_path_buf()));
         Ok(())
+    }
+
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+        let mut normalized = PathBuf::new();
+        for comp in path.components() {
+            match comp {
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => normalized.push(c),
+            }
+        }
+        if let Some(target) = self.aliases.lock().get(&normalized) {
+            Ok(target.clone())
+        } else {
+            Ok(normalized)
+        }
     }
 
     fn acquire_jobs_lock(&self, path: &Path) -> Result<Box<dyn MigrationLock>> {
@@ -503,6 +1035,9 @@ impl MigrationEnv for FakeMigrationEnv {
         self.launchctl_calls
             .lock()
             .push(args.iter().map(|arg| (*arg).to_string()).collect());
+        self.operations.lock().push(MigrationOperation::Bootout(
+            args.iter().map(|arg| (*arg).to_owned()).collect(),
+        ));
         if let Some(message) = self.launchctl_error.lock().clone() {
             Err(OmonError::Config(message))
         } else {
@@ -513,10 +1048,16 @@ impl MigrationEnv for FakeMigrationEnv {
 
 #[cfg(test)]
 mod tests {
-    use super::{FakeMigrationEnv, LaunchctlOutput, MigrationEnv, OsEnv};
+    use super::{
+        run_command_with_timeout, run_command_with_timeout_injected, FakeMigrationEnv,
+        LaunchctlOutput, MigrationEnv, OsEnv,
+    };
+    use crate::OmonError;
     use chrono::{TimeZone, Utc};
     use std::any::{type_name, type_name_of_val};
     use std::path::Path;
+    use std::process::Command;
+    use std::time::Duration;
 
     #[test]
     fn fake_records_process_and_launchctl_calls_without_os_env() {
@@ -616,5 +1157,134 @@ mod tests {
 
         assert!(error.to_string().contains("read-only"));
         assert!(env.write_calls().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subprocess_timeout_kills_and_reaps_owned_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let signal_file = temp.path().join("started.txt");
+        let signal_path = signal_file.display().to_string();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!("echo started > '{signal_path}' && exec sleep 5"),
+        ]);
+        let start = std::time::Instant::now();
+        let result = run_command_with_timeout(cmd, Duration::from_millis(200));
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "expected timeout error, got {result:?}");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("timed out"),
+            "expected timeout message, got {err_msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "elapsed {elapsed:?} exceeded bounded timeout"
+        );
+        assert!(
+            signal_file.exists(),
+            "child should have signaled start before holding"
+        );
+
+        let pid_str = err_msg
+            .split("command pid ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap();
+        let child_pid: i32 = pid_str.parse().unwrap();
+        #[cfg(unix)]
+        {
+            let ret = unsafe { libc::kill(child_pid, 0) };
+            assert_ne!(ret, 0, "child pid {child_pid} should have been reaped");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subprocess_injected_notifier_failure_kills_and_reaps_child_without_hang() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exec cat"]);
+        cmd.stdin(std::process::Stdio::piped());
+
+        let (pid_tx, pid_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+
+        let test_thread = std::thread::spawn(move || {
+            let res =
+                run_command_with_timeout_injected(cmd, Duration::from_secs(5), |pid, _timeout| {
+                    let _ = pid_tx.send(pid);
+                    Err(OmonError::Config(format!(
+                        "injected notifier failure for pid {pid}"
+                    )))
+                });
+            let _ = res_tx.send(res);
+        });
+
+        let child_pid = pid_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("notifier should observe child pid immediately after spawn");
+
+        let result = res_rx.recv_timeout(Duration::from_secs(2)).expect(
+            "run_command_with_timeout_injected should complete without hanging on reader join",
+        );
+        let elapsed = start.elapsed();
+
+        test_thread
+            .join()
+            .expect("test runner thread should join cleanly");
+
+        assert!(
+            result.is_err(),
+            "expected error from injected notifier failure"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "elapsed {elapsed:?} should be bounded and not hang"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(&format!("injected notifier failure for pid {child_pid}")),
+            "error should contain notifier message: {err_msg}"
+        );
+        #[cfg(unix)]
+        {
+            let ret = unsafe { libc::kill(child_pid, 0) };
+            assert_ne!(
+                ret, 0,
+                "child pid {child_pid} should have been reaped, not leaked"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subprocess_simultaneous_large_stdout_stderr_does_not_deadlock() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf '%131072s' E >&2; printf '%131072s' O"]);
+        let output = run_command_with_timeout(cmd, Duration::from_secs(2))
+            .expect("should not deadlock on simultaneous large stderr/stdout");
+        assert_eq!(output.stdout.len(), 131072);
+        assert_eq!(output.stderr.len(), 131072);
+        assert_eq!(output.stdout.last(), Some(&b'O'));
+        assert_eq!(output.stderr.last(), Some(&b'E'));
+        assert!(output.status.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn os_env_reads_self_command_line() {
+        let env = OsEnv;
+        let self_pid = std::process::id() as i32;
+        let cmd = env.process_command_line(self_pid).unwrap();
+        assert!(cmd.is_some(), "expected to read self command line");
+        let cmd = cmd.unwrap();
+        assert!(!cmd.is_empty());
+        assert!(
+            !crate::migrate::gateway_down::looks_like_gateway_runtime_command_line(&cmd),
+            "test runner should not look like gateway runtime: {cmd}"
+        );
     }
 }

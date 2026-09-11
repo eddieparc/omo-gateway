@@ -1,0 +1,17 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.67s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+text bounds: Rect { left: 16.0, top: 13.4, right: 50.3, bottom: 30.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 57.4, right: 403.5199, bottom: 74.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 77.4, right: 403.5199, bottom: 94.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 97.4, right: 403.5199, bottom: 114.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 117.4, right: 64.44, bottom: 134.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+fence_preserved=true; glyphs_inside=true; images=1
+test discord::table_render::tests::fences_and_unbroken_cells_preserve_content ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 288 filtered out; finished in 0.43s
+
+
+EXIT_CODE=0

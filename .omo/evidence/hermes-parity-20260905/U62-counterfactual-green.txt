@@ -1,0 +1,10 @@
+status: completed exit_code: 0
+
+running 1 test
+observed real child exit 1
+observed real child exit 2
+observed real child exit 3
+after three exiting children: circuit_stopped=true; live_pid=None
+test supervisor::counterfactual::real_exiting_child_budget ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.66s

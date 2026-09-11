@@ -1,8 +1,14 @@
 pub mod ack;
+pub mod executor;
 pub mod guard;
 mod scheduler;
 mod store;
 
+pub use executor::{
+    authorized_cron_roots, canonical_authorized_directory, canonical_directory,
+    execute_native_cron, find_skill_file, hermes_home, load_cron_skills, resolve_skill_bundle,
+    resolve_workspace_instructions, run_cron_script, AgentCronExecutor,
+};
 pub use guard::check_gateway_lifecycle;
 
 pub use scheduler::{
@@ -16,8 +22,9 @@ pub use scheduler::{
     MIN_RETRY_INTERVAL, ONESHOT_GRACE_DURATION, STALE_LEASE_SAFETY_NET,
 };
 pub use store::{
-    cron_runs_retention_days_from_environment, cron_script_timeout_secs_from,
-    prune_terminal_cron_runs, resolve_cron_script_timeout, HermesJob, HermesOrigin, HermesRepeat,
+    cron_runs_retention_days_from_environment, cron_script_timeout_secs_from, delete_cron_notepad,
+    get_cron_authority, get_cron_notepads, prune_terminal_cron_runs, resolve_cron_script_timeout,
+    set_cron_notepad, update_cron_authority, CronAuthority, HermesJob, HermesOrigin, HermesRepeat,
     HermesSchedule, HermesStore, HermesStoreSynchronizer, DEFAULT_CRON_RUNS_RETENTION_DAYS,
     DEFAULT_CRON_SCRIPT_TIMEOUT_SECS,
 };

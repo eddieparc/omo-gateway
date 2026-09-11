@@ -3,13 +3,13 @@ pub mod cron_cutover;
 pub mod gateway_down;
 pub mod sys;
 
-use crate::cron::{HermesStore, HermesStoreSynchronizer};
+use crate::cron::{HermesJob, HermesStore, HermesStoreSynchronizer};
 use crate::migrate::config_import::import_config;
 use crate::migrate::cron_cutover::{cutover_cron_stores, CronStoreCutoverSummary};
 use crate::migrate::gateway_down::bring_gateway_down;
 use crate::migrate::sys::{MigrationEnv, OsEnv};
 use crate::{Database, OmonError, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::collections::BTreeSet;
@@ -31,6 +31,14 @@ pub struct MigrationPaths {
     pub launch_agents_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronJobRejection {
+    pub id: String,
+    pub job_id: String,
+    pub profile: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationSummary {
     pub dry_run: bool,
@@ -41,6 +49,8 @@ pub struct MigrationSummary {
     pub cron_imported: usize,
     pub cron_importable: Vec<String>,
     pub cron_already_present: Vec<String>,
+    pub cron_rejected: Vec<CronJobRejection>,
+    pub cron_nonselected: Vec<String>,
     pub cron_stores: Vec<CronStoreCutoverSummary>,
     pub pids_stopped: Vec<i32>,
     pub plists_disabled: Vec<PathBuf>,
@@ -163,6 +173,8 @@ async fn run_after_config(
         cron_imported,
         cron_importable: Vec::new(),
         cron_already_present: Vec::new(),
+        cron_rejected: Vec::new(),
+        cron_nonselected: Vec::new(),
         cron_stores: Vec::new(),
         pids_stopped: Vec::new(),
         plists_disabled: Vec::new(),
@@ -171,15 +183,16 @@ async fn run_after_config(
         return Ok(summary);
     }
 
-    let cron_cutover = cutover_cron_stores(env, &paths.hermes_root, &pool, false)
-        .await
-        .map_err(|error| step_error("cron cutover", "gateway-down", error))?;
-    summary.cron_stores = cron_cutover.stores;
-
     let gateway = bring_gateway_down(env, &paths.hermes_root, &paths.launch_agents_dir, false)
-        .map_err(|error| step_error("gateway-down", "none", error))?;
+        .map_err(|error| step_error("gateway-down", "cron cutover", error))?;
     summary.pids_stopped = gateway.pids_terminated;
     summary.plists_disabled = gateway.plists_disabled;
+
+    let cron_cutover = cutover_cron_stores(env, &paths.hermes_root, &pool, false)
+        .await
+        .map_err(|error| step_error("cron cutover", "none", error))?;
+    summary.cron_stores = cron_cutover.stores;
+
     Ok(summary)
 }
 
@@ -190,31 +203,145 @@ async fn project_migration(
     pool: Option<SqlitePool>,
     config: config_import::ConfigImportResult,
 ) -> Result<MigrationSummary> {
-    let projected = projected_cron_jobs(env, &paths.hermes_root)?;
+    let now = env.now();
+    let selected_profiles = HermesStoreSynchronizer::selected_profiles();
+    let all_stores = discover_all_hermes_stores(env, &paths.hermes_root)?;
+
+    let mut cron_importable = Vec::new();
+    let mut cron_already_present = Vec::new();
+    let mut cron_rejected = Vec::new();
+    let mut cron_nonselected = Vec::new();
+
     let existing = existing_cron_ids(pool.as_ref()).await?;
-    let (cron_already_present, cron_importable): (Vec<_>, Vec<_>) = projected
-        .iter()
-        .cloned()
-        .partition(|id| existing.contains(id));
+
+    struct ScannedStore {
+        profile: String,
+        job_ids: Vec<String>,
+        is_selected: bool,
+        has_rejected: bool,
+    }
+    let mut scanned_stores = Vec::new();
+
+    for store in &all_stores {
+        let profile = store.profile().to_string();
+        let is_selected =
+            HermesStoreSynchronizer::is_profile_selected(&profile, selected_profiles.as_deref());
+        let jobs_path = store.jobs_path();
+
+        let raw_jobs: Vec<serde_json::Value> = if env.exists(&jobs_path) {
+            let bytes = env.read(&jobs_path)?;
+            #[derive(Deserialize)]
+            struct StoreDoc {
+                #[serde(default)]
+                jobs: Vec<serde_json::Value>,
+            }
+            let doc: StoreDoc = serde_json::from_slice(&bytes).map_err(|error| {
+                OmonError::Config(format!(
+                    "invalid Hermes cron store {}: {error}",
+                    jobs_path.display()
+                ))
+            })?;
+            doc.jobs
+        } else {
+            Vec::new()
+        };
+
+        let timezone = read_store_timezone(env, store.home());
+        let mut has_rejected = false;
+        let mut job_ids = Vec::with_capacity(raw_jobs.len());
+
+        for job_val in &raw_jobs {
+            let job_id = job_val
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            job_ids.push(job_id.clone());
+            let full_id = format!("hermes:{profile}:{job_id}");
+            if !is_selected {
+                cron_nonselected.push(full_id);
+            } else {
+                match serde_json::from_value::<HermesJob>(job_val.clone()) {
+                    Ok(job) => match job.validate(timezone.as_deref(), now) {
+                        Ok(_) => {
+                            if existing.contains(&full_id) {
+                                cron_already_present.push(full_id);
+                            } else {
+                                cron_importable.push(full_id);
+                            }
+                        }
+                        Err(reason) => {
+                            has_rejected = true;
+                            cron_rejected.push(CronJobRejection {
+                                id: full_id,
+                                job_id,
+                                profile: profile.clone(),
+                                reason,
+                            });
+                        }
+                    },
+                    Err(err) => {
+                        has_rejected = true;
+                        cron_rejected.push(CronJobRejection {
+                            id: full_id,
+                            job_id,
+                            profile: profile.clone(),
+                            reason: format!("invalid Hermes cron job specification: {err}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        scanned_stores.push(ScannedStore {
+            profile,
+            job_ids,
+            is_selected,
+            has_rejected,
+        });
+    }
+
+    let (pids_stopped, plists_disabled) = if !args.no_cutover {
+        let gateway = bring_gateway_down(env, &paths.hermes_root, &paths.launch_agents_dir, true)
+            .map_err(|error| {
+            step_error("gateway-down projection", "cron cutover projection", error)
+        })?;
+        (gateway.pids_terminated, gateway.plists_disabled)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let cron_stores = if args.no_cutover {
         Vec::new()
     } else if let Some(pool) = pool.as_ref() {
         let mut stores = cutover_cron_stores(env, &paths.hermes_root, pool, true)
             .await
-            .map_err(|error| {
-                step_error("cron cutover projection", "gateway-down projection", error)
-            })?
+            .map_err(|error| step_error("cron cutover projection", "none", error))?
             .stores;
         for store in &mut stores {
-            store.would_empty = store.jobs_found > 0;
+            let scan = scanned_stores.iter().find(|s| s.profile == store.profile);
+            let is_selected = scan.map(|s| s.is_selected).unwrap_or(true);
+            let has_rejected = scan.map(|s| s.has_rejected).unwrap_or(false);
+            store.would_empty = is_selected && store.jobs_found > 0 && !has_rejected;
         }
         stores
     } else {
-        projected_store_summaries(env, &paths.hermes_root)?
+        scanned_stores
+            .iter()
+            .map(|scan| {
+                let ids = scan.job_ids.clone();
+                CronStoreCutoverSummary {
+                    profile: scan.profile.clone(),
+                    jobs_found: ids.len(),
+                    all_imported: false,
+                    would_empty: scan.is_selected && !ids.is_empty() && !scan.has_rejected,
+                    unverified_jobs: ids,
+                }
+            })
+            .collect()
     };
 
-    let mut summary = MigrationSummary {
+    let summary = MigrationSummary {
         dry_run: true,
         database_would_be_created: pool.is_none(),
         config_keys: config.values.len(),
@@ -223,21 +350,25 @@ async fn project_migration(
         cron_imported: 0,
         cron_importable,
         cron_already_present,
+        cron_rejected,
+        cron_nonselected,
         cron_stores,
-        pids_stopped: Vec::new(),
-        plists_disabled: Vec::new(),
+        pids_stopped,
+        plists_disabled,
     };
-
-    if !args.no_cutover {
-        let gateway = bring_gateway_down(env, &paths.hermes_root, &paths.launch_agents_dir, true)
-            .map_err(|error| step_error("gateway-down projection", "none", error))?;
-        summary.pids_stopped = gateway.pids_terminated;
-        summary.plists_disabled = gateway.plists_disabled;
-    }
     Ok(summary)
 }
 
 fn discover_hermes_stores(env: &dyn MigrationEnv, root: &Path) -> Result<Vec<HermesStore>> {
+    let mut stores = discover_all_hermes_stores(env, root)?;
+    let selected = HermesStoreSynchronizer::selected_profiles();
+    stores.retain(|store| {
+        HermesStoreSynchronizer::is_profile_selected(store.profile(), selected.as_deref())
+    });
+    Ok(stores)
+}
+
+fn discover_all_hermes_stores(env: &dyn MigrationEnv, root: &Path) -> Result<Vec<HermesStore>> {
     let mut stores = vec![HermesStore::new("default", root)];
     let profiles_root = root.join("profiles");
     if env.is_dir(&profiles_root) {
@@ -261,65 +392,19 @@ fn discover_hermes_stores(env: &dyn MigrationEnv, root: &Path) -> Result<Vec<Her
     Ok(stores)
 }
 
-#[derive(Deserialize)]
-struct CronDocument {
-    #[serde(default)]
-    jobs: Vec<CronId>,
-}
-
-#[derive(Deserialize)]
-struct CronId {
-    id: String,
-}
-
-fn projected_store_summaries(
-    env: &dyn MigrationEnv,
-    root: &Path,
-) -> Result<Vec<CronStoreCutoverSummary>> {
-    cron_store_documents(env, root)?
-        .into_iter()
-        .map(|(profile, jobs)| {
-            let ids = jobs.into_iter().map(|job| job.id).collect::<Vec<_>>();
-            Ok(CronStoreCutoverSummary {
-                profile,
-                jobs_found: ids.len(),
-                all_imported: false,
-                would_empty: !ids.is_empty(),
-                unverified_jobs: ids,
-            })
-        })
-        .collect()
-}
-
-fn projected_cron_jobs(env: &dyn MigrationEnv, root: &Path) -> Result<Vec<String>> {
-    Ok(cron_store_documents(env, root)?
-        .into_iter()
-        .flat_map(|(profile, jobs)| {
-            jobs.into_iter()
-                .map(move |job| format!("hermes:{profile}:{}", job.id))
-        })
-        .collect())
-}
-
-fn cron_store_documents(env: &dyn MigrationEnv, root: &Path) -> Result<Vec<(String, Vec<CronId>)>> {
-    let stores = discover_hermes_stores(env, root)?;
-    stores
-        .into_iter()
-        .map(|store| {
-            let path = store.jobs_path();
-            if !env.exists(&path) {
-                return Ok((store.profile().to_owned(), Vec::new()));
-            }
-            let bytes = env.read(&path)?;
-            let document: CronDocument = serde_json::from_slice(&bytes).map_err(|error| {
-                OmonError::Config(format!(
-                    "invalid Hermes cron store {}: {error}",
-                    path.display()
-                ))
-            })?;
-            Ok((store.profile().to_owned(), document.jobs))
-        })
-        .collect()
+fn read_store_timezone(env: &dyn MigrationEnv, home: &Path) -> Option<String> {
+    let path = home.join("config.yaml");
+    let bytes = env.read(&path).ok()?;
+    #[derive(Deserialize)]
+    struct ConfigTimezone {
+        #[serde(default)]
+        timezone: Option<String>,
+    }
+    serde_yaml::from_slice::<ConfigTimezone>(&bytes)
+        .ok()?
+        .timezone
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 async fn existing_cron_ids(pool: Option<&SqlitePool>) -> Result<BTreeSet<String>> {
@@ -396,6 +481,8 @@ fn print_summary(summary: &MigrationSummary) {
     println!("    imported: {}", summary.cron_imported);
     println!("    importable: {:?}", summary.cron_importable);
     println!("    already_present: {:?}", summary.cron_already_present);
+    println!("    rejected: {:?}", summary.cron_rejected);
+    println!("    nonselected: {:?}", summary.cron_nonselected);
     println!("  cron_delete:");
     for store in &summary.cron_stores {
         println!(

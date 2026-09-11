@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, watch, Notify};
 
-use crate::{InboundEvent, OmonError, ProfileRouter, Result, SessionKey};
+use crate::{InboundEvent, OmonError, ProfileRouter, Result, SessionContext, SessionKey};
 
 use super::actor::{ActorCommand, AgentRunner, OutboundDispatcher, SessionActor};
 
@@ -89,6 +89,18 @@ impl SessionHandle {
             .await
     }
 
+    pub(crate) async fn send_event_with_ack(
+        &self,
+        event: InboundEvent,
+        ack: tokio::sync::oneshot::Sender<Result<()>>,
+    ) -> Result<SendOutcome> {
+        self.send_command(ActorCommand::EventWithAck {
+            event: Box::new(event),
+            ack,
+        })
+        .await
+    }
+
     pub(crate) async fn stop(&self) -> Result<(SendOutcome, Option<bool>)> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let outcome = self
@@ -101,6 +113,48 @@ impl SessionHandle {
             Ok(result) => Ok((SendOutcome::Sent, Some(result?))),
             Err(_) => Ok((SendOutcome::Closed, None)),
         }
+    }
+
+    pub(crate) async fn set_model(&self, model: String) -> Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let outcome = self
+            .send_command(ActorCommand::SetModel {
+                model,
+                reply: reply_tx,
+            })
+            .await?;
+        if outcome != SendOutcome::Sent {
+            return Ok(());
+        }
+        reply_rx
+            .await
+            .map_err(|_| OmonError::Multiplexer("actor closed before set_model reply".into()))?
+    }
+
+    pub(crate) async fn reset(&self) -> Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let outcome = self
+            .send_command(ActorCommand::Reset { reply: reply_tx })
+            .await?;
+        if outcome != SendOutcome::Sent {
+            return Ok(());
+        }
+        reply_rx
+            .await
+            .map_err(|_| OmonError::Multiplexer("actor closed before reset reply".into()))?
+    }
+
+    pub(crate) async fn get_context(&self) -> Result<SessionContext> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let outcome = self
+            .send_command(ActorCommand::GetContext { reply: reply_tx })
+            .await?;
+        if outcome != SendOutcome::Sent {
+            return Err(OmonError::Multiplexer("actor not accepting".into()));
+        }
+        reply_rx
+            .await
+            .map_err(|_| OmonError::Multiplexer("actor closed before get_context reply".into()))
     }
 
     async fn send_command(&self, command: ActorCommand) -> Result<SendOutcome> {
@@ -189,6 +243,7 @@ pub struct SessionMultiplexer {
     pool: SqlitePool,
     config: MultiplexerConfig,
     profile_router: Arc<ProfileRouter>,
+    drain_rx: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl SessionMultiplexer {
@@ -219,7 +274,13 @@ impl SessionMultiplexer {
             pool,
             config,
             profile_router: Arc::new(profile_router),
+            drain_rx: None,
         }
+    }
+
+    pub fn with_drain_receiver(mut self, rx: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.drain_rx = Some(rx);
+        self
     }
 
     pub fn with_router(mut self, profile_router: ProfileRouter) -> Self {
@@ -232,6 +293,13 @@ impl SessionMultiplexer {
     }
 
     pub async fn route(&self, event: InboundEvent) -> Result<()> {
+        if let Some(ref rx) = self.drain_rx {
+            if *rx.borrow() {
+                return Err(OmonError::Config(
+                    "gateway is draining; new turns are refused".into(),
+                ));
+            }
+        }
         let key = event.session.clone();
         loop {
             let handle = self.handle_for(&key);
@@ -284,10 +352,96 @@ impl SessionMultiplexer {
         self.sessions.contains_key(key)
     }
 
+    /// Routes an event and resolves once its turn reaches a terminal outcome.
+    ///
+    /// Startup backfill uses this so a durability cursor only advances past a message
+    /// whose replayed turn actually succeeded. The wait is signal-driven, never polled.
+    pub async fn route_awaiting_turn(&self, event: InboundEvent) -> Result<()> {
+        let key = event.session.clone();
+        loop {
+            let handle = self.handle_for(&key);
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            match handle.send_event_with_ack(event.clone(), ack_tx).await? {
+                SendOutcome::Sent => {
+                    return match ack_rx.await {
+                        Ok(outcome) => outcome,
+                        Err(_) => Err(OmonError::Multiplexer(
+                            "session actor dropped the turn before reporting an outcome".into(),
+                        )),
+                    };
+                }
+                SendOutcome::Retiring => {
+                    handle.wait_until_reusable().await;
+                }
+                SendOutcome::Closed => {
+                    self.remove_handle(&key, &handle);
+                    handle.mark_finished();
+                }
+            }
+        }
+    }
+
     /// Touches the session's activity timestamp to prevent premature idle GC eviction.
     pub fn touch_activity(&self, key: &SessionKey) {
         if let Some(handle) = self.sessions.get(key) {
             let _ = handle.sender.try_send(ActorCommand::TouchActivity);
+        }
+    }
+
+    pub async fn set_model(&self, key: &SessionKey, model: String) -> Result<()> {
+        let storage_key = key.storage_key();
+        let state_json: Option<String> =
+            sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+                .bind(&storage_key)
+                .fetch_optional(&self.pool)
+                .await?;
+        let mut state: crate::SessionState = state_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        state.active_model = Some(model.clone());
+        let state_str =
+            serde_json::to_string(&state).map_err(|e| OmonError::Database(e.to_string()))?;
+        sqlx::query(
+            "UPDATE sessions SET state_json = ?, updated_at = CURRENT_TIMESTAMP WHERE session_key = ?",
+        )
+        .bind(state_str)
+        .bind(&storage_key)
+        .execute(&self.pool)
+        .await?;
+
+        if let Some(handle) = self.sessions.get(key) {
+            let _ = handle.set_model(model).await;
+        }
+        Ok(())
+    }
+
+    pub async fn reset(&self, key: &SessionKey) -> Result<()> {
+        if let Some(handle) = self.sessions.get(key) {
+            let _ = handle.reset().await;
+        }
+        Ok(())
+    }
+
+    pub async fn session_context(&self, key: &SessionKey) -> Result<Option<SessionContext>> {
+        if let Some(handle) = self.sessions.get(key) {
+            if let Ok(ctx) = handle.get_context().await {
+                return Ok(Some(ctx));
+            }
+        }
+        let storage_key = key.storage_key();
+        let state_json: Option<String> =
+            sqlx::query_scalar("SELECT state_json FROM sessions WHERE session_key = ?")
+                .bind(&storage_key)
+                .fetch_optional(&self.pool)
+                .await?;
+        if let Some(json_str) = state_json {
+            let state: crate::SessionState = serde_json::from_str(&json_str).unwrap_or_default();
+            let mut ctx = SessionContext::new(key.clone());
+            ctx.state = state;
+            Ok(Some(ctx))
+        } else {
+            Ok(None)
         }
     }
 

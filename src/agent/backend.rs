@@ -43,7 +43,10 @@ pub trait AgentBackend: Send + Sync + 'static {
     ) -> Result<()> {
         tokio::select! {
             result = self.run(session, event) => result,
-            _ = cancellation.cancelled() => Err(OmonError::Multiplexer("agent turn cancelled".into())),
+            _ = cancellation.cancelled() => {
+                let _ = self.cancel(session).await;
+                Err(OmonError::Multiplexer("agent turn cancelled".into()))
+            }
         }
     }
 

@@ -1,0 +1,11 @@
+[
+  "cargo test --test test_discord_adapter startup_recovery_preserves_work_and_source_time -- --exact --nocapture",
+  "cargo test --lib storage::db::tests::inbound_preserves_original_platform_timestamp -- --exact --nocapture",
+  "cargo test --lib inbound_preserves_original_platform_timestamp -- --nocapture",
+  "cargo test --test test_discord_adapter",
+  "cargo test --test test_multiplexer",
+  "cargo test --lib storage::db::tests",
+  "cargo build",
+  "git diff --check src/discord/adapter.rs src/ledger/service.rs src/multiplexer/router.rs tests/test_discord_adapter.rs",
+  "rustfmt --check --edition 2021 src/discord/adapter.rs src/ledger/service.rs src/multiplexer/router.rs tests/test_discord_adapter.rs"
+]

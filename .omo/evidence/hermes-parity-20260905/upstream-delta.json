@@ -1,0 +1,9 @@
+{
+  "http": 200,
+  "status": "ahead",
+  "ahead": 15233,
+  "behind": 0,
+  "totalCommits": 10000,
+  "fileCount": 300,
+  "gatewayFiles": []
+}

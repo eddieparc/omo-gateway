@@ -1,0 +1,30 @@
+    Blocking waiting for file lock on build directory
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 13s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 2 tests
+test tools::tests::test_tool_approval_hook_dispatch_approved ... ok
+test tools::tests::test_tool_approval_hook_dispatch_denied ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 286 filtered out; finished in 0.00s
+
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.34s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+test discord::approval::tests::test_permanent_allowlist_persistence_roundtrip_and_auto_approval ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 288 filtered out; finished in 0.12s
+
+   Compiling png v0.18.1
+   Compiling serenity v0.12.5
+   Compiling harfrust v0.12.0
+   Compiling tiny-skia v0.12.0
+   Compiling usvg v0.48.1
+   Compiling resvg v0.48.1
+   Compiling songbird v0.5.0
+   Compiling poise v0.6.2
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 57.91s

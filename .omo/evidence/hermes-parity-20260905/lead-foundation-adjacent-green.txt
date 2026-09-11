@@ -1,0 +1,67 @@
+status: completed exit_code: 0
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 29s                                             
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 295 filtered out; finished in 0.00s
+
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.76s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+test discord::approval::tests::test_permanent_allowlist_persistence_roundtrip_and_auto_approval ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 295 filtered out; finished in 0.12s
+
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.55s                                             
+     Running tests/test_omo_backend.rs (target/debug/deps/test_omo_backend-e85d760fcf7cdf1d)
+
+running 25 tests
+test test_omo_backend_ignores_turn_completed_for_other_thread ... ok
+test test_omo_backend_omits_workspace_when_per_agent_disabled ... ok
+test test_omo_backend_emits_hermes_activity_lines ... ok
+test test_omo_backend_cron_session_suppresses_activity_lines_and_delivers_only_final_result ... ok
+test test_omo_backend_cron_sessions_always_start_fresh_thread ... ok
+test rejects_foreign_and_stale_turn_frames ... ok
+test correlation_requires_ack_and_ignores_subscription_replay ... ok
+test test_omo_backend_aborts_turn_on_repeated_approval_denials ... ok
+test test_omo_backend_e2e_thread_lifecycle_and_streaming ... ok
+test test_omo_backend_replaces_stale_cached_thread ... ok
+test test_omo_backend_surfaces_turn_start_rpc_error_immediately ... ok
+test correlation_distinguishes_interrupted_and_failed ... ok
+test test_omo_backend_skips_ack_when_delivery_fails ... ok
+test test_omo_backend_waits_for_final_message_after_tool_activity ... ok
+test test_omo_backend_provisions_agent_workspace_and_passes_to_thread_start ... ok
+test test_omo_backend_persists_without_preexisting_session_row ... ok
+test test_omo_backend_runs_ack_command_after_cron_delivery ... ok
+test test_omo_backend_accepts_received_completion_at_deadline_edge ... ok
+test test_omo_backend_deadline_fires_on_ping_only_stream ... ok
+test test_omo_backend_empty_terminal_past_grace_fails_fast ... ok
+test test_omo_backend_ignores_turn_completed_without_content ... ok
+test test_omo_backend_retries_once_after_connection_drop ... ok
+test test_omo_backend_deadline_interrupts_looping_turn ... ok
+test test_omo_backend_requires_turn_terminal_even_after_final_agent_message ... ok
+test test_omo_backend_unreachable_daemon_error ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.68s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.59s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 4 tests
+test discord::table_render::tests::test_extract_markdown_tables ... ok
+test discord::table_render::tests::test_render_table_to_svg_and_png ... ok
+text bounds: Rect { left: 16.0, top: 13.4, right: 50.3, bottom: 30.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 57.4, right: 403.5199, bottom: 74.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 77.4, right: 403.5199, bottom: 94.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 97.4, right: 403.5199, bottom: 114.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 117.4, right: 64.44, bottom: 134.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+fence_preserved=true; glyphs_inside=true; images=1
+test discord::table_render::tests::fences_and_unbroken_cells_preserve_content ... ok
+test discord::table_render::tests::table_source_span_and_fence_controls ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 292 filtered out; finished in 0.90s

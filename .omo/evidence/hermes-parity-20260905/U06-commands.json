@@ -1,0 +1,7 @@
+[
+  "cargo test --lib tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging -- --exact --nocapture",
+  "cargo test --lib tools::skills::tests::skill_write_destination_adjacent_controls -- --exact --nocapture",
+  "cargo test --lib storage::db::tests::test_pending_writes_store_round_trip -- --exact --nocapture",
+  "cargo build",
+  "git diff --check -- src/tools/skills.rs src/storage/db.rs"
+]

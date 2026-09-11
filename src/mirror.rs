@@ -59,63 +59,144 @@ pub async fn mirror_to_session(
 }
 
 /// Finds the most relevant active session key for a platform and origin coordinates.
+fn extract_bot_id_from_session_key(key: &str) -> Option<String> {
+    if let Ok(k) = crate::SessionKey::from_storage_key(key) {
+        return k.bot_id;
+    }
+    let parts: Vec<&str> = key.split(':').collect();
+    if parts.len() >= 4 {
+        Some(parts[1].to_string())
+    } else {
+        None
+    }
+}
+
 pub async fn find_session_by_origin(
     pool: &SqlitePool,
     platform: &str,
     chat_id: &str,
     thread_id: Option<&str>,
     user_id: Option<&str>,
+    bot_id: Option<&str>,
 ) -> Result<Option<String>> {
     let platform = platform.to_ascii_lowercase();
 
-    // 1. Thread-specific match if thread_id is given
     if let Some(tid) = thread_id {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT session_key FROM sessions
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT session_key, user_id FROM sessions
              WHERE lower(platform) = ? AND channel_id = ? AND thread_id = ?
-             ORDER BY updated_at DESC LIMIT 1",
+             ORDER BY updated_at DESC",
         )
         .bind(&platform)
         .bind(chat_id)
         .bind(tid)
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await?;
 
-        if let Some((k,)) = row {
-            return Ok(Some(k));
+        if rows.is_empty() {
+            return Ok(None);
         }
+
+        let matching_bot_rows: Vec<&(String, Option<String>)> = rows
+            .iter()
+            .filter(|r| {
+                if let Some(bid) = bot_id {
+                    extract_bot_id_from_session_key(&r.0).as_deref() == Some(bid)
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        if matching_bot_rows.is_empty() {
+            return Ok(None);
+        }
+
+        if let Some(uid) = user_id {
+            if let Some(matching) = matching_bot_rows
+                .iter()
+                .find(|r| r.1.as_deref() == Some(uid))
+            {
+                return Ok(Some(matching.0.clone()));
+            }
+        }
+
+        if bot_id.is_none() {
+            let distinct_bots: std::collections::HashSet<_> = matching_bot_rows
+                .iter()
+                .map(|r| extract_bot_id_from_session_key(&r.0))
+                .collect();
+            if distinct_bots.len() > 1 {
+                return Ok(None);
+            }
+        }
+
+        return Ok(Some(matching_bot_rows[0].0.clone()));
     }
 
-    // 2. User-specific match in channel if user_id is given
-    if let Some(uid) = user_id {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT session_key FROM sessions
-             WHERE lower(platform) = ? AND channel_id = ? AND user_id = ?
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(&platform)
-        .bind(chat_id)
-        .bind(uid)
-        .fetch_optional(pool)
-        .await?;
-
-        if let Some((k,)) = row {
-            return Ok(Some(k));
-        }
-    }
-
-    // 3. Fallback to most recently active session for this platform and channel
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT session_key FROM sessions
-         WHERE lower(platform) = ? AND channel_id = ?
-         ORDER BY updated_at DESC LIMIT 1",
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT session_key, user_id FROM sessions
+         WHERE lower(platform) = ? AND channel_id = ? AND (thread_id IS NULL OR thread_id = '')
+         ORDER BY updated_at DESC",
     )
     .bind(&platform)
     .bind(chat_id)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await?;
 
-    Ok(row.map(|(k,)| k))
+    let rows = if rows.is_empty() {
+        sqlx::query_as(
+            "SELECT session_key, user_id FROM sessions
+             WHERE lower(platform) = ? AND channel_id = ?
+             ORDER BY updated_at DESC",
+        )
+        .bind(&platform)
+        .bind(chat_id)
+        .fetch_all(pool)
+        .await?
+    } else {
+        rows
+    };
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let matching_bot_rows: Vec<&(String, Option<String>)> = rows
+        .iter()
+        .filter(|r| {
+            if let Some(bid) = bot_id {
+                extract_bot_id_from_session_key(&r.0).as_deref() == Some(bid)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if matching_bot_rows.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(uid) = user_id {
+        if let Some(matching) = matching_bot_rows
+            .iter()
+            .find(|r| r.1.as_deref() == Some(uid))
+        {
+            return Ok(Some(matching.0.clone()));
+        }
+    }
+
+    if bot_id.is_none() {
+        let distinct_bots: std::collections::HashSet<_> = matching_bot_rows
+            .iter()
+            .map(|r| extract_bot_id_from_session_key(&r.0))
+            .collect();
+        if distinct_bots.len() > 1 {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(matching_bot_rows[0].0.clone()))
 }
 
 #[cfg(test)]
@@ -207,22 +288,49 @@ mod tests {
         .await
         .unwrap();
 
-        // 1. Finding with thread_id returns thread session
-        let found = find_session_by_origin(&pool, "discord", "c1", Some("t1"), None)
+        let found = find_session_by_origin(&pool, "discord", "c1", Some("t1"), None, None)
             .await
             .unwrap();
         assert_eq!(found, Some("sess-thread".to_string()));
 
-        // 2. Finding with user_id returns user-specific session
-        let found_user = find_session_by_origin(&pool, "discord", "c1", None, Some("u2"))
+        let found_user = find_session_by_origin(&pool, "discord", "c1", None, Some("u2"), None)
             .await
             .unwrap();
         assert_eq!(found_user, Some("sess-user2".to_string()));
 
-        // 3. Finding with channel only returns a matching channel session
-        let found_chan = find_session_by_origin(&pool, "discord", "c1", None, None)
+        let found_chan = find_session_by_origin(&pool, "discord", "c1", None, None, None)
             .await
             .unwrap();
         assert!(found_chan.is_some());
+    }
+
+    #[tokio::test]
+    async fn mirror_refuses_wrong_thread_and_ambiguous_bot() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, channel_id, thread_id, user_id, state_json)
+             VALUES ('discord:bot-a:c1:t1:u1', 'discord', 'c1', 't1', 'u1', '{}'),
+                    ('discord:bot-b:c1:t2:u2', 'discord', 'c1', 't2', 'u2', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let found_t3 = find_session_by_origin(&pool, "discord", "c1", Some("t3"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(found_t3, None);
+
+        let found_c1 = find_session_by_origin(&pool, "discord", "c1", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(found_c1, None);
+
+        let found_bota =
+            find_session_by_origin(&pool, "discord", "c1", Some("t1"), None, Some("bot-a"))
+                .await
+                .unwrap();
+        assert_eq!(found_bota, Some("discord:bot-a:c1:t1:u1".to_string()));
     }
 }

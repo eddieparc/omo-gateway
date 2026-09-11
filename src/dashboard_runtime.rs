@@ -100,7 +100,8 @@ pub async fn run_standalone(
         FileTool::new(&workspace_root).with_authorized_roots(extra_tool_roots.clone()),
     );
     tools.register(McpTool::default());
-    tools.register(CronTool::new(pool.clone()));
+    let cron_tool = CronTool::new(pool.clone());
+    tools.register(cron_tool.clone());
     tools.register(omon_gateway::WebSearchTool);
     tools.register(omon_gateway::WebFetchTool);
     tools.register(omon_gateway::BrowserTool::default());
@@ -113,7 +114,10 @@ pub async fn run_standalone(
     tools.register(omon_gateway::SkillsTool::new(skill_roots.clone()).with_pool(pool.clone()));
 
     validate_agent_backend_env()?;
-    let omo_config = OmoBackendConfig::from_env()?.with_workspace_root(workspace_root.clone());
+    let mut omo_config = OmoBackendConfig::from_env()?.with_workspace_root(workspace_root.clone());
+    omo_config
+        .default_model
+        .get_or_insert_with(effective_default_model);
     // Zero-config daemon lifecycle: spawn/keep-alive/kill the local
     // `omo app-server` unless an external one is already serving.
     let _daemon_supervisor = OmoDaemonSupervisor::ensure(&omo_config).await?;
@@ -122,7 +126,7 @@ pub async fn run_standalone(
         "Configured dashboard agent backend: OMO app-server"
     );
     let omo_backend = Arc::new(
-        OmoBackend::new(omo_config, dispatcher.clone()).with_pool(pool.clone()),
+        OmoBackend::new(omo_config.clone(), dispatcher.clone()).with_pool(pool.clone()),
     );
     let mux = SessionMultiplexer::with_dispatcher(
         pool.clone(),
@@ -134,15 +138,21 @@ pub async fn run_standalone(
     let scale_to_zero = Some(ScaleToZero::start(mux.clone()));
     let multiplexer = Some(mux);
 
-    // Cron gets its own app-server instance so a long cron turn cannot
-    // occupy the interactive daemon (one turn per agent thread).
-    let cron_omo_config =
+    // Cron and interactive share one multiplexed daemon instance with distinct agent threads
+    let mut cron_omo_config =
         OmoBackendConfig::cron_from_env()?.with_workspace_root(workspace_root.clone());
-    let _cron_daemon_supervisor = OmoDaemonSupervisor::ensure(&cron_omo_config).await?;
+    cron_omo_config
+        .default_model
+        .get_or_insert_with(effective_default_model);
+    let _cron_daemon_supervisor = if cron_omo_config.appserver_url == omo_config.appserver_url {
+        None
+    } else {
+        OmoDaemonSupervisor::ensure(&cron_omo_config).await?
+    };
     tracing::info!(
         appserver_url = %cron_omo_config.appserver_url,
         total_timeout_secs = cron_omo_config.total_timeout.as_secs(),
-        "Configured isolated dashboard cron backend: OMO app-server"
+        "Configured dashboard cron backend: OMO app-server"
     );
     let cron_backend = Arc::new(
         OmoBackend::new(cron_omo_config, dispatcher.clone()).with_pool(pool.clone()),
@@ -160,6 +170,7 @@ pub async fn run_standalone(
         }),
         dispatcher,
     );
+    cron_tool.bind_scheduler(Arc::new(scheduler.clone()));
     if start_scheduler {
         scheduler.start().await;
     }
@@ -251,6 +262,10 @@ fn configured_bot_count() -> usize {
     tokens.len()
 }
 
+pub fn effective_default_model() -> String {
+    super::Config::resolve_default_model()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dashboard_config_view(
     settings: &DashboardSettings,
@@ -267,7 +282,7 @@ fn dashboard_config_view(
         .map(|value| split_csv(&value))
         .unwrap_or_default();
     json!({
-        "model": super::optional_env("DEFAULT_MODEL"),
+        "model": effective_default_model(),
         "providers": {
             "openai_base_url": super::optional_env("OPENAI_API_BASE"),
             "openai_api_key_configured": super::optional_env("OPENAI_API_KEY").is_some_and(|value| !value.trim().is_empty()),
@@ -275,7 +290,7 @@ fn dashboard_config_view(
             "anthropic_api_key_configured": super::optional_env("ANTHROPIC_API_KEY").is_some_and(|value| !value.trim().is_empty()),
         },
         "approval": {
-            "policy": super::optional_env("APPROVAL_MODE").unwrap_or_else(|| "ask".into()),
+            "policy": super::optional_env("APPROVAL_MODE").unwrap_or_else(|| "smart".into()),
             "timeout_secs": super::approval_timeout_secs_from(super::optional_env("APPROVAL_TIMEOUT_SECS").as_deref()),
             "deny_patterns": deny_patterns,
         },

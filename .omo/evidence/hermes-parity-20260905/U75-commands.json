@@ -1,0 +1,9 @@
+[
+  "cargo test --lib drain_control::tests::drain_marker_expiry_is_lenient_and_bounded -- --list --exact",
+  "cargo test --lib drain_control::tests::drain_marker_expiry_is_lenient_and_bounded -- --exact --nocapture",
+  "cargo test --lib drain_control::tests::drain_marker_expiry_local_surface -- --exact --nocapture",
+  "cargo test --lib drain_control::tests -- --nocapture",
+  "cargo build",
+  "rustfmt --edition 2021 --check src/drain_control.rs",
+  "git diff --check -- src/drain_control.rs"
+]

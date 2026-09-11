@@ -1,0 +1,24 @@
+Diff in /Users/indo/code/project/omon-gateway/src/discord/table_render/mod.rs:159:
+                 continue;
+             }
+             // A full em accommodates wide CJK glyphs as well as Latin text.
+[31m-            let max_line_chars =
+(B[m[31m-                ((width - cell_padding_x * 2.0) / font_size).max(1.0) as usize;
+(B[m[32m+            let max_line_chars = ((width - cell_padding_x * 2.0) / font_size).max(1.0) as usize;
+(B[m             let mut current = String::new();
+             for word in paragraph.split_whitespace() {
+                 if current.chars().count() + word.chars().count() + 1 > max_line_chars {
+Diff in /Users/indo/code/project/omon-gateway/src/discord/table_render/mod.rs:428:
+             assert_eq!(output, payload);
+             assert!(images.is_empty());
+         }
+[31m-        let raw = format!("| Wide | Small |\n|---|---|\n| {} | ok<br>end |", "W".repeat(100));
+(B[m[32m+        let raw = format!(
+(B[m[32m+            "| Wide | Small |\n|---|---|\n| {} | ok<br>end |",
+(B[m[32m+            "W".repeat(100)
+(B[m[32m+        );
+(B[m         let svg = render_table_to_svg(&extract_markdown_tables(&raw)[0]);
+         assert_eq!(svg.matches('W').count(), 101);
+         assert!(svg.contains(">ok</text>") && svg.contains(">end</text>"));
+
+EXIT_CODE=1

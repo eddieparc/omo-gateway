@@ -1,0 +1,12 @@
+--- a/src/agent/omo_backend.rs
++++ b/src/agent/omo_backend.rs
+@@ -389,4 +389,4 @@
+-        let started_at = std::time::Instant::now();
++        let started_at = tokio::time::Instant::now();
+         let mut turn_id: Option<String> = None;
+         let mut turn_started_ack = false;
+-        let mut last_activity_at = std::time::Instant::now();
++        let mut last_activity_at = tokio::time::Instant::now();
+@@ -427 +427 @@
+-                    last_activity_at = std::time::Instant::now();
++                    last_activity_at = tokio::time::Instant::now();

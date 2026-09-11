@@ -1,0 +1,6 @@
+[
+  "cargo test --lib drain_control::tests::drain_marker_cross_process_epoch -- --exact --nocapture",
+  "cargo test --lib drain_control::tests -- --nocapture",
+  "rustfmt --edition 2021 --check src/drain_control.rs",
+  "git diff --check -- src/drain_control.rs"
+]

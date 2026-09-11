@@ -358,10 +358,11 @@ fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str, OmonError> {
 }
 
 fn relative_string(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    if let Ok(rel) = path.strip_prefix(root) {
+        rel.to_string_lossy().replace('\\', "/")
+    } else {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 fn tool_error(error: impl std::fmt::Display) -> OmonError {
@@ -552,7 +553,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("path escapes tool root") || msg.contains("No such file")),
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("path escapes tool root") || msg.contains("No such file") || msg.contains("os error 2")),
             "expected error for traversal, got {:?}",
             err
         );

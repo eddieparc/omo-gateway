@@ -1,0 +1,24 @@
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 28s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+AP06 prompts=1, MCP calls=3, rule B denied=false
+
+thread 'tools::tests::tool_approval_scopes_do_not_cross_rules' (13069478) panicked at src/tools/mod.rs:278:9:
+assertion `left == right` failed: rule B autoapproved using rule A's Always grant
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tools::tests::tool_approval_scopes_do_not_cross_rules ... FAILED
+
+failures:
+
+failures:
+    tools::tests::tool_approval_scopes_do_not_cross_rules
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 285 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `--lib`
+
+EXIT_CODE=101

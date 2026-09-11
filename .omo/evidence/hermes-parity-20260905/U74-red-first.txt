@@ -1,0 +1,67 @@
+status: completed exit_code: 0
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.20s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+
+thread 'multiplexer::restart_loop_guard::tests::restart_chain_trips_for_slow_cycles' (13141901) panicked at src/multiplexer/restart_loop_guard.rs:156:9:
+assertion `left == right` failed: slow persisted restart chain
+  left: [false, false, false]
+ right: [false, false, true]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test multiplexer::restart_loop_guard::tests::restart_chain_trips_for_slow_cycles ... FAILED
+
+failures:
+
+failures:
+    multiplexer::restart_loop_guard::tests::restart_chain_trips_for_slow_cycles
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 289 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`
+    Blocking waiting for file lock on package cache
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+error[E0433]: failed to resolve: use of undeclared type `RestartLoopGuard`                                            
+    --> src/main.rs:1802:18
+     |
+1802 |         assert!(!RestartLoopGuard::new(&path).check_and_record_at(0.0));
+     |                  ^^^^^^^^^^^^^^^^ use of undeclared type `RestartLoopGuard`
+     |
+help: consider importing one of these structs
+     |
+1489 +     use crate::legacy::RestartLoopGuard;
+     |
+1489 +     use omon_gateway::RestartLoopGuard;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `RestartLoopGuard`
+    --> src/main.rs:1803:18
+     |
+1803 |         assert!(!RestartLoopGuard::new(&path).check_and_record_at(150.0));
+     |                  ^^^^^^^^^^^^^^^^ use of undeclared type `RestartLoopGuard`
+     |
+help: consider importing one of these structs
+     |
+1489 +     use crate::legacy::RestartLoopGuard;
+     |
+1489 +     use omon_gateway::RestartLoopGuard;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `RestartLoopGuard`
+    --> src/main.rs:1810:28
+     |
+1810 |         let recovered = if RestartLoopGuard::new(&path).check_and_record_at(300.0) {
+     |                            ^^^^^^^^^^^^^^^^ use of undeclared type `RestartLoopGuard`
+     |
+help: consider importing one of these structs
+     |
+1489 +     use crate::legacy::RestartLoopGuard;
+     |
+1489 +     use omon_gateway::RestartLoopGuard;
+     |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `omo-gateway` (bin "omo-gateway" test) due to 3 previous errors
+U74_RED_EXIT_CODES 101 101

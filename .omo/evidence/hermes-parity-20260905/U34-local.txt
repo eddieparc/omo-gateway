@@ -1,0 +1,21 @@
+    Blocking waiting for file lock on build directory
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 06s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 4 tests
+test discord::table_render::tests::test_extract_markdown_tables ... ok
+test discord::table_render::tests::test_render_table_to_svg_and_png ... ok
+text bounds: Rect { left: 16.0, top: 13.4, right: 50.3, bottom: 30.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 57.4, right: 403.5199, bottom: 74.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 77.4, right: 403.5199, bottom: 94.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 97.4, right: 403.5199, bottom: 114.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+text bounds: Rect { left: 16.0, top: 117.4, right: 64.44, bottom: 134.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(149.0)) }
+fence_preserved=true; glyphs_inside=true; images=1
+test discord::table_render::tests::fences_and_unbroken_cells_preserve_content ... ok
+test discord::table_render::tests::table_source_span_and_fence_controls ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 286 filtered out; finished in 0.90s
+
+
+EXIT_CODE=0

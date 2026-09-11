@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{SessionContext, SessionKey};
+use crate::{InboundEvent, SessionContext, SessionKey};
 
 /// Flexible deserializer for optional u64 supporting numbers (123), strings ("123"), and null.
 fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
@@ -79,6 +79,10 @@ pub struct ProfileRoute {
     pub system_prompt: Option<String>,
     #[serde(default, alias = "toolsets")]
     pub enabled_toolsets: Option<Vec<String>>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub allowed_users: Option<Vec<u64>>,
 }
 
 impl ProfileRoute {
@@ -92,6 +96,8 @@ impl ProfileRoute {
             model: None,
             system_prompt: None,
             enabled_toolsets: None,
+            profile: None,
+            allowed_users: None,
         }
     }
 
@@ -162,6 +168,12 @@ impl ProfileRoute {
                 .entry("enabled_toolsets".into())
                 .or_insert_with(|| serde_json::json!(toolsets));
         }
+        if let Some(profile) = &self.profile {
+            session
+                .state
+                .metadata
+                .insert("profile".into(), serde_json::Value::String(profile.clone()));
+        }
     }
 }
 
@@ -213,6 +225,34 @@ impl ProfileRouter {
         self.routes.len()
     }
 
+    pub fn is_user_allowed_for_bot_or_route(
+        &self,
+        bot_id: Option<&str>,
+        channel_id: u64,
+        user_id: u64,
+        global_allowed_users: &[u64],
+    ) -> bool {
+        if let Some(route) = self.match_route(None, channel_id, None) {
+            if let Some(ref allowed) = route.allowed_users {
+                return allowed.contains(&user_id);
+            }
+        }
+        if let Some(bot) = bot_id {
+            for route in &self.routes {
+                if route.name.as_deref() == Some(bot) || route.profile.as_deref() == Some(bot) {
+                    if let Some(ref allowed) = route.allowed_users {
+                        return allowed.contains(&user_id);
+                    }
+                }
+            }
+        }
+        if global_allowed_users.is_empty() {
+            true
+        } else {
+            global_allowed_users.contains(&user_id)
+        }
+    }
+
     /// Finds the highest-specificity matching route for the given Discord context.
     pub fn match_route(
         &self,
@@ -220,9 +260,84 @@ impl ProfileRouter {
         channel_id: u64,
         thread_id: Option<u64>,
     ) -> Option<&ProfileRoute> {
-        self.routes
+        self.match_route_with_parent(guild_id, channel_id, thread_id, None)
+    }
+
+    /// Finds matching route with explicit parent channel awareness.
+    /// Follows precedence: thread-specific route > direct channel route > parent-channel route > guild route.
+    pub fn match_route_with_parent(
+        &self,
+        guild_id: Option<u64>,
+        channel_id: u64,
+        thread_id: Option<u64>,
+        parent_chat_id: Option<u64>,
+    ) -> Option<&ProfileRoute> {
+        // 1. Thread-specific route: route explicitly matching this thread ID
+        if let Some(tid) = thread_id {
+            if let Some(route) = self.routes.iter().find(|r| {
+                r.thread == Some(tid)
+                    && (r.channel.is_none()
+                        || r.channel == Some(channel_id)
+                        || parent_chat_id.is_some_and(|pid| r.channel == Some(pid)))
+                    && (r.guild.is_none() || r.guild == guild_id)
+                    && r.enabled
+            }) {
+                return Some(route);
+            }
+            // A route targeting the thread ID directly as channel (e.g. {"channel": 300})
+            if let Some(route) = self.routes.iter().find(|r| {
+                r.channel == Some(tid)
+                    && r.thread.is_none()
+                    && (r.guild.is_none() || r.guild == guild_id)
+                    && r.enabled
+            }) {
+                return Some(route);
+            }
+        }
+
+        // 2. Direct channel route: route on the given channel_id
+        if let Some(route) = self
+            .routes
             .iter()
-            .find(|route| route.matches(guild_id, channel_id, thread_id))
+            .find(|r| r.matches(guild_id, channel_id, thread_id))
+        {
+            return Some(route);
+        }
+        if thread_id.is_some() {
+            if let Some(route) = self.routes.iter().find(|r| {
+                r.channel == Some(channel_id)
+                    && r.thread.is_none()
+                    && (r.guild.is_none() || r.guild == guild_id)
+                    && r.enabled
+            }) {
+                return Some(route);
+            }
+        }
+
+        // 3. Parent channel route when direct channel route misses
+        if let Some(parent_id) = parent_chat_id {
+            if parent_id != channel_id {
+                if let Some(route) = self.routes.iter().find(|r| {
+                    r.channel == Some(parent_id)
+                        && r.thread.is_none()
+                        && (r.guild.is_none() || r.guild == guild_id)
+                        && r.enabled
+                }) {
+                    return Some(route);
+                }
+            }
+        }
+
+        // 4. Guild-level fallback
+        if let Some(gid) = guild_id {
+            if let Some(route) = self.routes.iter().find(|r| {
+                r.guild == Some(gid) && r.channel.is_none() && r.thread.is_none() && r.enabled
+            }) {
+                return Some(route);
+            }
+        }
+
+        None
     }
 
     /// Alias for `match_route` to match profile-returning API style.
@@ -247,6 +362,23 @@ impl ProfileRouter {
             .as_deref()
             .and_then(|s| s.parse::<u64>().ok());
         self.match_route(guild_id, channel_id, thread_id)
+    }
+
+    /// Matches a route against an `InboundEvent`, taking parent channel into account if present.
+    pub fn match_event(&self, event: &InboundEvent) -> Option<&ProfileRoute> {
+        let guild_id = event
+            .session
+            .guild_id
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok());
+        let channel_id = event.session.channel_id.parse::<u64>().ok()?;
+        let thread_id = event
+            .session
+            .thread_id
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok());
+        let parent_id = event.parent_chat_id().and_then(|s| s.parse::<u64>().ok());
+        self.match_route_with_parent(guild_id, channel_id, thread_id, parent_id)
     }
 
     /// Applies matching profile overrides to a session context if a route matches.
@@ -321,6 +453,8 @@ pub fn parse_channel_prompts(json_str: &str) -> Vec<ProfileRoute> {
                     model: None,
                     system_prompt,
                     enabled_toolsets: skills,
+                    profile: None,
+                    allowed_users: None,
                 });
             }
             routes.sort_by_key(|r| r.channel);
@@ -348,6 +482,7 @@ mod tests {
             model: Some("guild-model".into()),
             system_prompt: Some("guild-prompt".into()),
             enabled_toolsets: None,
+            ..Default::default()
         };
         let channel_route = ProfileRoute {
             name: Some("channel-route".into()),
@@ -358,6 +493,7 @@ mod tests {
             model: Some("channel-model".into()),
             system_prompt: Some("channel-prompt".into()),
             enabled_toolsets: None,
+            ..Default::default()
         };
         let thread_route = ProfileRoute {
             name: Some("thread-route".into()),
@@ -368,6 +504,7 @@ mod tests {
             model: Some("thread-model".into()),
             system_prompt: Some("thread-prompt".into()),
             enabled_toolsets: None,
+            ..Default::default()
         };
 
         // Insert in arbitrary order
@@ -403,6 +540,49 @@ mod tests {
     }
 
     #[test]
+    fn test_parent_channel_fallback_when_thread_route_misses() {
+        let router = ProfileRouter::new(vec![
+            ProfileRoute {
+                name: Some("parent-channel".into()),
+                guild: Some(100),
+                channel: Some(200),
+                thread: None,
+                enabled: true,
+                model: Some("model-x".into()),
+                system_prompt: Some("parent prompt".into()),
+                enabled_toolsets: None,
+                ..Default::default()
+            },
+            ProfileRoute {
+                name: Some("specific-thread".into()),
+                guild: Some(100),
+                channel: Some(200),
+                thread: Some(301),
+                enabled: true,
+                model: Some("specific-model".into()),
+                system_prompt: None,
+                enabled_toolsets: None,
+                ..Default::default()
+            },
+        ]);
+
+        // Thread 301 gets its specific model
+        let matched = router.match_route(Some(100), 200, Some(301)).unwrap();
+        assert_eq!(matched.model.as_deref(), Some("specific-model"));
+
+        // Thread 300 (no specific thread route) inherits parent channel 200 route
+        let matched = router.match_route(Some(100), 200, Some(300)).unwrap();
+        assert_eq!(matched.model.as_deref(), Some("model-x"));
+        assert_eq!(matched.system_prompt.as_deref(), Some("parent prompt"));
+
+        // When thread ID 300 is supplied with explicit parent 200
+        let matched = router
+            .match_route_with_parent(Some(100), 300, Some(300), Some(200))
+            .unwrap();
+        assert_eq!(matched.model.as_deref(), Some("model-x"));
+    }
+
+    #[test]
     fn test_no_match_returns_none() {
         let router = ProfileRouter::new(vec![ProfileRoute {
             name: Some("specific".into()),
@@ -413,6 +593,7 @@ mod tests {
             model: Some("custom".into()),
             system_prompt: None,
             enabled_toolsets: None,
+            ..Default::default()
         }]);
 
         assert!(router.match_route(Some(999), 888, Some(777)).is_none());
@@ -430,6 +611,7 @@ mod tests {
             model: Some("disabled-model".into()),
             system_prompt: None,
             enabled_toolsets: None,
+            ..Default::default()
         }]);
 
         assert!(router.match_route(Some(100), 200, None).is_none());
@@ -535,6 +717,7 @@ mod tests {
             model: Some("gpt-routed".into()),
             system_prompt: Some("Custom system prompt".into()),
             enabled_toolsets: Some(vec!["terminal".into(), "web".into()]),
+            ..Default::default()
         };
 
         let key = SessionKey::new("discord", Some("10"), "20", None::<String>, "user-1");
@@ -571,6 +754,7 @@ mod tests {
             model: Some("gpt-routed".into()),
             system_prompt: Some("Custom system prompt".into()),
             enabled_toolsets: Some(vec!["terminal".into()]),
+            ..Default::default()
         };
 
         let key = SessionKey::new("discord", Some("10"), "20", None::<String>, "user-1");
@@ -605,6 +789,7 @@ mod tests {
                 model: Some("model-a".into()),
                 system_prompt: None,
                 enabled_toolsets: None,
+                ..Default::default()
             },
             ProfileRoute {
                 name: Some("thread-profile".into()),
@@ -615,6 +800,7 @@ mod tests {
                 model: Some("model-b".into()),
                 system_prompt: None,
                 enabled_toolsets: None,
+                ..Default::default()
             },
         ]);
 

@@ -24,7 +24,7 @@ static HARDLINE_PATTERNS: LazyLock<Vec<HardlineRule>> = LazyLock::new(|| {
     let rm_prefix = format!(r"{cmdpos}rm\s+(-[^\s]*\s+)*");
     let hardline_system_dirs = r"/home|/home/\*|/root|/root/\*|/etc|/etc/\*|/usr|/usr/\*|/var|/var/\*|/bin|/bin/\*|/sbin|/sbin/\*|/boot|/boot/\*|/lib|/lib/\*|/System|/System/\*";
 
-    let root_rm_path = build_hardline_rm_path(r"/(?:(?:[.]/|[.][.]/)*)*(?:[.]|[.][.])?\**|/ \*");
+    let root_rm_path = build_hardline_rm_path(r"/(?:/|[.]/|[.][.]/)*(?:[.]|[.][.])?\**|/ \*");
     let sys_rm_path = build_hardline_rm_path(hardline_system_dirs);
     let home_rm_path = build_hardline_rm_path(r"(?:~|\$\{?HOME\}?)(?:/?|/\*)?");
 

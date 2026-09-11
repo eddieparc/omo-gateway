@@ -1,0 +1,82 @@
+Chronology before any U75 production edit:
+
+$ cargo test --lib drain_control::tests::drain_marker_expiry_is_lenient_and_bounded -- --list --exact
+    Blocking waiting for file lock on build directory
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 12s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+drain_control::tests::drain_marker_expiry_is_lenient_and_bounded: test
+
+1 test, 0 benchmarks
+EXIT_CODE=0
+
+$ cargo test --lib drain_control::tests::drain_marker_expiry_is_lenient_and_bounded -- --exact --nocapture
+    Blocking waiting for file lock on build directory
+Command timed out after 180 seconds
+NOT behavioral RED. Subsequent process inspection found no surviving U75 cargo process.
+
+$ target/debug/deps/omon_gateway-dbf1c807bcd6f72f drain_control::tests::drain_marker_expiry_is_lenient_and_bounded --exact --nocapture
+running 1 test
+case=expired_same_epoch T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05T10:59:59Z","suppress_notification":true} expected_active=false actual=Some(DrainRequest { action: "drain", requested_at: Some("2026-09-05T10:59:59Z"), principal: Some("u75-operator"), epoch: Some("boot:1"), suppress_notification: true })
+
+thread 'drain_control::tests::drain_marker_expiry_is_lenient_and_bounded' (1292907) panicked at src/drain_control.rs:264:13:
+assertion `left == right` failed: expired_same_epoch
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test drain_control::tests::drain_marker_expiry_is_lenient_and_bounded ... FAILED
+
+failures:
+
+failures:
+    drain_control::tests::drain_marker_expiry_is_lenient_and_bounded
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 309 filtered out; finished in 0.02s
+EXIT_CODE=101
+
+$ cargo test --lib drain_control::tests::drain_marker_expiry_is_lenient_and_bounded -- --exact --nocapture
+    Blocking waiting for file lock on build directory
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+error[E0505]: cannot move out of `path` because it is borrowed
+   --> src/agent/omo_daemon.rs:400:89
+    |
+399 |                 let path = entry.unwrap().path();
+    |                     ---- binding `path` declared here
+400 |                 println!("fixture log {}:\n{}", path.display(), std::fs::read_to_string(path).unwrap());
+    |                 ------------------------------------------------------------------------^^^^-----------
+    |                 |                               |                                       |
+    |                 |                               |                                       move out of `path` occurs here
+    |                 |                               borrow of `path` occurs here
+    |                 borrow later used here
+
+For more information about this error, try `rustc --explain E0505`.
+error: could not compile `omo-gateway` (lib test) due to 1 previous error
+EXIT_CODE=101; NOT behavioral RED; concurrent unowned edit, no U75 repair.
+
+After a read confirmed the owner had changed read_to_string(path) to
+read_to_string(&path), the identical registered command ran before production edits:
+
+$ cargo test --lib drain_control::tests::drain_marker_expiry_is_lenient_and_bounded -- --exact --nocapture
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.78s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+case=expired_same_epoch T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05T10:59:59Z","suppress_notification":true} expected_active=false actual=Some(DrainRequest { action: "drain", requested_at: Some("2026-09-05T10:59:59Z"), principal: Some("u75-operator"), epoch: Some("boot:1"), suppress_notification: true })
+
+thread 'drain_control::tests::drain_marker_expiry_is_lenient_and_bounded' (1337144) panicked at src/drain_control.rs:264:13:
+assertion `left == right` failed: expired_same_epoch
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test drain_control::tests::drain_marker_expiry_is_lenient_and_bounded ... FAILED
+
+failures:
+
+failures:
+    drain_control::tests::drain_marker_expiry_is_lenient_and_bounded
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 311 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+EXIT_CODE=101; behavioral RED, one selected test.

@@ -1,0 +1,10 @@
+[
+  "cargo test --test test_omo_backend accepted_disconnect_does_not_resubmit_turn -- --exact --nocapture",
+  "cargo test --test test_omo_backend pre_ack_disconnect_does_not_resubmit_turn -- --exact --nocapture",
+  "cargo test --test test_omo_backend pre_submit_disconnect_retries_and_succeeds -- --exact --nocapture",
+  "cargo test --test test_omo_backend -- --nocapture",
+  "cargo clippy --lib -- -D warnings",
+  "cargo build",
+  "git diff --check src/agent/omo_backend.rs tests/test_omo_backend.rs",
+  "rustfmt --check --edition 2021 src/agent/omo_backend.rs tests/test_omo_backend.rs"
+]

@@ -124,6 +124,98 @@ pub trait SpeechToText: Send + Sync + 'static {
     async fn transcribe(&self, frames: &[AudioFrame]) -> Result<String>;
 }
 
+#[derive(Clone)]
+pub struct OpenAiSpeechToText {
+    api_key: String,
+    base_url: String,
+    model: String,
+    client: reqwest::Client,
+}
+
+impl OpenAiSpeechToText {
+    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            base_url: base_url.into(),
+            model: "whisper-1".to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl SpeechToText for OpenAiSpeechToText {
+    async fn transcribe(&self, frames: &[AudioFrame]) -> Result<String> {
+        let Some(first) = frames.first() else {
+            return Ok(String::new());
+        };
+        let (bytes, filename) = match &first.payload {
+            AudioPayload::Opus(opus_bytes) => (opus_bytes.clone(), "audio.ogg"),
+            AudioPayload::Pcm(pcm_samples) => {
+                let mut wav = Vec::new();
+                let sample_rate = first.sample_rate;
+                let channels = first.channels;
+                let data_size = (pcm_samples.len() * 2) as u32;
+                wav.extend_from_slice(b"RIFF");
+                wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+                wav.extend_from_slice(b"WAVE");
+                wav.extend_from_slice(b"fmt ");
+                wav.extend_from_slice(&16u32.to_le_bytes());
+                wav.extend_from_slice(&1u16.to_le_bytes());
+                wav.extend_from_slice(&channels.to_le_bytes());
+                wav.extend_from_slice(&sample_rate.to_le_bytes());
+                wav.extend_from_slice(&(sample_rate * channels as u32 * 2).to_le_bytes());
+                wav.extend_from_slice(&(channels * 2).to_le_bytes());
+                wav.extend_from_slice(&16u16.to_le_bytes());
+                wav.extend_from_slice(b"data");
+                wav.extend_from_slice(&data_size.to_le_bytes());
+                for sample in pcm_samples {
+                    wav.extend_from_slice(&sample.to_le_bytes());
+                }
+                (wav, "audio.wav")
+            }
+        };
+
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
+        let form = reqwest::multipart::Form::new()
+            .text("model", self.model.clone())
+            .part("file", part);
+
+        let url = format!(
+            "{}/audio/transcriptions",
+            self.base_url.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| OmonError::Multiplexer(format!("OpenAI STT network error: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(OmonError::Multiplexer(format!(
+                "OpenAI STT error {status}: {text}"
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct TranscriptionResponse {
+            text: String,
+        }
+
+        let body: TranscriptionResponse = response
+            .json()
+            .await
+            .map_err(|e| OmonError::Multiplexer(format!("OpenAI STT JSON error: {e}")))?;
+
+        Ok(body.text)
+    }
+}
+
 #[async_trait]
 pub trait VoiceLanguageModel: Send + Sync + 'static {
     async fn respond(&self, channel_id: u64, transcript: &str) -> Result<String>;

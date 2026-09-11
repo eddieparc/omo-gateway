@@ -1,0 +1,577 @@
+diff --git a/tests/test_omo_backend.rs b/tests/test_omo_backend.rs
+index 9fff28d..48f9d96 100644
+--- a/tests/test_omo_backend.rs
++++ b/tests/test_omo_backend.rs
+@@ -12,14 +12,158 @@ use serde_json::{json, Value};
+ use tokio::net::TcpListener;
+ use tokio_tungstenite::tungstenite::Message;
+ 
++// Public backend entry point over a real loopback WebSocket. Each script is a
++// new subscription to r1, so completed t1 frames can replay while t2 is active.
++async fn run_correlated_frames(frames: Vec<Value>) -> (omon_gateway::Result<()>, Vec<StreamChunk>) {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
++    let peer = tokio::spawn(async move {
++        let (socket, _) = listener.accept().await.unwrap();
++        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
++        for method in ["initialize", "thread/resume", "turn/start"] {
++            let message = ws.next().await.unwrap().unwrap();
++            let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
++            assert_eq!(request["method"], method);
++            if method != "initialize" {
++                assert_eq!(request["params"]["threadId"], "r1");
++            }
++            if method != "turn/start" {
++                ws.send(Message::text(
++                    json!({"jsonrpc":"2.0", "id":request["id"],
++                    "result":{"thread":{"id":"r1"}}})
++                    .to_string(),
++                ))
++                .await
++                .unwrap();
++            }
++        }
++        for frame in frames {
++            ws.feed(Message::text(frame.to_string())).await.unwrap();
++        }
++        ws.flush().await.unwrap();
++        stop_rx.await.unwrap();
++    });
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    let backend = OmoBackend::new(
++        OmoBackendConfig::new(format!("ws://{address}")),
++        dispatcher.clone(),
++    );
++    let key = SessionKey::new("local", None::<String>, "u12", None::<String>, "user");
++    let mut session = SessionContext::new(key.clone());
++    session
++        .state
++        .metadata
++        .insert("omo_thread_id".into(), json!("r1"));
++    let result = tokio::time::timeout(
++        std::time::Duration::from_secs(5),
++        backend.run(&mut session, InboundEvent::message(key, "u12", "probe")),
++    )
++    .await;
++    stop_tx.send(()).unwrap();
++    tokio::time::timeout(std::time::Duration::from_secs(5), peer)
++        .await
++        .unwrap()
++        .unwrap();
++    (
++        result.expect("bounded backend completion"),
++        dispatcher.stream_chunks(),
++    )
++}
++
++fn correlation_ack() -> Value {
++    json!({"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"t2","status":"inProgress"}}})
++}
++
++fn correlation_delta(thread: &str, turn: &str, text: &str) -> Value {
++    json!({"jsonrpc":"2.0","method":"item/agentMessage/delta",
++        "params":{"threadId":thread,"turnId":turn,"itemId":"m1","delta":text}})
++}
++
++fn correlation_terminal(turn: &str, status: &str) -> Value {
++    json!({"jsonrpc":"2.0","method":"turn/completed",
++        "params":{"threadId":"r1","turn":{"id":turn,"status":status,"error":{"message":"failure-sentinel"}}}})
++}
++
++#[tokio::test]
++async fn rejects_foreign_and_stale_turn_frames() {
++    let (result, chunks) = run_correlated_frames(vec![
++        correlation_ack(),
++        correlation_delta("r9", "t9", "SECRET"),
++        correlation_terminal("t1", "completed"),
++        correlation_delta("r1", "t2", "OK"),
++        correlation_terminal("t2", "completed"),
++    ])
++    .await;
++    assert!(result.is_ok(), "{result:?}");
++    assert_eq!(
++        chunks
++            .iter()
++            .filter(|c| c.is_final)
++            .map(|c| c.content.as_str())
++            .collect::<Vec<_>>(),
++        vec!["OK"]
++    );
++    assert!(chunks.iter().all(|c| !c.content.contains("SECRET")));
++}
++
++#[tokio::test]
++async fn correlation_requires_ack_and_ignores_subscription_replay() {
++    let replay = vec![
++        correlation_delta("r1", "t2", "SECRET"),
++        correlation_terminal("t2", "completed"),
++        correlation_ack(),
++        correlation_delta("r1", "t2", "O"),
++        json!({"method":"thread/status/changed","params":{"threadId":"r1","status":{"type":"idle"}}}),
++        json!({"method":"turn/started","params":{"threadId":"r1","turnId":"t1"}}),
++        correlation_delta("r1", "t1", "SECRET"),
++        json!({"method":"item/started","params":{"threadId":"r9","turnId":"t9","item":{"id":"tool","type":"commandExecution","command":"SECRET"}}}),
++        json!({"method":"item/completed","params":{"threadId":"r1","turnId":"t1","item":{"type":"agentMessage","text":"SECRET"}}}),
++        json!({"method":"turn/error","params":{"threadId":"r9","turnId":"t9","message":"SECRET"}}),
++        json!({"method":"error","params":{"threadId":"r1","turn":{"id":"t1"},"message":"SECRET"}}),
++        json!({"method":"item/agentMessage/delta","params":{"delta":"SECRET"}}),
++        json!({"method":"turn/completed","params":{"turn":{"id":"t2","status":"completed"}}}),
++        correlation_delta("r1", "t2", "K"),
++        correlation_terminal("t2", "completed"),
++    ];
++    let (result, chunks) = run_correlated_frames(replay).await;
++    assert!(result.is_ok(), "{result:?}");
++    assert_eq!(
++        chunks
++            .iter()
++            .filter(|c| c.is_final)
++            .map(|c| c.content.as_str())
++            .collect::<Vec<_>>(),
++        vec!["OK"]
++    );
++    assert!(chunks.iter().all(|c| !c.content.contains("SECRET")));
++}
++
++#[tokio::test]
++async fn correlation_distinguishes_interrupted_and_failed() {
++    for status in ["interrupted", "failed"] {
++        let (result, chunks) = run_correlated_frames(vec![
++            correlation_ack(),
++            correlation_delta("r1", "t2", "partial"),
++            correlation_terminal("t2", status),
++        ])
++        .await;
++        let error = result.expect_err(status);
++        assert!(error.to_string().contains(status), "{error}");
++        assert!(!chunks.iter().any(|c| c.is_final));
++    }
++}
++
+ struct CapturingDispatcher {
+     actions: ParkingMutex<Vec<OutboundAction>>,
++    tool_started: ParkingMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+ }
+ 
+ impl CapturingDispatcher {
+     fn new() -> Self {
+         Self {
+             actions: ParkingMutex::new(Vec::new()),
++            tool_started: ParkingMutex::new(None),
+         }
+     }
+ 
+@@ -38,7 +182,16 @@ impl CapturingDispatcher {
+ #[async_trait]
+ impl OutboundDispatcher for CapturingDispatcher {
+     async fn dispatch(&self, action: OutboundAction) -> omon_gateway::Result<()> {
++        let tool_started = matches!(&action, OutboundAction::Stream { chunk, .. }
++            if !chunk.is_final && chunk.content.ends_with("U12_TOOL_STARTED"));
+         self.actions.lock().push(action);
++        if tool_started {
++            if let Some(sender) = self.tool_started.lock().take() {
++                sender
++                    .send(())
++                    .expect("tool-start subscriber still waiting");
++            }
++        }
+         Ok(())
+     }
+ }
+@@ -314,8 +467,19 @@ impl FakeAppServer {
+                                         .send(Message::text(approval_req.to_string()))
+                                         .await;
+ 
+-                                    // Small delay to allow client to process approval request before ending turn
+-                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
++                                    // Observe the exact denial before publishing completion.
++                                    let response = tokio::time::timeout(
++                                        std::time::Duration::from_secs(5),
++                                        ws_stream.next(),
++                                    )
++                                    .await
++                                    .unwrap()
++                                    .unwrap()
++                                    .unwrap();
++                                    let response: Value =
++                                        serde_json::from_str(response.to_text().unwrap()).unwrap();
++                                    assert_eq!(response["id"], 999);
++                                    ar.lock().push(response);
+ 
+                                     // Stream item/agentMessage/delta chunks
+                                     let emit_activity = ea.load(Ordering::SeqCst);
+@@ -724,12 +888,141 @@ async fn spawn_empty_turn_completed_server() -> u16 {
+     port
+ }
+ 
+-async fn spawn_tool_after_agent_message_server() -> u16 {
++/// Like [`spawn_empty_turn_completed_server`], but the content-less terminal
++/// arrives only after `delay_ms`, so the configured empty-terminal grace
++/// window has already elapsed when it lands.
++async fn spawn_delayed_empty_turn_completed_server(delay_ms: u64) -> u16 {
+     let listener = TcpListener::bind("127.0.0.1:0")
+         .await
+         .expect("bind free port");
+     let port = listener.local_addr().expect("local addr").port();
+     tokio::spawn(async move {
++        let Ok((stream, _)) = listener.accept().await else {
++            return;
++        };
++        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
++            return;
++        };
++        while let Some(Ok(Message::Text(text))) = ws.next().await {
++            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
++                continue;
++            };
++            let id = request
++                .get("id")
++                .and_then(Value::as_u64)
++                .unwrap_or_default();
++            match request.get("method").and_then(Value::as_str) {
++                Some("initialize") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
++                        ))
++                        .await;
++                }
++                Some("thread/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-1"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                }
++                Some("turn/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
++                    let done = json!({
++                        "jsonrpc":"2.0","method":"turn/completed",
++                        "params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}
++                    });
++                    let _ = ws.send(Message::text(done.to_string())).await;
++                }
++                _ => continue,
++            }
++        }
++    });
++    port
++}
++
++/// Completes the handshake and then emits only WebSocket ping frames: this
++/// is the keepalive-alive-but-wedged daemon shape that must still hit the
++/// whole-turn deadline.
++async fn spawn_pinging_idle_server() -> u16 {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind free port");
++    let port = listener.local_addr().expect("local addr").port();
++    tokio::spawn(async move {
++        let Ok((stream, _)) = listener.accept().await else {
++            return;
++        };
++        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
++            return;
++        };
++        while let Some(Ok(Message::Text(text))) = ws.next().await {
++            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
++                continue;
++            };
++            let id = request
++                .get("id")
++                .and_then(Value::as_u64)
++                .unwrap_or_default();
++            match request.get("method").and_then(Value::as_str) {
++                Some("initialize") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
++                        ))
++                        .await;
++                }
++                Some("thread/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-1"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                }
++                Some("turn/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                    // Keepalive pings forever; zero turn events ever arrive.
++                    loop {
++                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++                        if ws
++                            .send(Message::Ping(b"keepalive".to_vec().into()))
++                            .await
++                            .is_err()
++                        {
++                            break;
++                        }
++                    }
++                }
++                _ => continue,
++            }
++        }
++    });
++    port
++}
++
++async fn spawn_tool_after_agent_message_server(
++    release: tokio::sync::oneshot::Receiver<()>,
++    stop: tokio::sync::oneshot::Receiver<()>,
++    peers: &mut tokio::task::JoinSet<()>,
++) -> u16 {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind free port");
++    let port = listener.local_addr().expect("local addr").port();
++    peers.spawn(async move {
+         let Ok((stream, _)) = listener.accept().await else {
+             return;
+         };
+@@ -764,32 +1057,41 @@ async fn spawn_tool_after_agent_message_server() -> u16 {
+                     let _ = ws.send(Message::text(response.to_string())).await;
+                     let intent = json!({
+                         "jsonrpc":"2.0","method":"item/completed",
+-                        "params":{"item":{"type":"agentMessage","id":"intent","text":"I read this as the digest task."}}
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","item":{"type":"agentMessage","id":"intent","text":"I read this as the digest task."}}
+                     });
+                     let _ = ws.send(Message::text(intent.to_string())).await;
+                     let tool_started = json!({
+                         "jsonrpc":"2.0","method":"item/started",
+-                        "params":{"item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"inProgress"}}
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"inProgress"}}
+                     });
+                     let _ = ws.send(Message::text(tool_started.to_string())).await;
+ 
+-                    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
++                    // No tool-start dispatch exists; this ordered delta witnesses
++                    // processing of the preceding correlated tool-start frame.
++                    let processed = json!({
++                        "method":"item/agentMessage/delta",
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","itemId":"intent","delta":"U12_TOOL_STARTED"}
++                    });
++                    ws.send(Message::text(processed.to_string())).await.unwrap();
++                    release.await.expect("release held tool result");
+ 
+                     let tool_completed = json!({
+                         "jsonrpc":"2.0","method":"item/completed",
+-                        "params":{"item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"completed"}}
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","item":{"type":"commandExecution","id":"tool-1","command":"write digest","status":"completed"}}
+                     });
+                     let _ = ws.send(Message::text(tool_completed.to_string())).await;
+                     let digest = json!({
+                         "jsonrpc":"2.0","method":"item/completed",
+-                        "params":{"item":{"type":"agentMessage","id":"digest","text":"## Actual digest body"}}
++                        "params":{"threadId":"thread-tool-sequence","turnId":"turn-tool-sequence","item":{"type":"agentMessage","id":"digest","text":"## Actual digest body"}}
+                     });
+                     let _ = ws.send(Message::text(digest.to_string())).await;
+                     let idle = json!({
+-                        "jsonrpc":"2.0","method":"thread/status/changed",
+-                        "params":{"threadId":"thread-tool-sequence","status":{"type":"idle"}}
++                        "jsonrpc":"2.0","method":"turn/completed",
++                        "params":{"threadId":"thread-tool-sequence","turn":{"id":"turn-tool-sequence","status":"completed"}}
+                     });
+                     let _ = ws.send(Message::text(idle.to_string())).await;
++                    stop.await.expect("backend finished before peer shutdown");
++                    return;
+                 }
+                 _ => {}
+             }
+@@ -824,7 +1126,7 @@ async fn test_omo_backend_surfaces_turn_start_rpc_error_immediately() {
+ }
+ 
+ #[tokio::test]
+-async fn test_omo_backend_completes_from_final_agent_message_when_turn_terminal_is_missing() {
++async fn test_omo_backend_requires_turn_terminal_even_after_final_agent_message() {
+     let server = FakeAppServer::spawn_without_turn_completed().await;
+     let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{}", server.port))
+         .with_request_timeout(std::time::Duration::from_millis(800));
+@@ -841,31 +1143,75 @@ async fn test_omo_backend_completes_from_final_agent_message_when_turn_terminal_
+         .await;
+ 
+     assert!(
+-        result.is_ok(),
+-        "missing terminal fallback failed: {result:?}"
++        result.is_err(),
++        "uncorrelated idle must not finalize: {result:?}"
+     );
+     let chunks = dispatcher.stream_chunks();
+-    let final_chunk = chunks.last().expect("final fallback chunk");
+-    assert!(final_chunk.is_final);
+-    assert_eq!(final_chunk.content, "Hello World!");
++    assert!(!chunks.iter().any(|chunk| chunk.is_final));
+ }
+ 
+ #[tokio::test]
+ async fn test_omo_backend_waits_for_final_message_after_tool_activity() {
+-    let port = spawn_tool_after_agent_message_server().await;
++    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
++    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
++    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
++    let mut peers = tokio::task::JoinSet::new();
++    let port = spawn_tool_after_agent_message_server(release_rx, stop_rx, &mut peers).await;
+     let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
+         .with_request_timeout(std::time::Duration::from_secs(3));
+     let dispatcher = Arc::new(CapturingDispatcher::new());
++    *dispatcher.tool_started.lock() = Some(started_tx);
+     let backend = OmoBackend::new(config, dispatcher.clone());
+     let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "cron");
+     let mut session = SessionContext::new(session_key.clone());
+ 
+-    let result = backend
+-        .run(
+-            &mut session,
+-            InboundEvent::message(session_key, "msg", "digest"),
+-        )
+-        .await;
++    let run = backend.run(
++        &mut session,
++        InboundEvent::message(session_key, "msg", "digest"),
++    );
++    tokio::pin!(run);
++    tokio::select! {
++        biased;
++        result = &mut run => panic!("backend ended before tool-start witness: {result:?}"),
++        started = tokio::time::timeout(std::time::Duration::from_secs(5), started_rx) => {
++            started.expect("bounded tool-start dispatch").expect("tool-start recorded");
++        }
++    }
++
++    // Pause after real socket I/O, avoiding auto-advance during the handshake.
++    // Poll the actual run, not a JoinHandle: expired fallback timers must run.
++    tokio::time::pause();
++    let quiet_started = tokio::time::Instant::now();
++    tokio::time::advance(std::time::Duration::from_millis(1_200)).await;
++    assert!(
++        futures_util::poll!(&mut run).is_pending(),
++        "backend ended during held tool"
++    );
++    assert!(!dispatcher
++        .stream_chunks()
++        .iter()
++        .any(|chunk| chunk.is_final));
++    assert!(quiet_started.elapsed() > std::time::Duration::from_millis(1_100));
++    println!(
++        "U12 quiet: processed tool-start; virtual_ms=1200; backend=pending; finals=0; result=held"
++    );
++    tokio::time::resume();
++
++    release_tx
++        .send(())
++        .expect("release correlated completion/digest/terminal");
++    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut run)
++        .await
++        .expect("bounded final digest");
++    stop_tx
++        .send(())
++        .expect("stop peer after backend completion");
++    tokio::time::timeout(std::time::Duration::from_secs(5), peers.join_next())
++        .await
++        .expect("bounded peer cleanup")
++        .expect("one peer")
++        .expect("peer succeeded");
++    assert!(peers.is_empty());
+ 
+     assert!(result.is_ok(), "tool sequence failed: {result:?}");
+     let final_chunk = dispatcher
+@@ -877,6 +1223,17 @@ async fn test_omo_backend_waits_for_final_message_after_tool_activity() {
+     assert!(!final_chunk
+         .content
+         .contains("I read this as the digest task"));
++    assert_eq!(
++        dispatcher
++            .stream_chunks()
++            .iter()
++            .filter(|chunk| chunk.is_final)
++            .count(),
++        1
++    );
++    println!(
++        "U12 quiet: released correlated completion/digest/terminal; actual digest final=1; peers=0"
++    );
+ }
+ 
+ #[tokio::test]
+@@ -1522,6 +1879,67 @@ async fn test_omo_backend_ignores_turn_completed_without_content() {
+     );
+ }
+ 
++#[tokio::test]
++async fn test_omo_backend_deadline_fires_on_ping_only_stream() {
++    // Regression for the 1800s no-response hang: keepalive pings kept the
++    // read loop awake while the daemon produced zero turn events, so the
++    // whole-turn deadline only fired on text frames and never happened. The
++    // deadline check must fire on non-text frames too.
++    let port = spawn_pinging_idle_server().await;
++    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
++        .with_request_timeout(std::time::Duration::from_secs(1))
++        .with_total_timeout(std::time::Duration::from_millis(150));
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    let backend = OmoBackend::new(config, dispatcher.clone());
++    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "user");
++    let mut session = SessionContext::new(session_key.clone());
++
++    let result = backend
++        .run(
++            &mut session,
++            InboundEvent::message(session_key, "msg", "hello"),
++        )
++        .await;
++
++    let err = result.expect_err("ping-only stream must hit the total deadline");
++    assert!(
++        err.to_string().contains("turn exceeded total deadline"),
++        "unexpected error: {err}"
++    );
++}
++
++#[tokio::test]
++async fn test_omo_backend_empty_terminal_past_grace_fails_fast() {
++    // Regression for the 53-minute silence: a daemon that records an upstream
++    // LLM failure as an empty successful completion must surface right after
++    // the grace window instead of stalling until the silence deadline.
++    let port = spawn_delayed_empty_turn_completed_server(400).await;
++    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
++        .with_request_timeout(std::time::Duration::from_secs(5))
++        .with_no_content_grace(std::time::Duration::from_millis(100));
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    let backend = OmoBackend::new(config, dispatcher.clone());
++    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "user");
++    let mut session = SessionContext::new(session_key.clone());
++
++    let result = backend
++        .run(
++            &mut session,
++            InboundEvent::message(session_key, "msg", "hello"),
++        )
++        .await;
++
++    let err = result.expect_err("empty terminal past grace must fail the turn");
++    assert!(
++        err.to_string().contains("no content"),
++        "unexpected error: {err}"
++    );
++    assert!(
++        dispatcher.stream_chunks().is_empty(),
++        "no final chunk may be emitted for an empty turn"
++    );
++}
++
+ #[tokio::test]
+ async fn test_omo_backend_runs_ack_command_after_cron_delivery() {
+     // Given: a cron session carrying an ack command, and a daemon whose turn

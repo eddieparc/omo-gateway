@@ -11,6 +11,9 @@ use super::adapter::safe_allowed_mentions;
 use crate::Result;
 
 pub const DISCORD_MESSAGE_LIMIT: usize = 2_000;
+pub const MAX_SPLIT_MESSAGES: usize = 8;
+pub const TRUNCATION_NOTICE: &str =
+    "\n\n… [Response truncated: output exceeded Discord 8-message limit]";
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(800);
 
 #[async_trait]
@@ -23,6 +26,15 @@ pub trait DiscordMessageTransport: Send + Sync + 'static {
         content: String,
     ) -> Result<()>;
     async fn send_message(&self, channel_id: ChannelId, content: String) -> Result<MessageId>;
+    async fn send_message_with_reference(
+        &self,
+        channel_id: ChannelId,
+        content: String,
+        reference: Option<MessageId>,
+    ) -> Result<MessageId> {
+        let _ = reference;
+        self.send_message(channel_id, content).await
+    }
     async fn delete_message(&self, channel_id: ChannelId, message_id: MessageId) -> Result<()>;
 }
 
@@ -63,6 +75,32 @@ impl DiscordMessageTransport for SerenityMessageTransport {
     }
 
     async fn send_message(&self, channel_id: ChannelId, content: String) -> Result<MessageId> {
+        self.send_message_with_reference(channel_id, content, None)
+            .await
+    }
+
+    async fn send_message_with_reference(
+        &self,
+        channel_id: ChannelId,
+        content: String,
+        reference: Option<MessageId>,
+    ) -> Result<MessageId> {
+        if let Some(target_msg_id) = reference {
+            let builder = CreateMessage::new()
+                .content(content.clone())
+                .reference_message((channel_id, target_msg_id))
+                .allowed_mentions(safe_allowed_mentions());
+            match channel_id.send_message(&self.http, builder).await {
+                Ok(msg) => return Ok(msg.id),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        target_msg_id = %target_msg_id,
+                        "Failed to send stream message with reference; retrying without reference"
+                    );
+                }
+            }
+        }
         let message = channel_id
             .send_message(
                 &self.http,
@@ -92,7 +130,7 @@ struct LiveEditState {
 /// debounce sleep happens outside the state mutex, so a final update does not
 /// queue behind a sleeping intermediate update. Network mutations remain
 /// serialized to preserve message ordering and the chunk/message-id mapping.
-pub struct LiveEditThrottler<T: DiscordMessageTransport> {
+pub struct LiveEditThrottler<T: DiscordMessageTransport + ?Sized> {
     transport: Arc<T>,
     channel_id: ChannelId,
     debounce: Duration,
@@ -100,7 +138,7 @@ pub struct LiveEditThrottler<T: DiscordMessageTransport> {
     state: Mutex<LiveEditState>,
 }
 
-impl<T: DiscordMessageTransport> LiveEditThrottler<T> {
+impl<T: DiscordMessageTransport + ?Sized> LiveEditThrottler<T> {
     pub fn new(transport: Arc<T>, channel_id: ChannelId, message_id: MessageId) -> Self {
         Self::with_debounce(transport, channel_id, message_id, DEFAULT_DEBOUNCE)
     }
@@ -169,7 +207,10 @@ impl<T: DiscordMessageTransport> LiveEditThrottler<T> {
                     .await?;
             }
         } else {
-            let chunks = chunk_markdown(content, DISCORD_MESSAGE_LIMIT);
+            let chunks = bound_split_messages(
+                chunk_markdown(content, DISCORD_MESSAGE_LIMIT),
+                MAX_SPLIT_MESSAGES,
+            );
             for (index, chunk) in chunks.iter().enumerate() {
                 if index < state.message_ids.len() {
                     self.transport
@@ -278,6 +319,29 @@ pub fn chunk_markdown_paginated(content: &str, limit: usize, paginate: bool) -> 
 /// include `(i/N)` headers.
 pub fn chunk_markdown(content: &str, limit: usize) -> Vec<String> {
     chunk_markdown_paginated(content, limit, is_chunk_pagination_enabled())
+}
+
+/// Bounds the number of split message chunks to `max_messages`. If the total chunk count
+/// exceeds `max_messages`, only the first `max_messages` are kept and an explicit truncation
+/// notice is appended to the final kept chunk.
+pub fn bound_split_messages(mut chunks: Vec<String>, max_messages: usize) -> Vec<String> {
+    if chunks.len() <= max_messages || max_messages == 0 {
+        return chunks;
+    }
+
+    chunks.truncate(max_messages);
+    if let Some(last) = chunks.last_mut() {
+        let budget = DISCORD_MESSAGE_LIMIT.saturating_sub(TRUNCATION_NOTICE.len());
+        if last.len() > budget {
+            let mut end = budget;
+            while end > 0 && !last.is_char_boundary(end) {
+                end -= 1;
+            }
+            last.truncate(end);
+        }
+        last.push_str(TRUNCATION_NOTICE);
+    }
+    chunks
 }
 
 fn chunk_markdown_raw(content: &str, limit: usize, total_chunks: Option<usize>) -> Vec<String> {

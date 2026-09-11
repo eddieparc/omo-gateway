@@ -24,6 +24,7 @@ pub fn thread_start_request(
     system_prompt: Option<&str>,
     model: Option<&str>,
     workspace: Option<&AgentWorkspace>,
+    enabled_toolsets: Option<&[String]>,
 ) -> Message {
     let mut params = json!({});
     if let Some(prompt) = system_prompt {
@@ -35,6 +36,9 @@ pub fn thread_start_request(
     if let Some(ws) = workspace {
         params["cwd"] = json!(&ws.cwd);
         params["runtimeWorkspaceRoots"] = json!(&ws.roots);
+    }
+    if let Some(tools) = enabled_toolsets {
+        params["enabledToolsets"] = json!(tools);
     }
     Message::text(
         json!({
@@ -96,6 +100,20 @@ pub fn approval_denial_response(req_id: &Value) -> Message {
     )
 }
 
+pub fn approval_allow_response(req_id: &Value) -> Message {
+    Message::text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "allow": true,
+                "decision": "accept"
+            }
+        })
+        .to_string(),
+    )
+}
+
 pub fn is_approval_request(method: &str) -> bool {
     method.contains("Approval")
         || method.contains("requestApproval")
@@ -118,7 +136,12 @@ mod tests {
         };
 
         // When: building thread start request with workspace Some
-        let msg = thread_start_request(Some("instructions"), Some("model-x"), Some(&workspace));
+        let msg = thread_start_request(
+            Some("instructions"),
+            Some("model-x"),
+            Some(&workspace),
+            None,
+        );
 
         // Then: params contains cwd and runtimeWorkspaceRoots in order
         let val: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
@@ -136,7 +159,7 @@ mod tests {
     fn test_thread_start_request_when_workspace_none() {
         // Given: system prompt and model without workspace
         // When: building thread start request with workspace None
-        let msg = thread_start_request(Some("instructions"), Some("model-x"), None);
+        let msg = thread_start_request(Some("instructions"), Some("model-x"), None, None);
 
         // Then: params has neither cwd nor runtimeWorkspaceRoots
         let val: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();

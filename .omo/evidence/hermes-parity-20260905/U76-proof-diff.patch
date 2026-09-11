@@ -1,0 +1,731 @@
+diff --git a/tests/test_voice_cron.rs b/tests/test_voice_cron.rs
+index ab9dd11..1bfee47 100644
+--- a/tests/test_voice_cron.rs
++++ b/tests/test_voice_cron.rs
+@@ -473,3 +473,726 @@ fn audio_frame_buffer_serializes_without_losing_pcm_samples() {
+     assert_eq!(decoded.pop(), Some(second));
+     assert!(decoded.is_empty());
+ }
++
++#[tokio::test]
++async fn persisted_oneshot_past_grace_is_retired() {
++    let database = Database::connect("sqlite::memory:").await.unwrap();
++    let (tx, mut rx) = mpsc::unbounded_channel();
++    let t0 = chrono::DateTime::parse_from_rfc3339("2026-09-06T12:00:00Z")
++        .unwrap()
++        .with_timezone(&chrono::Utc);
++    let clock_time = Arc::new(std::sync::Mutex::new(t0));
++    let scheduler = CronScheduler::new(database.pool().clone(), Arc::new(RecordingExecutor(tx)))
++        .with_clock({
++            let c = clock_time.clone();
++            move || *c.lock().unwrap()
++        });
++
++    // --- PHASE 1: DIRECT DB SEEDING AND DUE SCAN AT T ---
++    // Seed real DB rows directly:
++    // 1. One-shot past grace: next_run = T - 121s (more than 120s late)
++    let overdue_id = "test-overdue-oneshot";
++    let overdue_next = t0 - chrono::TimeDelta::seconds(121);
++    sqlx::query(
++        "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
++         VALUES (?, ?, ?, 1, ?, ?, ?)",
++    )
++    .bind(overdue_id)
++    .bind(format!("once:{}", overdue_next.to_rfc3339()))
++    .bind(json!({"content": "overdue once"}).to_string())
++    .bind(overdue_next)
++    .bind(overdue_next)
++    .bind(overdue_next)
++    .execute(database.pool())
++    .await
++    .unwrap();
++
++    // 2. Boundary one-shot: next_run = T - 120s (exactly at 120s grace boundary)
++    let boundary_id = "test-boundary-oneshot";
++    let boundary_next = t0 - chrono::TimeDelta::seconds(120);
++    sqlx::query(
++        "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
++         VALUES (?, ?, ?, 1, ?, ?, ?)",
++    )
++    .bind(boundary_id)
++    .bind(format!("once:{}", boundary_next.to_rfc3339()))
++    .bind(json!({"content": "boundary once"}).to_string())
++    .bind(boundary_next)
++    .bind(boundary_next)
++    .bind(boundary_next)
++    .execute(database.pool())
++    .await
++    .unwrap();
++
++    // 3. Overdue recurring job: next_run = T - 300s (recurring jobs remain eligible)
++    let recurring_id = "test-overdue-recurring";
++    let recurring_next = t0 - chrono::TimeDelta::seconds(300);
++    sqlx::query(
++        "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
++         VALUES (?, ?, ?, 1, ?, ?, ?)",
++    )
++    .bind(recurring_id)
++    .bind("interval:60s")
++    .bind(json!({"content": "recurring"}).to_string())
++    .bind(recurring_next)
++    .bind(recurring_next)
++    .bind(recurring_next)
++    .execute(database.pool())
++    .await
++    .unwrap();
++
++    // Run due scan at T:
++    // RED: claims all 3 jobs (claim count = 3); overdue one-shot executes
++    // GREEN: claims 2 jobs (boundary + recurring); overdue one-shot claim count = 0
++    let claimed = scheduler.run_due_jobs().await.unwrap();
++    assert_eq!(
++        claimed, 2,
++        "overdue one-shot past grace (T-121s) must not be claimed; boundary (T-120s) and recurring must be claimed"
++    );
++
++    // Collect executions for the claimed jobs:
++    let mut executed_ids = Vec::new();
++    for _ in 0..claimed {
++        let id = tokio::time::timeout(Duration::from_secs(2), rx.recv())
++            .await
++            .expect("must receive claimed execution within timeout")
++            .expect("channel should not close");
++        executed_ids.push(id);
++    }
++    assert!(
++        !executed_ids.contains(&overdue_id.to_string()),
++        "overdue one-shot past grace must not execute"
++    );
++    assert!(
++        executed_ids.contains(&boundary_id.to_string()),
++        "boundary one-shot (T-120s) must execute once"
++    );
++    assert!(
++        executed_ids.contains(&recurring_id.to_string()),
++        "overdue recurring job must execute"
++    );
++
++    // Overdue one-shot must be retired: disabled, no next run, and retained missed record
++    let overdue_job = scheduler.get(overdue_id).await.unwrap().unwrap();
++    assert!(!overdue_job.enabled, "overdue once job must be disabled");
++    assert!(
++        overdue_job.next_run_at.is_none(),
++        "overdue once job must have next_run_at = None"
++    );
++    assert_eq!(
++        overdue_job.last_status().as_deref(),
++        Some("missed"),
++        "overdue once job must have last_status = 'missed'"
++    );
++    assert!(
++        overdue_job
++            .last_error()
++            .unwrap_or_default()
++            .contains("missed"),
++        "overdue once job must retain missed error diagnostic"
++    );
++
++    // Verify manual control: manual trigger still executes the retired job
++    assert!(scheduler.trigger(overdue_id).await.unwrap());
++    let triggered_id = tokio::time::timeout(Duration::from_secs(2), rx.recv())
++        .await
++        .expect("manual trigger must execute")
++        .expect("channel open");
++    assert_eq!(triggered_id, overdue_id);
++
++    // Verify explicit rearm: resume with future schedule re-enables the job
++    let future_t = t0 + chrono::TimeDelta::minutes(10);
++    *clock_time.lock().unwrap() = future_t;
++    // Updating next_run to future and resuming:
++    sqlx::query("UPDATE cron_jobs SET expression = ?, next_run_at = ? WHERE id = ?")
++        .bind(format!("once:{}", future_t.to_rfc3339()))
++        .bind(future_t)
++        .bind(overdue_id)
++        .execute(database.pool())
++        .await
++        .unwrap();
++    assert!(scheduler.resume(overdue_id).await.unwrap());
++    let rearmed_job = scheduler.get(overdue_id).await.unwrap().unwrap();
++    assert!(rearmed_job.enabled, "rearmed job must be enabled");
++    assert!(
++        rearmed_job.next_run_at.is_some(),
++        "rearmed job must have next_run_at"
++    );
++
++    // --- PHASE 2: LOCAL SURFACE (HERMES STORE IMPORT & DISPATCH PASS) ---
++    let root = tempfile::tempdir().unwrap();
++    let profile_home = root.path().join("surface");
++    tokio::fs::create_dir_all(profile_home.join("cron"))
++        .await
++        .unwrap();
++
++    let old_imported_time = "2026-09-06T11:57:00Z"; // T - 180s (past grace)
++    let fresh_imported_time = "2026-09-06T12:10:00Z";
++    let jobs_json = json!({
++        "jobs": [
++            {
++                "id": "old-once",
++                "prompt": "stale one-shot reminder",
++                "enabled": true,
++                "next_run_at": old_imported_time,
++                "schedule": {"kind": "once", "run_at": old_imported_time},
++                "deliver": "local"
++            },
++            {
++                "id": "fresh-once",
++                "prompt": "fresh one-shot",
++                "enabled": true,
++                "next_run_at": fresh_imported_time,
++                "schedule": {"kind": "once", "run_at": fresh_imported_time},
++                "deliver": "local"
++            }
++        ]
++    });
++    tokio::fs::write(
++        profile_home.join("cron/jobs.json"),
++        serde_json::to_vec(&jobs_json).unwrap(),
++    )
++    .await
++    .unwrap();
++
++    let sync = omon_gateway::HermesStoreSynchronizer::new(
++        database.pool().clone(),
++        vec![omon_gateway::HermesStore::new("surface", &profile_home)],
++    );
++    let imported_count = sync.sync_at(t0).await.unwrap();
++    assert_eq!(imported_count, 2, "must import both jobs from temp store");
++
++    // Reset clock back to t0
++    *clock_time.lock().unwrap() = t0;
++
++    // Run actual scheduler dispatch pass
++    let surface_claimed = scheduler.run_due_jobs().await.unwrap();
++    assert_eq!(
++        surface_claimed, 0,
++        "old-once is past grace and fresh-once is in the future; 0 claims"
++    );
++
++    // Capturing executor must receive zero calls for old-once
++    assert!(
++        rx.try_recv().is_err(),
++        "capturing executor must receive zero calls for expired once job"
++    );
++
++    // Dashboard-visible job/run state must distinguish missed from succeeded:
++    let old_job = scheduler
++        .get("hermes:surface:old-once")
++        .await
++        .unwrap()
++        .expect("job exists");
++    assert!(!old_job.enabled, "expired imported once must be disabled");
++    assert!(
++        old_job.next_run_at.is_none(),
++        "expired imported once must have NULL next_run_at"
++    );
++    assert_eq!(
++        old_job.last_status().as_deref(),
++        Some("missed"),
++        "dashboard-visible status must be 'missed'"
++    );
++
++    // Trigger fresh-once manually to verify it succeeds and distinguishes from missed
++    assert!(scheduler
++        .trigger("hermes:surface:fresh-once")
++        .await
++        .unwrap());
++    let fresh_executed = tokio::time::timeout(Duration::from_secs(2), rx.recv())
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(fresh_executed, "hermes:surface:fresh-once");
++
++    // Allow completion to persist
++    tokio::time::timeout(Duration::from_secs(5), scheduler.shutdown())
++        .await
++        .expect("scheduler shutdown timeout");
++
++    let fresh_job = scheduler
++        .get("hermes:surface:fresh-once")
++        .await
++        .unwrap()
++        .expect("fresh job exists");
++    assert_eq!(
++        fresh_job.last_status().as_deref(),
++        Some("succeeded"),
++        "dashboard-visible status for succeeded job must be 'succeeded'"
++    );
++
++    tokio::time::timeout(Duration::from_secs(5), database.close())
++        .await
++        .expect("database close timeout");
++    root.close().unwrap();
++}
++
++struct NotifyOnDrop(Arc<Notify>);
++impl Drop for NotifyOnDrop {
++    fn drop(&mut self) {
++        self.0.notify_waiters();
++    }
++}
++
++struct SpawnGuard<T> {
++    handle: Option<tokio::task::JoinHandle<T>>,
++}
++
++impl<T> SpawnGuard<T> {
++    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
++        Self {
++            handle: Some(handle),
++        }
++    }
++
++    async fn join(&mut self, timeout: Duration) -> Result<T, String> {
++        let handle = self
++            .handle
++            .as_mut()
++            .ok_or_else(|| "task already joined".to_string())?;
++        match tokio::time::timeout(timeout, handle).await {
++            Ok(Ok(val)) => {
++                self.handle.take();
++                Ok(val)
++            }
++            Ok(Err(join_err)) => {
++                self.handle.take();
++                Err(format!("task panicked: {join_err}"))
++            }
++            Err(_) => {
++                if let Some(h) = self.handle.take() {
++                    h.abort();
++                    let _ = h.await;
++                }
++                Err(format!("task timed out after {timeout:?}"))
++            }
++        }
++    }
++}
++
++impl<T> Drop for SpawnGuard<T> {
++    fn drop(&mut self) {
++        if let Some(h) = self.handle.take() {
++            h.abort();
++        }
++    }
++}
++
++#[tokio::test]
++async fn overdue_oneshot_retirement_is_atomic_against_concurrent_claim_and_rearm() {
++    let t0 = chrono::DateTime::parse_from_rfc3339("2026-09-06T12:00:00Z")
++        .unwrap()
++        .with_timezone(&chrono::Utc);
++    let overdue_next = t0 - chrono::TimeDelta::seconds(125);
++
++    // --- CASE 1: COMPETING MANUAL CLAIM WINS OVER RETIREMENT ---
++    // Proves CAS condition: NOT EXISTS (SELECT 1 FROM cron_runs WHERE job_id = ? AND status = 'running')
++    {
++        let database = Database::connect("sqlite::memory:").await.unwrap();
++        let job_id = "job-competing-manual";
++        let payload =
++            json!({"content": "competing manual", "preserved_metadata": "keep-me"}).to_string();
++        sqlx::query(
++            "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
++             VALUES (?, ?, ?, 1, ?, ?, ?)",
++        )
++        .bind(job_id)
++        .bind(format!("once:{}", overdue_next.to_rfc3339()))
++        .bind(&payload)
++        .bind(overdue_next)
++        .bind(overdue_next)
++        .bind(overdue_next)
++        .execute(database.pool())
++        .await
++        .unwrap();
++
++        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
++        let release_manual = Arc::new(Notify::new());
++        let _manual_guard = NotifyOnDrop(release_manual.clone());
++        let entered = Arc::new(Notify::new());
++        let release_gate = Arc::new(Notify::new());
++        let _gate_guard = NotifyOnDrop(release_gate.clone());
++
++        let scheduler = CronScheduler::new(
++            database.pool().clone(),
++            Arc::new(BlockingExecutor {
++                started: started_tx,
++                release: release_manual.clone(),
++            }),
++        )
++        .with_clock(move || t0)
++        .with_pre_retire_gate(entered.clone(), release_gate.clone());
++
++        // Subscribe to pre-retire gate before triggering background due scan:
++        let entered_wait = entered.notified();
++        tokio::pin!(entered_wait);
++
++        let s = scheduler.clone();
++        let mut run_task = SpawnGuard::new(tokio::spawn(async move { s.run_due_jobs().await }));
++
++        // Wait until scheduler enters pre-retire gate (paused before retirement CAS update):
++        tokio::time::timeout(Duration::from_secs(5), &mut entered_wait)
++            .await
++            .expect("scheduler must reach pre-retire gate within timeout");
++
++        // Competing manual trigger executes while retirement is paused at gate:
++        let triggered = scheduler.trigger(job_id).await.unwrap();
++        assert!(triggered, "competing manual trigger must succeed");
++        let executed_id = tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
++            .await
++            .expect("manual executor must start within timeout")
++            .expect("channel open");
++        assert_eq!(executed_id, job_id);
++
++        // Verify lease is actively running in SQLite:
++        let running_count: i64 = sqlx::query_scalar(
++            "SELECT COUNT(*) FROM cron_runs WHERE job_id = ? AND status = 'running'",
++        )
++        .bind(job_id)
++        .fetch_one(database.pool())
++        .await
++        .unwrap();
++        assert_eq!(
++            running_count, 1,
++            "manual claim must be actively running in SQLite"
++        );
++
++        // Release the pre-retire gate to allow retirement update to attempt CAS:
++        release_gate.notify_one();
++        let due_claims = run_task
++            .join(Duration::from_secs(5))
++            .await
++            .expect("due task join")
++            .unwrap();
++        assert_eq!(
++            due_claims, 0,
++            "due scan must claim 0 after manual trigger took ownership"
++        );
++
++        // Verify retirement CAS failed and job is still enabled while manual run is active:
++        let job_mid_run = scheduler.get(job_id).await.unwrap().unwrap();
++        assert!(
++            job_mid_run.enabled,
++            "job must remain enabled while manual run is active"
++        );
++        assert_ne!(
++            job_mid_run.last_status().as_deref(),
++            Some("missed"),
++            "job must not be marked missed while manual run is active"
++        );
++
++        // Release manual executor and wait for scheduler shutdown:
++        release_manual.notify_one();
++        tokio::time::timeout(Duration::from_secs(5), scheduler.shutdown())
++            .await
++            .expect("scheduler shutdown timeout");
++
++        let job_after = scheduler.get(job_id).await.unwrap().unwrap();
++        assert_eq!(
++            job_after.last_status().as_deref(),
++            Some("succeeded"),
++            "job was executed manually, must have status 'succeeded'"
++        );
++
++        tokio::time::timeout(Duration::from_secs(5), database.close())
++            .await
++            .expect("database close timeout");
++    }
++
++    // --- CASE 2: COMPETING FULL REARM WINS OVER RETIREMENT ---
++    // Proves CAS condition: expression = ? + next_run_at = ? + payload_json = ? (full schedule change)
++    {
++        let database = Database::connect("sqlite::memory:").await.unwrap();
++        let (tx, _rx) = mpsc::unbounded_channel();
++        let job_id = "job-competing-rearm";
++        let payload = json!({"content": "competing rearm", "original_key": "v1"}).to_string();
++        sqlx::query(
++            "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
++             VALUES (?, ?, ?, 1, ?, ?, ?)",
++        )
++        .bind(job_id)
++        .bind(format!("once:{}", overdue_next.to_rfc3339()))
++        .bind(&payload)
++        .bind(overdue_next)
++        .bind(overdue_next)
++        .bind(overdue_next)
++        .execute(database.pool())
++        .await
++        .unwrap();
++
++        let entered = Arc::new(Notify::new());
++        let release_gate = Arc::new(Notify::new());
++        let _gate_guard = NotifyOnDrop(release_gate.clone());
++
++        let scheduler = CronScheduler::new(
++            database.pool().clone(),
++            Arc::new(RecordingExecutor(tx.clone())),
++        )
++        .with_clock(move || t0)
++        .with_pre_retire_gate(entered.clone(), release_gate.clone());
++
++        // Subscribe before triggering background due scan:
++        let entered_wait = entered.notified();
++        tokio::pin!(entered_wait);
++
++        let s = scheduler.clone();
++        let mut run_task = SpawnGuard::new(tokio::spawn(async move { s.run_due_jobs().await }));
++
++        // Wait until scheduler enters pre-retire gate:
++        tokio::time::timeout(Duration::from_secs(5), &mut entered_wait)
++            .await
++            .expect("scheduler must reach pre-retire gate within timeout");
++
++        // Competing rearm by operator while paused:
++        let rearmed_time = t0 + chrono::TimeDelta::hours(1);
++        let rearmed_payload =
++            json!({"content": "competing rearm", "rearmed_key": "v2_updated"}).to_string();
++        sqlx::query(
++            "UPDATE cron_jobs SET expression = ?, next_run_at = ?, payload_json = ?, updated_at = ? WHERE id = ?",
++        )
++        .bind(format!("once:{}", rearmed_time.to_rfc3339()))
++        .bind(rearmed_time)
++        .bind(&rearmed_payload)
++        .bind(t0)
++        .bind(job_id)
++        .execute(database.pool())
++        .await
++        .unwrap();
++
++        // Release the pre-retire gate:
++        release_gate.notify_one();
++        let due_claims = run_task
++            .join(Duration::from_secs(5))
++            .await
++            .expect("due task join")
++            .unwrap();
++        assert_eq!(due_claims, 0);
++
++        tokio::time::timeout(Duration::from_secs(5), scheduler.shutdown())
++            .await
++            .expect("scheduler shutdown timeout");
++
++        // Verify rearmed job was NOT clobbered by the stale retirement:
++        let job_after = scheduler.get(job_id).await.unwrap().unwrap();
++        assert!(job_after.enabled, "rearmed job must remain enabled");
++        assert_eq!(
++            job_after.next_run_at,
++            Some(rearmed_time),
++            "rearmed next_run_at must not be cleared to NULL by stale retirement"
++        );
++        assert_eq!(
++            job_after.payload_json, rearmed_payload,
++            "rearmed payload must not be overwritten with old metadata by stale retirement"
++        );
++        assert_ne!(
++            job_after.last_status().as_deref(),
++            Some("missed"),
++            "rearmed job must not have last_status 'missed'"
++        );
++
++        tokio::time::timeout(Duration::from_secs(5), database.close())
++            .await
++            .expect("database close timeout");
++    }
++
++    // --- CASE 3: COMPETING SAME-EXPRESSION NEXT_RUN_AT-ONLY REARM WINS OVER RETIREMENT ---
++    // Proves CAS condition: next_run_at = ? predicate rejects retirement when expression & payload are unchanged
++    {
++        let database = Database::connect("sqlite::memory:").await.unwrap();
++        let (tx, _rx) = mpsc::unbounded_channel();
++        let job_id = "job-competing-reschedule-time-only";
++        let original_expression = format!("once:{}", overdue_next.to_rfc3339());
++        let original_payload =
++            json!({"content": "reschedule time only", "key": "retain-this"}).to_string();
++        sqlx::query(
++            "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
++             VALUES (?, ?, ?, 1, ?, ?, ?)",
++        )
++        .bind(job_id)
++        .bind(&original_expression)
++        .bind(&original_payload)
++        .bind(overdue_next)
++        .bind(overdue_next)
++        .bind(overdue_next)
++        .execute(database.pool())
++        .await
++        .unwrap();
++
++        let entered = Arc::new(Notify::new());
++        let release_gate = Arc::new(Notify::new());
++        let _gate_guard = NotifyOnDrop(release_gate.clone());
++
++        let scheduler = CronScheduler::new(
++            database.pool().clone(),
++            Arc::new(RecordingExecutor(tx.clone())),
++        )
++        .with_clock(move || t0)
++        .with_pre_retire_gate(entered.clone(), release_gate.clone());
++
++        // Subscribe before triggering background due scan:
++        let entered_wait = entered.notified();
++        tokio::pin!(entered_wait);
++
++        let s = scheduler.clone();
++        let mut run_task = SpawnGuard::new(tokio::spawn(async move { s.run_due_jobs().await }));
++
++        // Wait until scheduler enters pre-retire gate:
++        tokio::time::timeout(Duration::from_secs(5), &mut entered_wait)
++            .await
++            .expect("scheduler must reach pre-retire gate within timeout");
++
++        // Operator reschedules to future time: ONLY next_run_at and updated_at change!
++        // expression and payload_json remain IDENTICAL to the observed row.
++        let rescheduled_time = t0 + chrono::TimeDelta::hours(2);
++        sqlx::query("UPDATE cron_jobs SET next_run_at = ?, updated_at = ? WHERE id = ?")
++            .bind(rescheduled_time)
++            .bind(t0)
++            .bind(job_id)
++            .execute(database.pool())
++            .await
++            .unwrap();
++
++        // Release the pre-retire gate:
++        release_gate.notify_one();
++        let due_claims = run_task
++            .join(Duration::from_secs(5))
++            .await
++            .expect("due task join")
++            .unwrap();
++        assert_eq!(due_claims, 0);
++
++        tokio::time::timeout(Duration::from_secs(5), scheduler.shutdown())
++            .await
++            .expect("scheduler shutdown timeout");
++
++        // Verify: CAS rejected retirement because next_run_at changed.
++        // If CAS only checked expression = ?, it would have wrongly succeeded and set next_run_at to NULL!
++        let job_after = scheduler.get(job_id).await.unwrap().unwrap();
++        assert!(
++            job_after.enabled,
++            "job with rescheduled next_run_at must remain enabled"
++        );
++        assert_eq!(
++            job_after.next_run_at,
++            Some(rescheduled_time),
++            "rescheduled next_run_at must be preserved (not cleared to NULL by stale retirement)"
++        );
++        assert_eq!(
++            job_after.expression, original_expression,
++            "expression must remain unchanged"
++        );
++        assert_eq!(
++            job_after.payload_json, original_payload,
++            "payload must remain unchanged"
++        );
++        assert_ne!(
++            job_after.last_status().as_deref(),
++            Some("missed"),
++            "job must not have last_status 'missed'"
++        );
++
++        tokio::time::timeout(Duration::from_secs(5), database.close())
++            .await
++            .expect("database close timeout");
++    }
++
++    // --- CASE 4: COMPETING SAME-EXPRESSION PAYLOAD-ONLY UPDATE WINS OVER RETIREMENT ---
++    // Proves CAS condition: payload_json = ? predicate rejects retirement when payload changed, preventing metadata clobber
++    {
++        let database = Database::connect("sqlite::memory:").await.unwrap();
++        let (tx, _rx) = mpsc::unbounded_channel();
++        let job_id = "job-competing-payload-only";
++        let original_expression = format!("once:{}", overdue_next.to_rfc3339());
++        let initial_payload =
++            json!({"content": "payload only", "version": 1, "metadata": "initial"}).to_string();
++        sqlx::query(
++            "INSERT INTO cron_jobs (id, expression, payload_json, enabled, next_run_at, created_at, updated_at)
++             VALUES (?, ?, ?, 1, ?, ?, ?)",
++        )
++        .bind(job_id)
++        .bind(&original_expression)
++        .bind(&initial_payload)
++        .bind(overdue_next)
++        .bind(overdue_next)
++        .bind(overdue_next)
++        .execute(database.pool())
++        .await
++        .unwrap();
++
++        let entered = Arc::new(Notify::new());
++        let release_gate = Arc::new(Notify::new());
++        let _gate_guard = NotifyOnDrop(release_gate.clone());
++
++        let scheduler = CronScheduler::new(
++            database.pool().clone(),
++            Arc::new(RecordingExecutor(tx.clone())),
++        )
++        .with_clock(move || t0)
++        .with_pre_retire_gate(entered.clone(), release_gate.clone());
++
++        // Subscribe before triggering background due scan:
++        let entered_wait = entered.notified();
++        tokio::pin!(entered_wait);
++
++        let s = scheduler.clone();
++        let mut run_task = SpawnGuard::new(tokio::spawn(async move { s.run_due_jobs().await }));
++
++        // Wait until scheduler enters pre-retire gate:
++        tokio::time::timeout(Duration::from_secs(5), &mut entered_wait)
++            .await
++            .expect("scheduler must reach pre-retire gate within timeout");
++
++        // Concurrent update modifies payload: ONLY payload_json and updated_at change!
++        // expression and next_run_at remain IDENTICAL to the observed row.
++        let updated_payload =
++            json!({"content": "payload only", "version": 2, "metadata": "concurrent-operator-edit"})
++                .to_string();
++        sqlx::query("UPDATE cron_jobs SET payload_json = ?, updated_at = ? WHERE id = ?")
++            .bind(&updated_payload)
++            .bind(t0)
++            .bind(job_id)
++            .execute(database.pool())
++            .await
++            .unwrap();
++
++        // Release the pre-retire gate:
++        release_gate.notify_one();
++        let due_claims = run_task
++            .join(Duration::from_secs(5))
++            .await
++            .expect("due task join")
++            .unwrap();
++        assert_eq!(due_claims, 0);
++
++        tokio::time::timeout(Duration::from_secs(5), scheduler.shutdown())
++            .await
++            .expect("scheduler shutdown timeout");
++
++        // Verify: CAS rejected retirement because payload changed.
++        // If CAS only checked expression = ? or next_run_at = ?, it would have wrongly overwritten payload_json!
++        let job_after = scheduler.get(job_id).await.unwrap().unwrap();
++        assert!(
++            job_after.enabled,
++            "job with concurrently updated payload must remain enabled"
++        );
++        assert_eq!(
++            job_after.next_run_at,
++            Some(overdue_next),
++            "next_run_at must remain unchanged"
++        );
++        assert_eq!(
++            job_after.payload_json, updated_payload,
++            "concurrently updated payload must NOT be overwritten by stale retirement payload"
++        );
++        assert_ne!(
++            job_after.last_status().as_deref(),
++            Some("missed"),
++            "job must not have last_status 'missed'"
++        );
++
++        tokio::time::timeout(Duration::from_secs(5), database.close())
++            .await
++            .expect("database close timeout");
++    }
++}

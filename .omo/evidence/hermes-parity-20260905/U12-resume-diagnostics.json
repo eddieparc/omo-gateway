@@ -1,0 +1,12 @@
+{
+  "tool": "functions.lsp_diagnostics",
+  "severity": "all",
+  "before_red": {
+    "src/agent/omo_backend.rs": "No diagnostics found",
+    "tests/test_omo_backend.rs": "No diagnostics found"
+  },
+  "after_clock_edit_before_green_and_build": {
+    "src/agent/omo_backend.rs": "No diagnostics found",
+    "tests/test_omo_backend.rs": "No diagnostics found"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "isolated_run_home_logs_unchanged": true,
+  "removed": [
+    "/Users/indo/.omon/omo-appserver-invalid-url.log"
+  ],
+  "attribution": "Unique invalid-url fixture literal in src/agent/omo_daemon.rs; birth second 1788601644 matches captured U62-budget-red completion; empty file unchanged through isolated run.",
+  "retained_unattributed_ephemeral_logs": [
+    "/Users/indo/.omon/omo-appserver-50270.log",
+    "/Users/indo/.omon/omo-appserver-61640.log",
+    "/Users/indo/.omon/omo-appserver-60412.log",
+    "/Users/indo/.omon/omo-appserver-49306.log",
+    "/Users/indo/.omon/omo-appserver-64518.log",
+    "/Users/indo/.omon/omo-appserver-49945.log",
+    "/Users/indo/.omon/omo-appserver-63238.log"
+  ],
+  "production_logs_retained": [
+    "omo-appserver-19742.log",
+    "omo-appserver-19743.log"
+  ]
+}

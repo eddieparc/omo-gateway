@@ -1,0 +1,12 @@
+[
+  "cargo test --test test_multiplexer persistence_failure_never_acknowledges_turn_on_user_insert -- --exact --nocapture",
+  "cargo test --test test_multiplexer persistence_failure_never_acknowledges_turn_on_session_update -- --exact --nocapture",
+  "cargo test --test test_multiplexer persistence_failure_never_acknowledges_turn -- --exact --nocapture",
+  "cargo test --test test_multiplexer -- --nocapture",
+  "cargo test --test test_omo_backend",
+  "cargo test --lib models::session",
+  "cargo test --lib storage::db",
+  "cargo build",
+  "rustfmt --check --edition 2021 src/multiplexer/actor.rs src/storage/db.rs tests/test_multiplexer.rs",
+  "git diff --check src/multiplexer/actor.rs src/storage/db.rs tests/test_multiplexer.rs"
+]

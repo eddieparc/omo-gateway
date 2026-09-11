@@ -20,7 +20,9 @@ pub use cron::*;
 pub use discord::*;
 pub use drain_control::*;
 pub use error::{OmonError, Result};
-pub use ledger::{DeliveryLedgerEntry, DeliveryLedgerService};
+pub use ledger::{
+    recover_pending_delivery_obligations, DeliveryLedgerEntry, DeliveryLedgerService,
+};
 pub use memory::{Memory, MemoryStore};
 pub use mirror::*;
 pub use models::*;

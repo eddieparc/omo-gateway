@@ -1,0 +1,19 @@
+[
+  "cargo test --lib migrate::gateway_down::tests::stale_pid_never_signaled -- --exact --nocapture",
+  "cargo test --lib migrate::gateway_down::tests::matching_start_wrong_live_command_never_signaled -- --exact --nocapture",
+  "cargo test --lib migrate::sys::tests::subprocess_simultaneous_large_stdout_stderr_does_not_deadlock -- --exact --nocapture",
+  "cargo test --lib migrate::sys::tests::subprocess_timeout_kills_and_reaps_owned_child -- --exact --nocapture",
+  "cargo test --lib migrate::sys::tests::subprocess_injected_notifier_failure_kills_and_reaps_child_without_hang -- --exact --nocapture",
+  "cargo test --lib migrate::sys::tests::os_env_reads_self_command_line -- --exact --nocapture",
+  "cargo test --lib migrate::gateway_down::tests::valid_and_invalid_gateway_command_lines -- --exact --nocapture",
+  "cargo test --lib migrate::gateway_down::tests::service_unloads_before_verified_signals_and_delayed_kill_exit -- --exact --nocapture",
+  "cargo test --lib migrate::gateway_down::tests::reused_pid_during_term_wait_never_receives_kill -- --exact --nocapture",
+  "cargo test --lib migrate::gateway_down::tests::kill_timeout_preserves_lock_and_is_bounded -- --exact --nocapture",
+  "cargo test --lib migrate::gateway_down::tests::failed_bootout_preserves_files_and_never_signals -- --exact --nocapture",
+  "cargo test --lib migrate::gateway_down::tests::unknown_or_conflicting_identity_never_authorizes_signals -- --exact --nocapture",
+  "cargo test --lib migrate::gateway_down::tests::migration_entry_retires_service_with_real_files_and_database -- --exact --nocapture",
+  "cargo test --lib migrate:: -- --nocapture",
+  "cargo test --test test_migrate -- --nocapture",
+  "cargo build",
+  "git diff --check -- src/migrate/gateway_down.rs src/migrate/sys.rs tests/test_migrate.rs"
+]

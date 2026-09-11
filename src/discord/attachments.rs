@@ -15,6 +15,42 @@ pub const MAX_INLINED_ATTACHMENT_BYTES: u64 = 100 * 1024;
 const ATTACHMENT_DIR: &str = ".discord-attachments";
 
 /// Determines whether an inbound attachment represents a Discord voice note.
+pub fn decode_wav_pcm(bytes: &[u8]) -> Option<(u32, u16, Vec<i16>)> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12;
+    let mut channels = 1u16;
+    let mut sample_rate = 16000u32;
+    let mut pcm = Vec::new();
+
+    while pos + 8 <= bytes.len() {
+        let chunk_id = &bytes[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        pos += 8;
+        if pos + chunk_size > bytes.len() {
+            break;
+        }
+        let chunk_data = &bytes[pos..pos + chunk_size];
+        if chunk_id == b"fmt " && chunk_data.len() >= 16 {
+            channels = u16::from_le_bytes(chunk_data[2..4].try_into().ok()?);
+            sample_rate = u32::from_le_bytes(chunk_data[4..8].try_into().ok()?);
+        } else if chunk_id == b"data" {
+            pcm.reserve(chunk_data.len() / 2);
+            for pair in chunk_data.as_chunks::<2>().0 {
+                pcm.push(i16::from_le_bytes(*pair));
+            }
+        }
+        pos += chunk_size;
+    }
+
+    if !pcm.is_empty() {
+        Some((sample_rate, channels, pcm))
+    } else {
+        None
+    }
+}
+
 pub fn is_voice_attachment(
     filename: &str,
     content_type: Option<&str>,
@@ -204,15 +240,49 @@ impl AttachmentDownloader {
         ) {
             if let Some(stt) = &self.stt {
                 if let Ok(bytes) = tokio::fs::read(&path).await {
-                    let frame = crate::voice::AudioFrame {
-                        channel_id: 0,
-                        source_id: None,
-                        sequence: 0,
-                        sample_rate: 48_000,
-                        channels: 2,
-                        direction: crate::voice::AudioDirection::Incoming,
-                        payload: crate::voice::AudioPayload::Opus(bytes),
+                    let is_wav = attachment.filename.to_ascii_lowercase().ends_with(".wav")
+                        || attachment
+                            .content_type
+                            .as_deref()
+                            .is_some_and(|ct| ct.to_ascii_lowercase().contains("wav"))
+                        || (bytes.len() >= 12
+                            && &bytes[0..4] == b"RIFF"
+                            && &bytes[8..12] == b"WAVE");
+
+                    let frame = if is_wav {
+                        if let Some((sample_rate, channels, pcm)) = decode_wav_pcm(&bytes) {
+                            crate::voice::AudioFrame {
+                                channel_id: 0,
+                                source_id: None,
+                                sequence: 0,
+                                sample_rate,
+                                channels,
+                                direction: crate::voice::AudioDirection::Incoming,
+                                payload: crate::voice::AudioPayload::Pcm(pcm),
+                            }
+                        } else {
+                            crate::voice::AudioFrame {
+                                channel_id: 0,
+                                source_id: None,
+                                sequence: 0,
+                                sample_rate: 48_000,
+                                channels: 2,
+                                direction: crate::voice::AudioDirection::Incoming,
+                                payload: crate::voice::AudioPayload::Opus(bytes),
+                            }
+                        }
+                    } else {
+                        crate::voice::AudioFrame {
+                            channel_id: 0,
+                            source_id: None,
+                            sequence: 0,
+                            sample_rate: 48_000,
+                            channels: 2,
+                            direction: crate::voice::AudioDirection::Incoming,
+                            payload: crate::voice::AudioPayload::Opus(bytes),
+                        }
                     };
+
                     match stt.transcribe(&[frame]).await {
                         Ok(transcript) if !transcript.trim().is_empty() => {
                             attachment.text_content = Some(format!(
@@ -220,9 +290,17 @@ impl AttachmentDownloader {
                                 transcript.trim()
                             ));
                         }
-                        _ => {
-                            attachment.text_content =
-                                Some("[Voice message (audio downloaded)]".to_string());
+                        Ok(_) => {
+                            attachment.text_content = Some(
+                                "[Voice message: audio received (empty transcript)]".to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "inbound voice message transcription failed");
+                            attachment.text_content = Some(
+                                "[Voice message: audio received (transcription unavailable)]"
+                                    .to_string(),
+                            );
                         }
                     }
                 }

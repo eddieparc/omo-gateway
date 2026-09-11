@@ -1,0 +1,2802 @@
+diff --git a/src/cron/scheduler.rs b/src/cron/scheduler.rs
+index 3496153..24e6fd8 100644
+--- a/src/cron/scheduler.rs
++++ b/src/cron/scheduler.rs
+@@ -13,6 +13,7 @@ use tokio::sync::{broadcast, watch, Mutex, Notify};
+ use tokio::task::JoinHandle;
+ use uuid::Uuid;
+ 
++use super::store::{get_cron_authority, update_cron_authority, CronAuthority};
+ use crate::{
+     HermesJob, HermesStoreSynchronizer, OmonError, OutboundAction, OutboundDispatcher, Result,
+     SessionKey,
+@@ -319,6 +320,10 @@ impl CronJobSpec {
+     }
+ }
+ 
++fn default_authority_string() -> String {
++    "omon_owned".to_string()
++}
++
+ #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, FromRow)]
+ pub struct CronJob {
+     pub id: String,
+@@ -330,13 +335,72 @@ pub struct CronJob {
+     pub next_run_at: Option<DateTime<Utc>>,
+     pub created_at: DateTime<Utc>,
+     pub updated_at: DateTime<Utc>,
++    #[sqlx(default)]
++    #[serde(default = "default_authority_string")]
++    pub authority: String,
+ }
+ 
+ impl CronJob {
++    pub fn authority(&self) -> CronAuthority {
++        if self.authority.is_empty() {
++            CronAuthority::OmonOwned
++        } else {
++            self.authority.parse().unwrap_or(CronAuthority::OmonOwned)
++        }
++    }
++
++    pub fn is_hermes_mirror(&self) -> bool {
++        self.authority() == CronAuthority::HermesMirror
++    }
++
++    pub fn is_cutover_pending(&self) -> bool {
++        self.authority() == CronAuthority::CutoverPending
++    }
++
++    pub fn is_omon_owned(&self) -> bool {
++        self.authority() == CronAuthority::OmonOwned
++    }
++
+     pub fn payload(&self) -> Result<Value> {
+         serde_json::from_str(&self.payload_json)
+             .map_err(|error| OmonError::Config(format!("invalid cron payload: {error}")))
+     }
++
++    pub fn last_status(&self) -> Option<String> {
++        self.payload().ok().and_then(|p| {
++            p.get("last_status")
++                .and_then(Value::as_str)
++                .map(String::from)
++        })
++    }
++
++    pub fn last_run_at(&self) -> Option<String> {
++        self.payload().ok().and_then(|p| {
++            p.get("last_run_at")
++                .and_then(Value::as_str)
++                .map(String::from)
++        })
++    }
++
++    pub fn last_error(&self) -> Option<String> {
++        self.payload().ok().and_then(|p| {
++            p.get("last_error")
++                .and_then(Value::as_str)
++                .map(String::from)
++        })
++    }
++
++    pub fn last_delivery_error(&self) -> Option<String> {
++        self.payload().ok().and_then(|p| {
++            p.get("last_delivery_error")
++                .and_then(Value::as_str)
++                .map(String::from)
++        })
++    }
++
++    pub fn is_missed(&self) -> bool {
++        self.last_status().as_deref() == Some("missed")
++    }
+ }
+ 
+ #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+@@ -431,6 +495,8 @@ pub struct CronScheduler {
+     wake: Arc<Notify>,
+     poll_interval: Duration,
+     state: Arc<SchedulerState>,
++    clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
++    pre_retire_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+ }
+ 
+ #[derive(Clone)]
+@@ -441,6 +507,23 @@ struct CronClaim {
+     advance_schedule: bool,
+ }
+ 
++pub async fn has_pending_cutover_receipt(pool: &SqlitePool) -> Result<bool> {
++    let table_exists: bool = sqlx::query_scalar(
++        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_cutover_receipts')",
++    )
++    .fetch_one(pool)
++    .await?;
++    if !table_exists {
++        return Ok(false);
++    }
++    let pending: bool = sqlx::query_scalar(
++        "SELECT EXISTS(SELECT 1 FROM cron_cutover_receipts WHERE status = 'pending')",
++    )
++    .fetch_one(pool)
++    .await?;
++    Ok(pending)
++}
++
+ impl CronScheduler {
+     pub fn new(pool: SqlitePool, executor: Arc<dyn CronTaskExecutor>) -> Self {
+         Self::with_options(pool, executor, None, Duration::from_secs(1))
+@@ -478,6 +561,8 @@ impl CronScheduler {
+             notifications,
+             wake: Arc::new(Notify::new()),
+             poll_interval,
++            clock: Arc::new(Utc::now),
++            pre_retire_gate: None,
+             state: Arc::new(SchedulerState {
+                 shutdown,
+                 task: Mutex::new(None),
+@@ -491,6 +576,18 @@ impl CronScheduler {
+         self
+     }
+ 
++    /// Supplies the clock used at scheduling, claim and completion boundaries.
++    pub fn with_clock(mut self, clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
++        self.clock = Arc::new(clock);
++        self
++    }
++
++    /// Internal synchronization gate for testing deterministic races around retirement.
++    pub fn with_pre_retire_gate(mut self, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
++        self.pre_retire_gate = Some((entered, release));
++        self
++    }
++
+     pub fn subscribe(&self) -> broadcast::Receiver<CronNotification> {
+         self.notifications.subscribe()
+     }
+@@ -508,7 +605,7 @@ impl CronScheduler {
+                     break;
+                 }
+                 if let Some(synchronizer) = &scheduler.hermes_sync {
+-                    if let Err(error) = synchronizer.sync().await {
++                    if let Err(error) = synchronizer.sync_at((scheduler.clock)()).await {
+                         tracing::error!(%error, "Hermes cron store synchronization failed");
+                     }
+                 }
+@@ -544,7 +641,7 @@ impl CronScheduler {
+         spec: CronJobSpec,
+     ) -> Result<CronJob> {
+         let id = id.into();
+-        let now = Utc::now();
++        let now = (self.clock)();
+         let next_run_at = next_run(&spec.expression, now)?;
+         let payload_json = serde_json::to_string(&spec.payload)
+             .map_err(|error| OmonError::Config(error.to_string()))?;
+@@ -574,7 +671,7 @@ impl CronScheduler {
+     }
+ 
+     pub async fn register(&self, spec: CronJobSpec) -> Result<CronJob> {
+-        let now = Utc::now();
++        let now = (self.clock)();
+         let next_run_at = next_run(&spec.expression, now)?;
+         let id = Uuid::new_v4().to_string();
+         let payload_json = serde_json::to_string(&spec.payload)
+@@ -628,7 +725,7 @@ impl CronScheduler {
+         let result = sqlx::query(
+             "UPDATE cron_jobs SET enabled = 0, next_run_at = NULL, updated_at = ? WHERE id = ?",
+         )
+-        .bind(Utc::now())
++        .bind((self.clock)())
+         .bind(id)
+         .execute(&self.pool)
+         .await?;
+@@ -644,7 +741,7 @@ impl CronScheduler {
+         let Some(job) = self.get(id).await? else {
+             return Ok(false);
+         };
+-        let now = Utc::now();
++        let now = (self.clock)();
+         let next = next_run(&job.expression, now)?;
+         sqlx::query(
+             "UPDATE cron_jobs SET enabled = 1, next_run_at = ?, updated_at = ? WHERE id = ?",
+@@ -693,14 +790,92 @@ impl CronScheduler {
+         self.trigger(id).await
+     }
+ 
++    async fn retire_overdue_oneshot(
++        &self,
++        id: &str,
++        expression: &str,
++        observed_next_run_at: DateTime<Utc>,
++        observed_payload_json: &str,
++        now: DateTime<Utc>,
++    ) -> Result<bool> {
++        let mut payload: Value = serde_json::from_str(observed_payload_json)
++            .map_err(|error| OmonError::Config(format!("invalid cron payload: {error}")))?;
++        if let Some(obj) = payload.as_object_mut() {
++            obj.insert(
++                "last_status".to_string(),
++                Value::String("missed".to_string()),
++            );
++            obj.insert("last_run_at".to_string(), Value::String(now.to_rfc3339()));
++            obj.insert(
++                "last_error".to_string(),
++                Value::String("missed: overdue unclaimed one-shot past grace".to_string()),
++            );
++            obj.insert("last_delivery_error".to_string(), Value::Null);
++        }
++        let updated_payload_json = serde_json::to_string(&payload).map_err(|error| {
++            OmonError::Config(format!("failed to serialize updated payload: {error}"))
++        })?;
++
++        if let Some((entered, release)) = &self.pre_retire_gate {
++            entered.notify_one();
++            release.notified().await;
++        }
++
++        let result = sqlx::query(
++            "UPDATE cron_jobs
++             SET enabled = 0, next_run_at = NULL, payload_json = ?, updated_at = ?
++             WHERE id = ?
++               AND enabled = 1
++               AND expression = ?
++               AND next_run_at = ?
++               AND payload_json = ?
++               AND NOT EXISTS (
++                   SELECT 1 FROM cron_runs
++                   WHERE job_id = ? AND status = 'running'
++               )",
++        )
++        .bind(&updated_payload_json)
++        .bind(now)
++        .bind(id)
++        .bind(expression)
++        .bind(observed_next_run_at)
++        .bind(observed_payload_json)
++        .bind(id)
++        .execute(&self.pool)
++        .await?;
++
++        let retired = result.rows_affected() > 0;
++        if retired {
++            tracing::info!(job_id = %id, "retired overdue unclaimed one-shot past grace as missed");
++            self.wake.notify_one();
++        }
++        Ok(retired)
++    }
++
++    pub async fn get_authority(&self, id: &str) -> Result<Option<CronAuthority>> {
++        get_cron_authority(&self.pool, id).await
++    }
++
++    pub async fn set_authority(&self, id: &str, authority: CronAuthority) -> Result<bool> {
++        update_cron_authority(&self.pool, id, authority).await
++    }
++
++    pub async fn has_pending_cutover_receipt(&self) -> Result<bool> {
++        has_pending_cutover_receipt(&self.pool).await
++    }
++
+     /// Claims every due job and starts each execution in its own task. Claims
+     /// are protected by durable lease rows, so concurrent scheduler instances
+     /// cannot execute the same job while a live lease exists.
+     pub async fn run_due_jobs(&self) -> Result<usize> {
+-        let now = Utc::now();
++        if has_pending_cutover_receipt(&self.pool).await? {
++            return Ok(0);
++        }
++        let now = (self.clock)();
+         let job_ids: Vec<String> = sqlx::query_scalar(
+             "SELECT id FROM cron_jobs
+              WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
++               AND authority != 'cutover_pending'
+              ORDER BY next_run_at, id",
+         )
+         .bind(now)
+@@ -722,7 +897,10 @@ impl CronScheduler {
+         require_due: bool,
+         advance_schedule: bool,
+     ) -> Result<Option<CronClaim>> {
+-        let now = Utc::now();
++        if has_pending_cutover_receipt(&self.pool).await? {
++            return Ok(None);
++        }
++        let now = (self.clock)();
+         let lease_expires_at = now + LEASE_DURATION;
+         let run_id = Uuid::new_v4().to_string();
+         let claim_token = Uuid::new_v4().to_string();
+@@ -753,6 +931,28 @@ impl CronScheduler {
+             }
+         }
+ 
++        if require_due {
++            let job_row: Option<(String, Option<DateTime<Utc>>, String)> = sqlx::query_as(
++                "SELECT expression, next_run_at, payload_json FROM cron_jobs WHERE id = ? AND enabled = 1 AND authority != 'cutover_pending'",
++            )
++            .bind(id)
++            .fetch_optional(&self.pool)
++            .await?;
++
++            if let Some((expression, Some(next_run), payload_json)) = job_row {
++                if expression.starts_with("once:") {
++                    let overdue = now.signed_duration_since(next_run);
++                    let grace = TimeDelta::from_std(ONESHOT_GRACE_DURATION)
++                        .unwrap_or_else(|_| TimeDelta::seconds(120));
++                    if overdue > grace {
++                        self.retire_overdue_oneshot(id, &expression, next_run, &payload_json, now)
++                            .await?;
++                        return Ok(None);
++                    }
++                }
++            }
++        }
++
+         let due_clause = if require_due {
+             "AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?"
+         } else {
+@@ -765,6 +965,7 @@ impl CronScheduler {
+                     COALESCE((SELECT MAX(attempt) + 1 FROM cron_runs WHERE job_id = ?), 1), NULL, ?
+              FROM cron_jobs
+              WHERE id = ? {due_clause}
++               AND authority != 'cutover_pending'
+                AND NOT EXISTS (
+                    SELECT 1 FROM cron_runs
+                    WHERE job_id = ? AND status = 'running'
+@@ -849,7 +1050,7 @@ impl CronScheduler {
+     }
+ 
+     async fn refresh_lease(&self, claim_token: &str) -> Result<()> {
+-        let lease_expires_at = Utc::now() + LEASE_DURATION;
++        let lease_expires_at = (self.clock)() + LEASE_DURATION;
+         sqlx::query(
+             "UPDATE cron_runs SET lease_expires_at = ?
+              WHERE claim_token = ? AND status = 'running'",
+@@ -862,7 +1063,7 @@ impl CronScheduler {
+     }
+ 
+     async fn complete_success(&self, claim: &CronClaim) -> Result<()> {
+-        let now = Utc::now();
++        let now = (self.clock)();
+         let mut transaction = self.pool.begin().await?;
+         let completed = sqlx::query(
+             "UPDATE cron_runs
+@@ -914,6 +1115,15 @@ impl CronScheduler {
+         let mut payload: Value =
+             serde_json::from_str(&claim.job.payload_json).unwrap_or_else(|_| serde_json::json!({}));
+         let (times, completed_count) = increment_repeat_completed(&mut payload);
++        if let Some(obj) = payload.as_object_mut() {
++            obj.insert(
++                "last_status".to_string(),
++                Value::String("succeeded".to_string()),
++            );
++            obj.insert("last_run_at".to_string(), Value::String(now.to_rfc3339()));
++            obj.insert("last_error".to_string(), Value::Null);
++            obj.insert("last_delivery_error".to_string(), Value::Null);
++        }
+         let updated_payload_json =
+             serde_json::to_string(&payload).unwrap_or_else(|_| claim.job.payload_json.clone());
+         let limit_reached = should_disable_after(completed_count, times);
+@@ -933,7 +1143,11 @@ impl CronScheduler {
+                 .execute(&mut *transaction)
+                 .await?;
+             } else {
+-                let next = next_run(&claim.job.expression, now)?;
++                let timezone = payload
++                    .get("schedule")
++                    .and_then(|schedule| schedule.get("timezone"))
++                    .and_then(Value::as_str);
++                let next = next_run_tz(&claim.job.expression, now, timezone)?;
+                 sqlx::query(
+                     "UPDATE cron_jobs
+                      SET next_run_at = ?, payload_json = ?, updated_at = ?
+@@ -968,7 +1182,7 @@ impl CronScheduler {
+     }
+ 
+     async fn complete_failure(&self, claim: &CronClaim, error: &OmonError) -> Result<()> {
+-        let now = Utc::now();
++        let now = (self.clock)();
+         let mut transaction = self.pool.begin().await?;
+         let completed = sqlx::query(
+             "UPDATE cron_runs
+@@ -1018,13 +1232,35 @@ impl CronScheduler {
+             }
+         }
+ 
++        let mut payload: Value =
++            serde_json::from_str(&claim.job.payload_json).unwrap_or_else(|_| serde_json::json!({}));
++        if let Some(obj) = payload.as_object_mut() {
++            obj.insert(
++                "last_status".to_string(),
++                Value::String("failed".to_string()),
++            );
++            obj.insert("last_run_at".to_string(), Value::String(now.to_rfc3339()));
++            let err_str = error.to_string();
++            obj.insert("last_error".to_string(), Value::String(err_str.clone()));
++            if err_str.to_lowercase().contains("deliver")
++                || err_str.to_lowercase().contains("discord")
++            {
++                obj.insert("last_delivery_error".to_string(), Value::String(err_str));
++            } else {
++                obj.insert("last_delivery_error".to_string(), Value::Null);
++            }
++        }
++        let updated_payload_json =
++            serde_json::to_string(&payload).unwrap_or_else(|_| claim.job.payload_json.clone());
++
+         if claim.advance_schedule {
+             if claim.job.expression.starts_with("once:") {
+                 sqlx::query(
+                     "UPDATE cron_jobs
+-                     SET enabled = 0, next_run_at = NULL, updated_at = ?
++                     SET enabled = 0, next_run_at = NULL, payload_json = ?, updated_at = ?
+                      WHERE id = ? AND expression = ? AND payload_json = ?",
+                 )
++                .bind(&updated_payload_json)
+                 .bind(now)
+                 .bind(&claim.job.id)
+                 .bind(&claim.job.expression)
+@@ -1053,10 +1289,11 @@ impl CronScheduler {
+                     Ok(Some(next)) => {
+                         sqlx::query(
+                             "UPDATE cron_jobs
+-                             SET next_run_at = ?, updated_at = ?
++                             SET next_run_at = ?, payload_json = ?, updated_at = ?
+                              WHERE id = ? AND enabled = 1 AND expression = ? AND payload_json = ?",
+                         )
+                         .bind(next)
++                        .bind(&updated_payload_json)
+                         .bind(now)
+                         .bind(&claim.job.id)
+                         .bind(&claim.job.expression)
+@@ -1067,9 +1304,10 @@ impl CronScheduler {
+                     Ok(None) => {
+                         sqlx::query(
+                             "UPDATE cron_jobs
+-                             SET enabled = 0, next_run_at = NULL, updated_at = ?
++                             SET enabled = 0, next_run_at = NULL, payload_json = ?, updated_at = ?
+                              WHERE id = ? AND expression = ? AND payload_json = ?",
+                         )
++                        .bind(&updated_payload_json)
+                         .bind(now)
+                         .bind(&claim.job.id)
+                         .bind(&claim.job.expression)
+@@ -1085,9 +1323,10 @@ impl CronScheduler {
+                         );
+                         sqlx::query(
+                             "UPDATE cron_jobs
+-                             SET enabled = 0, next_run_at = NULL, updated_at = ?
++                             SET enabled = 0, next_run_at = NULL, payload_json = ?, updated_at = ?
+                              WHERE id = ? AND expression = ? AND payload_json = ?",
+                         )
++                        .bind(&updated_payload_json)
+                         .bind(now)
+                         .bind(&claim.job.id)
+                         .bind(&claim.job.expression)
+@@ -1097,6 +1336,19 @@ impl CronScheduler {
+                     }
+                 }
+             }
++        } else {
++            sqlx::query(
++                "UPDATE cron_jobs
++                 SET payload_json = ?, updated_at = ?
++                 WHERE id = ? AND expression = ? AND payload_json = ?",
++            )
++            .bind(&updated_payload_json)
++            .bind(now)
++            .bind(&claim.job.id)
++            .bind(&claim.job.expression)
++            .bind(&claim.job.payload_json)
++            .execute(&mut *transaction)
++            .await?;
+         }
+         transaction.commit().await?;
+         self.wake.notify_one();
+@@ -1127,7 +1379,11 @@ impl CronScheduler {
+                     if let Some(content) = content {
+                         if !content.trim().is_empty() && !is_cron_silence_response(&content) {
+                             for destination in &destinations {
+-                                self.deliver(job, destination, &content).await?;
++                                self.deliver(job, destination, &content)
++                                    .await
++                                    .map_err(|err| {
++                                        OmonError::Config(format!("delivery error: {err}"))
++                                    })?;
+                             }
+                         } else {
+                             tracing::info!(
+@@ -1170,7 +1426,7 @@ impl CronScheduler {
+             job_id: job.id.clone(),
+             channel_id,
+             content: content.to_string(),
+-            triggered_at: Utc::now(),
++            triggered_at: (self.clock)(),
+         };
+         let _ = self.notifications.send(notification);
+         if let Some(dispatcher) = &self.dispatcher {
+@@ -1407,6 +1663,35 @@ pub fn next_run(expression: &str, after: DateTime<Utc>) -> Result<DateTime<Utc>>
+         .ok_or_else(|| OmonError::Config(format!("cron expression `{expression}` has no next run")))
+ }
+ 
++/// Computes the next run instant for `expression`, evaluating cron wall-clock
++/// fields in `timezone` (an IANA name) when provided and converting the result
++/// back to UTC for storage. Interval and one-shot schedules are absolute
++/// instants, so the source timezone does not shift them.
++pub fn next_run_tz(
++    expression: &str,
++    after: DateTime<Utc>,
++    timezone: Option<&str>,
++) -> Result<DateTime<Utc>> {
++    let Some(tz_name) = timezone.map(str::trim).filter(|name| !name.is_empty()) else {
++        return next_run(expression, after);
++    };
++    if expression.starts_with("once:") || parse_interval(expression)?.is_some() {
++        return next_run(expression, after);
++    }
++    let tz: chrono_tz::Tz = tz_name
++        .parse()
++        .map_err(|_| OmonError::Config(format!("invalid timezone `{tz_name}`")))?;
++    let normalized = normalize_cron_expression(expression);
++    let schedule = Schedule::from_str(&normalized).map_err(|error| {
++        OmonError::Config(format!("invalid cron expression `{expression}`: {error}"))
++    })?;
++    schedule
++        .after(&after.with_timezone(&tz))
++        .next()
++        .map(|instant| instant.with_timezone(&Utc))
++        .ok_or_else(|| OmonError::Config(format!("cron expression `{expression}` has no next run")))
++}
++
+ fn normalize_cron_expression(expression: &str) -> String {
+     let parts: Vec<&str> = expression.split_whitespace().collect();
+     if parts.len() == 5 {
+@@ -1445,7 +1730,7 @@ fn parse_interval(expression: &str) -> Result<Option<Duration>> {
+         _ => {
+             return Err(OmonError::Config(format!(
+                 "invalid interval unit in `{expression}`"
+-            )))
++            )));
+         }
+     };
+     Ok(Some(duration))
+@@ -1500,6 +1785,56 @@ mod tests {
+         assert_eq!(failure_backoff_duration(100), Duration::from_secs(3600));
+     }
+ 
++    #[test]
++    fn next_run_tz_evaluates_wall_clock_and_tracks_dst_offset() {
++        // Asia/Seoul has no DST: 09:00 local is always 00:00 UTC.
++        let after_seoul = DateTime::parse_from_rfc3339("2026-09-05T00:00:00Z")
++            .unwrap()
++            .with_timezone(&Utc);
++        assert_eq!(
++            next_run_tz("0 9 * * *", after_seoul, Some("Asia/Seoul")).unwrap(),
++            DateTime::parse_from_rfc3339("2026-09-06T00:00:00Z")
++                .unwrap()
++                .with_timezone(&Utc)
++        );
++
++        // America/New_York observes DST: noon local resolves to a different UTC
++        // instant across the standard-time/daylight-time boundary.
++        let winter = DateTime::parse_from_rfc3339("2026-01-10T00:00:00Z")
++            .unwrap()
++            .with_timezone(&Utc);
++        assert_eq!(
++            next_run_tz("0 12 * * *", winter, Some("America/New_York")).unwrap(),
++            DateTime::parse_from_rfc3339("2026-01-10T17:00:00Z")
++                .unwrap()
++                .with_timezone(&Utc),
++            "noon EST is 17:00 UTC"
++        );
++        let summer = DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
++            .unwrap()
++            .with_timezone(&Utc);
++        assert_eq!(
++            next_run_tz("0 12 * * *", summer, Some("America/New_York")).unwrap(),
++            DateTime::parse_from_rfc3339("2026-07-10T16:00:00Z")
++                .unwrap()
++                .with_timezone(&Utc),
++            "noon EDT is 16:00 UTC"
++        );
++
++        // Absent/blank timezone and non-cron schedules fall back to UTC.
++        assert_eq!(
++            next_run_tz("0 12 * * *", winter, None).unwrap(),
++            next_run("0 12 * * *", winter).unwrap()
++        );
++        assert_eq!(
++            next_run_tz("interval:1h", winter, Some("America/New_York")).unwrap(),
++            next_run("interval:1h", winter).unwrap()
++        );
++
++        // Malformed cron expression is rejected regardless of the timezone.
++        assert!(next_run_tz("garbage", winter, Some("Asia/Seoul")).is_err());
++    }
++
+     #[test]
+     fn next_run_after_failure_advances_interval_and_applies_backoff() {
+         let now = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
+diff --git a/src/migrate/cron_cutover.rs b/src/migrate/cron_cutover.rs
+index 1c43cb9..cc38009 100644
+--- a/src/migrate/cron_cutover.rs
++++ b/src/migrate/cron_cutover.rs
+@@ -1,7 +1,10 @@
+ use crate::migrate::sys::MigrationEnv;
+ use crate::{OmonError, Result};
+ use serde::Deserialize;
++use serde_json::Value;
++use sha2::{Digest, Sha256};
+ use sqlx::SqlitePool;
++use std::collections::BTreeSet;
+ use std::path::{Path, PathBuf};
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -21,20 +24,233 @@ pub struct CronCutoverSummary {
+ #[derive(Debug, Deserialize)]
+ struct StoreDocument {
+     #[serde(default)]
+-    jobs: Vec<StoreJob>,
++    jobs: Vec<Value>,
+ }
+ 
+-#[derive(Debug, Deserialize)]
+-struct StoreJob {
+-    id: String,
++pub struct PreparedStore {
++    pub profile: String,
++    pub path: PathBuf,
++    pub original: Vec<u8>,
++    pub job_ids: Vec<String>,
++    pub unverified_jobs: Vec<String>,
+ }
+ 
+-struct PreparedStore {
++struct PreparedCutoverStore {
+     profile: String,
+     path: PathBuf,
+-    original: Vec<u8>,
++    original_bytes: Vec<u8>,
++    original_hash: String,
++    backup_candidate: PathBuf,
++    backup_path: Option<PathBuf>,
++    replacement_bytes: Vec<u8>,
++    replacement_hash: String,
+     job_ids: Vec<String>,
+     unverified_jobs: Vec<String>,
++    job_digests: Vec<(String, String)>,
++}
++
++fn sha256_hex(bytes: &[u8]) -> String {
++    let mut hasher = Sha256::new();
++    hasher.update(bytes);
++    let hash = hasher.finalize();
++    let mut hex = String::with_capacity(hash.len() * 2);
++    for b in hash {
++        use std::fmt::Write;
++        let _ = write!(hex, "{:02x}", b);
++    }
++    hex
++}
++
++pub fn normalize_job_payload(v: &Value) -> Value {
++    match v {
++        Value::Object(map) => {
++            let mut cleaned = serde_json::Map::new();
++            for (key, val) in map {
++                // Ignore runtime state and internal provenance metadata
++                if key == "_omon_hermes_source"
++                    || key == "_omon_hermes_profile"
++                    || key == "_omon_hermes_home"
++                    || key == "last_status"
++                    || key == "last_run_at"
++                    || key == "last_error"
++                    || key == "last_delivery_error"
++                    || key == "created_at"
++                    || key == "updated_at"
++                    || key == "next_run_at"
++                    || key == "id"
++                {
++                    continue;
++                }
++                if key == "repeat" {
++                    if let Value::Object(repeat_map) = val {
++                        let mut cleaned_repeat = serde_json::Map::new();
++                        for (rk, rv) in repeat_map {
++                            if rk != "completed" {
++                                cleaned_repeat.insert(rk.clone(), rv.clone());
++                            }
++                        }
++                        cleaned.insert(key.clone(), Value::Object(cleaned_repeat));
++                        continue;
++                    }
++                }
++                cleaned.insert(key.clone(), normalize_job_payload(val));
++            }
++            Value::Object(cleaned)
++        }
++        Value::Array(arr) => Value::Array(arr.iter().map(normalize_job_payload).collect()),
++        other => other.clone(),
++    }
++}
++
++pub fn canonical_job_payload_matches(source: &Value, db_payload: &Value) -> bool {
++    let source_norm =
++        if let Ok(hermes_job) = serde_json::from_value::<crate::cron::HermesJob>(source.clone()) {
++            if let Ok(serialized) = serde_json::to_value(&hermes_job) {
++                normalize_job_payload(&serialized)
++            } else {
++                normalize_job_payload(source)
++            }
++        } else {
++            normalize_job_payload(source)
++        };
++
++    let db_norm = if let Ok(hermes_job) =
++        serde_json::from_value::<crate::cron::HermesJob>(db_payload.clone())
++    {
++        if let Ok(serialized) = serde_json::to_value(&hermes_job) {
++            normalize_job_payload(&serialized)
++        } else {
++            normalize_job_payload(db_payload)
++        }
++    } else {
++        normalize_job_payload(db_payload)
++    };
++
++    source_norm == db_norm
++}
++
++pub async fn reconcile_pending_cutover(
++    env: &dyn MigrationEnv,
++    pool: &SqlitePool,
++) -> Result<Option<String>> {
++    let table_exists: bool = sqlx::query_scalar(
++        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_cutover_receipts')",
++    )
++    .fetch_one(pool)
++    .await?;
++    if !table_exists {
++        return Ok(None);
++    }
++
++    let pending_op: Option<(String,)> = sqlx::query_as(
++        "SELECT operation_id FROM cron_cutover_receipts WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1",
++    )
++    .fetch_optional(pool)
++    .await?;
++
++    let Some((operation_id,)) = pending_op else {
++        return Ok(None);
++    };
++
++    let stores: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
++        "SELECT profile, store_path, original_hash, replacement_hash, backup_path, phase
++         FROM cron_cutover_receipt_stores
++         WHERE operation_id = ?
++         ORDER BY store_path",
++    )
++    .bind(&operation_id)
++    .fetch_all(pool)
++    .await?;
++
++    // Acquire locks on all stores in canonical order
++    let mut lock_paths = BTreeSet::new();
++    for (_, store_path_str, _, _, _, _) in &stores {
++        let p = PathBuf::from(store_path_str);
++        if let Some(parent) = p.parent() {
++            if env.exists(parent) {
++                let lock_path = env.canonicalize(&parent.join(".jobs.lock"))?;
++                lock_paths.insert(lock_path);
++            }
++        }
++    }
++    let mut locks = Vec::new();
++    for lock_path in &lock_paths {
++        locks.push(env.acquire_jobs_lock(lock_path)?);
++    }
++
++    let now = env.now();
++    let emptied =
++        serde_json::to_vec(&serde_json::json!({ "jobs": [], "updated_at": now.to_rfc3339() }))
++            .map_err(|e| OmonError::Config(format!("failed to serialize empty store: {e}")))?;
++    let emptied_hash = sha256_hex(&emptied);
++
++    for (_profile, store_path_str, orig_hash, repl_hash, backup_path, _phase) in &stores {
++        let path = PathBuf::from(store_path_str);
++        let current_bytes = if env.exists(&path) {
++            env.read(&path)?
++        } else {
++            Vec::new()
++        };
++        let current_hash = sha256_hex(&current_bytes);
++
++        if current_hash == *repl_hash || current_hash == emptied_hash {
++            sqlx::query(
++                "UPDATE cron_cutover_receipt_stores SET phase = 'replaced', updated_at = ? WHERE operation_id = ? AND store_path = ?",
++            )
++            .bind(now)
++            .bind(&operation_id)
++            .bind(store_path_str)
++            .execute(pool)
++            .await?;
++        } else if current_hash == *orig_hash {
++            env.write_atomic(&path, &emptied)?;
++            sqlx::query(
++                "UPDATE cron_cutover_receipt_stores SET phase = 'replaced', updated_at = ? WHERE operation_id = ? AND store_path = ?",
++            )
++            .bind(now)
++            .bind(&operation_id)
++            .bind(store_path_str)
++            .execute(pool)
++            .await?;
++        } else {
++            return Err(OmonError::Config(format!(
++                "Hermes cron store {} has unknown content during cutover recovery (hash does not match original or replacement); backups preserved at {}",
++                path.display(),
++                backup_path
++            )));
++        }
++    }
++
++    let mut tx = pool.begin().await?;
++    let now = env.now();
++    sqlx::query(
++        "UPDATE cron_cutover_receipts SET status = 'committed', updated_at = ? WHERE operation_id = ?",
++    )
++    .bind(now)
++    .bind(&operation_id)
++    .execute(&mut *tx)
++    .await?;
++
++    sqlx::query(
++        "UPDATE cron_cutover_receipt_stores SET phase = 'committed', updated_at = ? WHERE operation_id = ?",
++    )
++    .bind(now)
++    .bind(&operation_id)
++    .execute(&mut *tx)
++    .await?;
++
++    sqlx::query(
++        "UPDATE cron_jobs SET authority = 'omon_owned', updated_at = ?
++         WHERE authority = 'cutover_pending'",
++    )
++    .bind(now)
++    .execute(&mut *tx)
++    .await?;
++
++    tx.commit().await?;
++    drop(locks);
++
++    Ok(Some(operation_id))
+ }
+ 
+ pub async fn cutover_cron_stores(
+@@ -43,44 +259,122 @@ pub async fn cutover_cron_stores(
+     pool: &SqlitePool,
+     dry_run: bool,
+ ) -> Result<CronCutoverSummary> {
++    if !dry_run {
++        reconcile_pending_cutover(env, pool).await?;
++    }
++
+     let stores = discover_stores(env, hermes_root)?;
++
++    // Lock all selected stores in canonical order (deduplicating aliases safely)
++    let mut lock_paths = BTreeSet::new();
++    for (_profile, path) in &stores {
++        if let Some(parent) = path.parent() {
++            if env.exists(parent) {
++                let lock_path = env.canonicalize(&parent.join(".jobs.lock"))?;
++                lock_paths.insert(lock_path);
++            }
++        }
++    }
++
++    let mut locks = Vec::new();
++    if !dry_run {
++        for lock_path in &lock_paths {
++            locks.push(env.acquire_jobs_lock(lock_path)?);
++        }
++    }
++
++    // Under locks take final snapshot and validate whole import receipt and source set
+     let mut prepared = Vec::with_capacity(stores.len());
+ 
+-    for (profile, path) in stores {
+-        let original = if env.exists(&path) {
+-            if !env.is_file(&path) {
++    for (profile, path) in &stores {
++        let original = if env.exists(path) {
++            if !env.is_file(path) {
+                 return Err(OmonError::Config(format!(
+                     "Hermes cron store is not a file: {}",
+                     path.display()
+                 )));
+             }
+-            env.read(&path)?
++            env.read(path)?
+         } else {
+             Vec::new()
+         };
+-        let job_ids = if original.is_empty() && !env.exists(&path) {
++        let original_hash = sha256_hex(&original);
++        let store_jobs = if original.is_empty() && !env.exists(path) {
+             Vec::new()
+         } else {
+-            parse_job_ids(&path, &original)?
++            parse_store_jobs(path, &original)?
+         };
++        let mut job_ids = Vec::with_capacity(store_jobs.len());
+         let mut unverified_jobs = Vec::new();
+-        for job_id in &job_ids {
++        let mut job_digests = Vec::with_capacity(store_jobs.len());
++
++        for job_val in &store_jobs {
++            let job_id = job_val.get("id").and_then(Value::as_str).unwrap_or("");
++            job_ids.push(job_id.to_owned());
+             let imported_id = format!("hermes:{profile}:{job_id}");
+-            let imported: bool =
+-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cron_jobs WHERE id = ?)")
++            let db_row: Option<(String,)> =
++                sqlx::query_as("SELECT payload_json FROM cron_jobs WHERE id = ?")
+                     .bind(&imported_id)
+-                    .fetch_one(pool)
++                    .fetch_optional(pool)
+                     .await?;
+-            if !imported {
+-                unverified_jobs.push(job_id.clone());
++
++            match db_row {
++                None => {
++                    unverified_jobs.push(job_id.to_owned());
++                }
++                Some((db_payload_str,)) => {
++                    let db_payload: Value =
++                        serde_json::from_str(&db_payload_str).unwrap_or(Value::Null);
++                    if !canonical_job_payload_matches(job_val, &db_payload) {
++                        unverified_jobs.push(job_id.to_owned());
++                    } else {
++                        let digest = sha256_hex(
++                            serde_json::to_string(&normalize_job_payload(job_val))
++                                .unwrap_or_default()
++                                .as_bytes(),
++                        );
++                        job_digests.push((job_id.to_owned(), digest));
++                    }
++                }
+             }
+         }
+-        prepared.push(PreparedStore {
+-            profile,
+-            path,
+-            original,
++
++        let parent = path.parent().ok_or_else(|| {
++            OmonError::Config(format!(
++                "invalid Hermes cron store path: {}",
++                path.display()
++            ))
++        })?;
++        let file_name = path.file_name().ok_or_else(|| {
++            OmonError::Config(format!(
++                "invalid Hermes cron store path: {}",
++                path.display()
++            ))
++        })?;
++        let timestamp = env.now().format("%Y%m%dT%H%M%S%.fZ").to_string();
++        let backup_candidate = parent.join(format!(
++            "{}.bak-omon-migration-{timestamp}",
++            file_name.to_string_lossy()
++        ));
++        let emptied = serde_json::to_vec(&serde_json::json!({
++            "jobs": [],
++            "updated_at": env.now().to_rfc3339(),
++        }))
++        .map_err(|e| OmonError::Config(format!("failed to serialize empty cron store: {e}")))?;
++        let replacement_hash = sha256_hex(&emptied);
++
++        prepared.push(PreparedCutoverStore {
++            profile: profile.clone(),
++            path: path.clone(),
++            original_bytes: original,
++            original_hash,
++            backup_candidate,
++            backup_path: None,
++            replacement_bytes: emptied,
++            replacement_hash,
+             job_ids,
+             unverified_jobs,
++            job_digests,
+         });
+     }
+ 
+@@ -106,19 +400,143 @@ pub async fn cutover_cron_stores(
+         .find(|store| !store.unverified_jobs.is_empty())
+     {
+         return Err(OmonError::Config(format!(
+-            "Hermes cron job hermes:{}:{} has not been imported into cron_jobs; refusing to empty {}",
++            "Hermes cron job hermes:{}:{} payload does not match imported cron_jobs or has not been imported; refusing to empty {}",
+             store.profile,
+             store.unverified_jobs[0],
+             store.path.display()
+         )));
+     }
+ 
+-    for store in prepared {
+-        if store.job_ids.is_empty() {
+-            continue;
++    let stores_with_jobs: Vec<_> = prepared
++        .into_iter()
++        .filter(|s| !s.job_ids.is_empty())
++        .collect();
++
++    if stores_with_jobs.is_empty() {
++        return Ok(summary);
++    }
++
++    // Prepare private unique backups for ALL stores before first source rewrite
++    let mut backed_up_stores = Vec::with_capacity(stores_with_jobs.len());
++    for mut store in stores_with_jobs {
++        let backup_path = env.write_unique(&store.backup_candidate, &store.original_bytes)?;
++        store.backup_path = Some(backup_path);
++        backed_up_stores.push(store);
++    }
++
++    // Record durable pending receipt with exact store set/hashes/provenance in SQLite
++    let operation_id = uuid::Uuid::new_v4().to_string();
++    let now = env.now();
++    let all_job_ids: Vec<String> = backed_up_stores
++        .iter()
++        .flat_map(|store| {
++            store
++                .job_ids
++                .iter()
++                .map(|job_id| format!("hermes:{}:{}", store.profile, job_id))
++        })
++        .collect();
++
++    let mut tx = pool.begin().await?;
++    sqlx::query(
++        "INSERT INTO cron_cutover_receipts (operation_id, status, store_count, policy_digest, created_at, updated_at)
++         VALUES (?, 'pending', ?, ?, ?, ?)",
++    )
++    .bind(&operation_id)
++    .bind(backed_up_stores.len() as i64)
++    .bind("hermes_cutover")
++    .bind(now)
++    .bind(now)
++    .execute(&mut *tx)
++    .await?;
++
++    for store in &backed_up_stores {
++        let digests_json =
++            serde_json::to_string(&store.job_digests).unwrap_or_else(|_| "[]".into());
++        let backup_str = store
++            .backup_path
++            .as_ref()
++            .map(|p| p.to_string_lossy().into_owned())
++            .unwrap_or_default();
++        sqlx::query(
++            "INSERT INTO cron_cutover_receipt_stores
++             (operation_id, profile, store_path, original_hash, replacement_hash, backup_path, job_digests_json, phase, updated_at)
++             VALUES (?, ?, ?, ?, ?, ?, ?, 'backed_up', ?)",
++        )
++        .bind(&operation_id)
++        .bind(&store.profile)
++        .bind(store.path.to_string_lossy())
++        .bind(&store.original_hash)
++        .bind(&store.replacement_hash)
++        .bind(backup_str)
++        .bind(digests_json)
++        .bind(now)
++        .execute(&mut *tx)
++        .await?;
++    }
++
++    for id in &all_job_ids {
++        sqlx::query(
++            "UPDATE cron_jobs SET authority = 'cutover_pending', updated_at = ? WHERE id = ?",
++        )
++        .bind(now)
++        .bind(id)
++        .execute(&mut *tx)
++        .await?;
++    }
++    tx.commit().await?;
++
++    // Rewrite each source store and record progress
++    for store in &backed_up_stores {
++        let current = env.read(&store.path)?;
++        if current != store.original_bytes {
++            return Err(OmonError::Config(format!(
++                "Hermes cron store changed during migration: {}; refusing to empty stale state",
++                store.path.display()
++            )));
+         }
+-        cutover_store(env, &store)?;
++        env.write_atomic(&store.path, &store.replacement_bytes)?;
++        sqlx::query(
++            "UPDATE cron_cutover_receipt_stores
++             SET phase = 'replaced', updated_at = ?
++             WHERE operation_id = ? AND store_path = ?",
++        )
++        .bind(env.now())
++        .bind(&operation_id)
++        .bind(store.path.to_string_lossy())
++        .execute(pool)
++        .await?;
++    }
++
++    // Final ownership commit in SQLite
++    let mut tx = pool.begin().await?;
++    let now = env.now();
++    sqlx::query(
++        "UPDATE cron_cutover_receipts SET status = 'committed', updated_at = ? WHERE operation_id = ?",
++    )
++    .bind(now)
++    .bind(&operation_id)
++    .execute(&mut *tx)
++    .await?;
++
++    sqlx::query(
++        "UPDATE cron_cutover_receipt_stores SET phase = 'committed', updated_at = ? WHERE operation_id = ?",
++    )
++    .bind(now)
++    .bind(&operation_id)
++    .execute(&mut *tx)
++    .await?;
++
++    for id in &all_job_ids {
++        sqlx::query("UPDATE cron_jobs SET authority = 'omon_owned', updated_at = ? WHERE id = ?")
++            .bind(now)
++            .bind(id)
++            .execute(&mut *tx)
++            .await?;
+     }
++    tx.commit().await?;
++
++    drop(locks);
+ 
+     Ok(summary)
+ }
+@@ -157,7 +575,7 @@ fn discover_stores(env: &dyn MigrationEnv, hermes_root: &Path) -> Result<Vec<(St
+     Ok(stores)
+ }
+ 
+-fn parse_job_ids(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
++fn parse_store_jobs(path: &Path, bytes: &[u8]) -> Result<Vec<Value>> {
+     let document: StoreDocument = serde_json::from_slice(bytes).map_err(|error| {
+         OmonError::Config(format!(
+             "invalid Hermes cron store {}: {error}",
+@@ -165,17 +583,18 @@ fn parse_job_ids(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
+         ))
+     })?;
+     for job in &document.jobs {
+-        if job.id.trim().is_empty() {
++        let id = job.get("id").and_then(Value::as_str).unwrap_or("");
++        if id.trim().is_empty() {
+             return Err(OmonError::Config(format!(
+                 "Hermes cron store {} contains a job without an id",
+                 path.display()
+             )));
+         }
+     }
+-    Ok(document.jobs.into_iter().map(|job| job.id).collect())
++    Ok(document.jobs)
+ }
+ 
+-fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
++pub fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
+     let directory = store.path.parent().ok_or_else(|| {
+         OmonError::Config(format!(
+             "invalid Hermes cron store path: {}",
+@@ -203,10 +622,7 @@ fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
+         "{}.bak-omon-migration-{timestamp}",
+         file_name.to_string_lossy()
+     ));
+-    let temporary = directory.join(format!(
+-        ".{}.tmp-omon-migration-{timestamp}",
+-        file_name.to_string_lossy()
+-    ));
++
+     let emptied = serde_json::json!({
+         "jobs": [],
+         "updated_at": now.to_rfc3339(),
+@@ -215,9 +631,8 @@ fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
+         OmonError::Config(format!("failed to serialize empty cron store: {error}"))
+     })?;
+ 
+-    env.write(&backup, &store.original)?;
+-    env.write(&temporary, &emptied)?;
+-    env.rename(&temporary, &store.path)?;
++    env.write_unique(&backup, &store.original)?;
++    env.write_atomic(&store.path, &emptied)?;
+     Ok(())
+ }
+ 
+@@ -457,4 +872,68 @@ mod tests {
+         assert!(env.rename_calls().is_empty());
+         println!("malformed-input error={error}");
+     }
++
++    #[tokio::test]
++    async fn alias_store_locks_deduplicate_safely() {
++        let (env, database) = fixture().await;
++        let profile_store = Path::new("/fixtures/.hermes/profiles/work/cron/jobs.json");
++        env.write(
++            profile_store,
++            br#"{"jobs":[{"id":"standup"}],"updated_at":"old"}"#,
++        )
++        .unwrap();
++        import_job(&database, "hermes:default:daily").await;
++        import_job(&database, "hermes:default:weekly").await;
++        import_job(&database, "hermes:work:standup").await;
++
++        // Add alias: make work store's lock point to default store's lock directory
++        let default_lock = PathBuf::from("/fixtures/.hermes/cron/.jobs.lock");
++        let work_lock = PathBuf::from("/fixtures/.hermes/profiles/work/cron/.jobs.lock");
++        env.add_alias(work_lock.clone(), default_lock.clone());
++
++        let summary = cutover_cron_stores(&env, Path::new(ROOT), database.pool(), false)
++            .await
++            .unwrap();
++
++        assert_eq!(summary.stores.len(), 2);
++        let lock_ops: Vec<_> = env
++            .operations()
++            .into_iter()
++            .filter(|op| matches!(op, MigrationOperation::LockAcquired(_)))
++            .collect();
++        assert_eq!(
++            lock_ops,
++            vec![MigrationOperation::LockAcquired(default_lock)]
++        );
++    }
++
++    #[tokio::test]
++    async fn reconcile_refuses_unknown_store_state_without_destroying_source() {
++        use super::reconcile_pending_cutover;
++        let (env, database) = fixture().await;
++        import_job(&database, "hermes:default:daily").await;
++        import_job(&database, "hermes:default:weekly").await;
++
++        // Make store read-only to inject failure on rewrite
++        env.set_read_only(Path::new(STORE), true);
++        let error = cutover_cron_stores(&env, Path::new(ROOT), database.pool(), false)
++            .await
++            .unwrap_err();
++        assert!(error.to_string().contains("read-only"));
++
++        // Now mutate the store externally so it matches NEITHER original NOR replacement
++        env.set_read_only(Path::new(STORE), false);
++        env.write(Path::new(STORE), b"external-unrecognized-corruption")
++            .unwrap();
++
++        // Recovery must refuse without destroying the store
++        let reconcile_err = reconcile_pending_cutover(&env, database.pool())
++            .await
++            .unwrap_err();
++        assert!(reconcile_err.to_string().contains("unknown content"));
++        assert_eq!(
++            env.read(Path::new(STORE)).unwrap(),
++            b"external-unrecognized-corruption"
++        );
++    }
+ }
+diff --git a/src/migrate/mod.rs b/src/migrate/mod.rs
+index 80231db..90572a7 100644
+--- a/src/migrate/mod.rs
++++ b/src/migrate/mod.rs
+@@ -171,15 +171,16 @@ async fn run_after_config(
+         return Ok(summary);
+     }
+ 
++    let gateway = bring_gateway_down(env, &paths.hermes_root, &paths.launch_agents_dir, false)
++        .map_err(|error| step_error("gateway-down", "cron cutover", error))?;
++    summary.pids_stopped = gateway.pids_terminated;
++    summary.plists_disabled = gateway.plists_disabled;
++
+     let cron_cutover = cutover_cron_stores(env, &paths.hermes_root, &pool, false)
+         .await
+-        .map_err(|error| step_error("cron cutover", "gateway-down", error))?;
++        .map_err(|error| step_error("cron cutover", "none", error))?;
+     summary.cron_stores = cron_cutover.stores;
+ 
+-    let gateway = bring_gateway_down(env, &paths.hermes_root, &paths.launch_agents_dir, false)
+-        .map_err(|error| step_error("gateway-down", "none", error))?;
+-    summary.pids_stopped = gateway.pids_terminated;
+-    summary.plists_disabled = gateway.plists_disabled;
+     Ok(summary)
+ }
+ 
+@@ -197,14 +198,22 @@ async fn project_migration(
+         .cloned()
+         .partition(|id| existing.contains(id));
+ 
++    let (pids_stopped, plists_disabled) = if !args.no_cutover {
++        let gateway = bring_gateway_down(env, &paths.hermes_root, &paths.launch_agents_dir, true)
++            .map_err(|error| {
++            step_error("gateway-down projection", "cron cutover projection", error)
++        })?;
++        (gateway.pids_terminated, gateway.plists_disabled)
++    } else {
++        (Vec::new(), Vec::new())
++    };
++
+     let cron_stores = if args.no_cutover {
+         Vec::new()
+     } else if let Some(pool) = pool.as_ref() {
+         let mut stores = cutover_cron_stores(env, &paths.hermes_root, pool, true)
+             .await
+-            .map_err(|error| {
+-                step_error("cron cutover projection", "gateway-down projection", error)
+-            })?
++            .map_err(|error| step_error("cron cutover projection", "none", error))?
+             .stores;
+         for store in &mut stores {
+             store.would_empty = store.jobs_found > 0;
+@@ -214,7 +223,7 @@ async fn project_migration(
+         projected_store_summaries(env, &paths.hermes_root)?
+     };
+ 
+-    let mut summary = MigrationSummary {
++    let summary = MigrationSummary {
+         dry_run: true,
+         database_would_be_created: pool.is_none(),
+         config_keys: config.values.len(),
+@@ -224,16 +233,9 @@ async fn project_migration(
+         cron_importable,
+         cron_already_present,
+         cron_stores,
+-        pids_stopped: Vec::new(),
+-        plists_disabled: Vec::new(),
++        pids_stopped,
++        plists_disabled,
+     };
+-
+-    if !args.no_cutover {
+-        let gateway = bring_gateway_down(env, &paths.hermes_root, &paths.launch_agents_dir, true)
+-            .map_err(|error| step_error("gateway-down projection", "none", error))?;
+-        summary.pids_stopped = gateway.pids_terminated;
+-        summary.plists_disabled = gateway.plists_disabled;
+-    }
+     Ok(summary)
+ }
+ 
+diff --git a/src/migrate/sys.rs b/src/migrate/sys.rs
+index c10df57..c6e498f 100644
+--- a/src/migrate/sys.rs
++++ b/src/migrate/sys.rs
+@@ -4,6 +4,8 @@ use fs2::FileExt;
+ use parking_lot::Mutex;
+ use std::collections::{HashMap, HashSet};
+ use std::fs::File;
++use std::io::Write;
++use std::os::unix::fs::OpenOptionsExt;
+ use std::path::{Path, PathBuf};
+ use std::process::Command;
+ use std::sync::Arc;
+@@ -23,6 +25,9 @@ pub enum MigrationOperation {
+     LockAcquired(PathBuf),
+     LockReleased(PathBuf),
+     PidAlive(i32),
++    ProcessStartTime(i32),
++    ProcessCommandLine(i32),
++    Bootout(Vec<String>),
+     Terminate(i32),
+     Kill(i32),
+     Sleep(Duration),
+@@ -35,8 +40,48 @@ pub trait MigrationEnv: Send + Sync {
+     fn read_to_string(&self, path: &Path) -> Result<String>;
+     fn read(&self, path: &Path) -> Result<Vec<u8>>;
+     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()>;
++    /// Create a private file exclusively, choosing a new suffix on collision.
++    fn write_unique(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
++        let _ = bytes;
++        Err(OmonError::Config(format!(
++            "exclusive migration writes unsupported for {}",
++            path.display()
++        )))
++    }
++
++    fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
++        let name = path.file_name().ok_or_else(|| {
++            OmonError::Config(format!("invalid migration target: {}", path.display()))
++        })?;
++        let temporary = path.with_file_name(format!(
++            ".{}.tmp-omon-migration-{}",
++            name.to_string_lossy(),
++            uuid::Uuid::new_v4()
++        ));
++        let temporary = self.write_unique(&temporary, bytes)?;
++        if let Err(error) = self.rename(&temporary, path) {
++            self.remove_file(&temporary).map_err(|cleanup| {
++                OmonError::Config(format!("{error}; temporary cleanup failed: {cleanup}"))
++            })?;
++            return Err(error);
++        }
++        Ok(())
++    }
+     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+     fn remove_file(&self, path: &Path) -> Result<()>;
++    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
++        let mut normalized = PathBuf::new();
++        for comp in path.components() {
++            match comp {
++                std::path::Component::ParentDir => {
++                    normalized.pop();
++                }
++                std::path::Component::CurDir => {}
++                c => normalized.push(c),
++            }
++        }
++        Ok(normalized)
++    }
+     fn acquire_jobs_lock(&self, path: &Path) -> Result<Box<dyn MigrationLock>>;
+     fn exists(&self, path: &Path) -> bool;
+     fn is_file(&self, path: &Path) -> bool;
+@@ -48,6 +93,14 @@ pub trait MigrationEnv: Send + Sync {
+     fn now(&self) -> DateTime<Utc>;
+ 
+     fn pid_alive(&self, pid: i32) -> bool;
++    /// Unknown identity never authorizes a signal.
++    fn process_start_time(&self, _pid: i32) -> Result<Option<u64>> {
++        Ok(None)
++    }
++    /// Live command-line probe; unknown identity never authorizes a signal.
++    fn process_command_line(&self, _pid: i32) -> Result<Option<String>> {
++        Ok(None)
++    }
+     fn terminate(&self, pid: i32) -> Result<()>;
+     fn kill(&self, pid: i32) -> Result<()>;
+     fn sleep(&self, duration: Duration);
+@@ -55,6 +108,253 @@ pub trait MigrationEnv: Send + Sync {
+     fn run_launchctl(&self, args: &[&str]) -> Result<LaunchctlOutput>;
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum WaitNotification {
++    Exited,
++    TimedOut,
++}
++
++#[cfg(target_os = "macos")]
++struct KqueueFd(libc::c_int);
++
++#[cfg(target_os = "macos")]
++impl KqueueFd {
++    fn new() -> Result<Self> {
++        let fd = unsafe { libc::kqueue() };
++        if fd < 0 {
++            Err(OmonError::Config(format!(
++                "kqueue creation failed: {}",
++                std::io::Error::last_os_error()
++            )))
++        } else {
++            Ok(Self(fd))
++        }
++    }
++
++    fn raw(&self) -> libc::c_int {
++        self.0
++    }
++}
++
++#[cfg(target_os = "macos")]
++impl Drop for KqueueFd {
++    fn drop(&mut self) {
++        if self.0 >= 0 {
++            unsafe {
++                libc::close(self.0);
++            }
++        }
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn default_wait_exit_notification(child_pid: i32, timeout: Duration) -> Result<WaitNotification> {
++    let kq = KqueueFd::new()?;
++
++    let ke = libc::kevent {
++        ident: child_pid as usize,
++        filter: libc::EVFILT_PROC,
++        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
++        fflags: libc::NOTE_EXIT,
++        data: 0,
++        udata: std::ptr::null_mut(),
++    };
++
++    let reg = unsafe { libc::kevent(kq.raw(), &ke, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
++
++    if reg < 0 {
++        let err = std::io::Error::last_os_error();
++        if err.raw_os_error() == Some(libc::ESRCH) {
++            return Ok(WaitNotification::Exited);
++        }
++        return Err(OmonError::Config(format!(
++            "failed to register kqueue for pid {child_pid}: {err}"
++        )));
++    }
++
++    let ts = libc::timespec {
++        tv_sec: timeout.as_secs() as _,
++        tv_nsec: timeout.subsec_nanos() as _,
++    };
++    let mut out_event = std::mem::MaybeUninit::<libc::kevent>::uninit();
++    let n = unsafe {
++        libc::kevent(
++            kq.raw(),
++            std::ptr::null(),
++            0,
++            out_event.as_mut_ptr(),
++            1,
++            &ts,
++        )
++    };
++    if n < 0 {
++        return Err(OmonError::Config(format!(
++            "kevent wait failed for pid {child_pid}: {}",
++            std::io::Error::last_os_error()
++        )));
++    }
++    if n == 0 {
++        return Ok(WaitNotification::TimedOut);
++    }
++
++    // SAFETY: n == 1, kevent populated out_event
++    let ev = unsafe { out_event.assume_init() };
++    if ev.flags & libc::EV_ERROR != 0 {
++        return Err(OmonError::Config(format!(
++            "kevent event error for pid {child_pid}: {}",
++            std::io::Error::from_raw_os_error(ev.data as i32)
++        )));
++    }
++    let ev_ident = ev.ident;
++    let ev_filter = ev.filter;
++    if ev_ident != child_pid as usize || ev_filter != libc::EVFILT_PROC {
++        return Err(OmonError::Config(format!(
++            "unexpected kevent for pid {child_pid}: ident {ev_ident} filter {ev_filter}"
++        )));
++    }
++    Ok(WaitNotification::Exited)
++}
++
++#[cfg(not(target_os = "macos"))]
++fn default_wait_exit_notification(child_pid: i32, timeout: Duration) -> Result<WaitNotification> {
++    let start = std::time::Instant::now();
++    loop {
++        if unsafe { libc::kill(child_pid, 0) != 0 } {
++            return Ok(WaitNotification::Exited);
++        }
++        if start.elapsed() >= timeout {
++            return Ok(WaitNotification::TimedOut);
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    }
++}
++
++fn run_command_with_timeout(cmd: Command, timeout: Duration) -> Result<std::process::Output> {
++    run_command_with_timeout_impl(cmd, timeout, default_wait_exit_notification)
++}
++
++#[cfg(test)]
++fn run_command_with_timeout_injected(
++    cmd: Command,
++    timeout: Duration,
++    notifier: impl FnOnce(i32, Duration) -> Result<WaitNotification>,
++) -> Result<std::process::Output> {
++    run_command_with_timeout_impl(cmd, timeout, notifier)
++}
++
++fn run_command_with_timeout_impl(
++    mut cmd: Command,
++    timeout: Duration,
++    notifier: impl FnOnce(i32, Duration) -> Result<WaitNotification>,
++) -> Result<std::process::Output> {
++    cmd.stdout(std::process::Stdio::piped())
++        .stderr(std::process::Stdio::piped());
++
++    let mut child = cmd
++        .spawn()
++        .map_err(|error| OmonError::Config(format!("failed to spawn command: {error}")))?;
++
++    let child_pid = child.id() as i32;
++    let stdout = child.stdout.take();
++    let stderr = child.stderr.take();
++
++    let stdout_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
++        let mut out = Vec::new();
++        if let Some(mut s) = stdout {
++            std::io::Read::read_to_end(&mut s, &mut out)?;
++        }
++        Ok(out)
++    });
++
++    let stderr_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
++        let mut err = Vec::new();
++        if let Some(mut s) = stderr {
++            std::io::Read::read_to_end(&mut s, &mut err)?;
++        }
++        Ok(err)
++    });
++
++    let wait_notification = notifier(child_pid, timeout);
++
++    let exit_status = match wait_notification {
++        Ok(WaitNotification::Exited) => child.wait().map_err(|e| {
++            OmonError::Config(format!("failed to wait on exited pid {child_pid}: {e}"))
++        }),
++        Ok(WaitNotification::TimedOut) => {
++            let kill_res = child.kill();
++            let wait_res = child.wait();
++            let mut errors = vec![format!(
++                "command pid {child_pid} timed out after {timeout:?}"
++            )];
++            if let Err(e) = kill_res {
++                if e.kind() != std::io::ErrorKind::NotFound
++                    && e.kind() != std::io::ErrorKind::InvalidInput
++                {
++                    errors.push(format!(
++                        "failed to kill timed out command pid {child_pid}: {e}"
++                    ));
++                }
++            }
++            if let Err(e) = wait_res {
++                errors.push(format!(
++                    "failed to reap killed command pid {child_pid}: {e}"
++                ));
++            }
++            Err(OmonError::Config(errors.join("; ")))
++        }
++        Err(notifier_err) => {
++            let kill_res = child.kill();
++            let wait_res = child.wait();
++            let mut errors = vec![notifier_err.to_string()];
++            if let Err(e) = kill_res {
++                if e.kind() != std::io::ErrorKind::NotFound
++                    && e.kind() != std::io::ErrorKind::InvalidInput
++                {
++                    errors.push(format!("failed to kill command pid {child_pid}: {e}"));
++                }
++            }
++            if let Err(e) = wait_res {
++                errors.push(format!("failed to reap command pid {child_pid}: {e}"));
++            }
++            Err(OmonError::Config(errors.join("; ")))
++        }
++    };
++
++    let stdout_join = stdout_reader.join();
++    let stderr_join = stderr_reader.join();
++
++    let stdout_res = stdout_join
++        .map_err(|_| OmonError::Config("stdout reader thread panicked".into()))
++        .and_then(|r| r.map_err(|e| OmonError::Config(format!("failed to read stdout: {e}"))));
++    let stderr_res = stderr_join
++        .map_err(|_| OmonError::Config("stderr reader thread panicked".into()))
++        .and_then(|r| r.map_err(|e| OmonError::Config(format!("failed to read stderr: {e}"))));
++
++    let status = match exit_status {
++        Ok(status) => status,
++        Err(err) => {
++            let mut msgs = vec![err.to_string()];
++            if let Err(e) = stdout_res {
++                msgs.push(e.to_string());
++            }
++            if let Err(e) = stderr_res {
++                msgs.push(e.to_string());
++            }
++            return Err(OmonError::Config(msgs.join("; ")));
++        }
++    };
++
++    match (stdout_res, stderr_res) {
++        (Ok(stdout), Ok(stderr)) => Ok(std::process::Output {
++            status,
++            stdout,
++            stderr,
++        }),
++        (Err(e1), Err(e2)) => Err(OmonError::Config(format!("{e1}; {e2}"))),
++        (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
++    }
++}
++
+ #[derive(Debug, Default, Clone, Copy)]
+ pub struct OsEnv;
+ 
+@@ -69,6 +369,78 @@ impl Drop for OsMigrationLock {
+ }
+ 
+ impl MigrationEnv for OsEnv {
++    fn process_start_time(&self, pid: i32) -> Result<Option<u64>> {
++        #[cfg(target_os = "macos")]
++        {
++            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
++            let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
++                .map_err(|error| OmonError::Config(error.to_string()))?;
++            // SAFETY: the kernel receives an aligned writable buffer of exactly size bytes.
++            let read = unsafe {
++                libc::proc_pidinfo(
++                    pid,
++                    libc::PROC_PIDTBSDINFO,
++                    0,
++                    info.as_mut_ptr().cast(),
++                    size,
++                )
++            };
++            if read != size {
++                return Err(OmonError::Config(format!(
++                    "cannot identify pid {pid}: {}",
++                    std::io::Error::last_os_error()
++                )));
++            }
++            // SAFETY: proc_pidinfo returned the full initialized proc_bsdinfo structure.
++            let info = unsafe { info.assume_init() };
++            // Hermes uses round(psutil.create_time() * 100), including ties-to-even.
++            let epoch = info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1_000_000.0;
++            Ok(Some((epoch * 100.0).round_ties_even() as u64))
++        }
++        #[cfg(not(target_os = "macos"))]
++        {
++            let _ = pid;
++            Err(OmonError::Config(
++                "verified process retirement requires macOS".into(),
++            ))
++        }
++    }
++
++    fn process_command_line(&self, pid: i32) -> Result<Option<String>> {
++        #[cfg(unix)]
++        {
++            let candidates = ["/bin/ps", "/usr/bin/ps"];
++            let ps_bin = candidates
++                .iter()
++                .find(|p| Path::new(p).is_file())
++                .copied()
++                .ok_or_else(|| {
++                    OmonError::Config(
++                        "trusted ps binary not found at /bin/ps or /usr/bin/ps".into(),
++                    )
++                })?;
++            let mut cmd = Command::new(ps_bin);
++            cmd.args(["-p", &pid.to_string(), "-o", "command="]);
++            match run_command_with_timeout(cmd, Duration::from_secs(5)) {
++                Ok(out) if out.status.success() => {
++                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
++                    if text.is_empty() {
++                        Ok(None)
++                    } else {
++                        Ok(Some(text))
++                    }
++                }
++                Ok(_) => Ok(None),
++                Err(error) => Err(error),
++            }
++        }
++        #[cfg(not(unix))]
++        {
++            let _ = pid;
++            Ok(None)
++        }
++    }
++
+     fn read_to_string(&self, path: &Path) -> Result<String> {
+         std::fs::read_to_string(path).map_err(|error| fs_error("read", path, error))
+     }
+@@ -78,7 +450,37 @@ impl MigrationEnv for OsEnv {
+     }
+ 
+     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+-        std::fs::write(path, bytes).map_err(|error| fs_error("write", path, error))
++        self.write_atomic(path, bytes)
++    }
++
++    fn write_unique(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
++        let mut candidate = path.to_path_buf();
++        loop {
++            let opened = File::options()
++                .write(true)
++                .create_new(true)
++                .mode(0o600)
++                .open(&candidate);
++            match opened {
++                Ok(mut file) => {
++                    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
++                        self.remove_file(&candidate).map_err(|cleanup| {
++                            OmonError::Config(format!(
++                                "{error}; partial file cleanup failed: {cleanup}"
++                            ))
++                        })?;
++                        return Err(fs_error("write", &candidate, error));
++                    }
++                    return Ok(candidate);
++                }
++                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
++                    let mut name = path.as_os_str().to_os_string();
++                    name.push(format!("-{}", uuid::Uuid::new_v4()));
++                    candidate = PathBuf::from(name);
++                }
++                Err(error) => return Err(fs_error("create", &candidate, error)),
++            }
++        }
+     }
+ 
+     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+@@ -99,6 +501,26 @@ impl MigrationEnv for OsEnv {
+         }
+     }
+ 
++    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
++        if path.exists() {
++            std::fs::canonicalize(path).map_err(|error| fs_error("canonicalize", path, error))
++        } else if let Some(parent) = path.parent() {
++            if parent.exists() {
++                let canonical_parent = std::fs::canonicalize(parent)
++                    .map_err(|error| fs_error("canonicalize parent of", path, error))?;
++                if let Some(file_name) = path.file_name() {
++                    Ok(canonical_parent.join(file_name))
++                } else {
++                    Ok(canonical_parent)
++                }
++            } else {
++                Ok(path.to_path_buf())
++            }
++        } else {
++            Ok(path.to_path_buf())
++        }
++    }
++
+     fn acquire_jobs_lock(&self, path: &Path) -> Result<Box<dyn MigrationLock>> {
+         let file = File::options()
+             .create(true)
+@@ -206,6 +628,8 @@ pub struct FakeMigrationEnv {
+     now: Mutex<DateTime<Utc>>,
+     current_uid: Mutex<u32>,
+     alive_pids: Mutex<HashSet<i32>>,
++    process_starts: Mutex<HashMap<i32, u64>>,
++    process_cmdlines: Mutex<HashMap<i32, String>>,
+     pid_death_after_sleeps: Mutex<HashMap<i32, usize>>,
+     operations: Arc<Mutex<Vec<MigrationOperation>>>,
+     terminate_calls: Mutex<Vec<i32>>,
+@@ -215,6 +639,7 @@ pub struct FakeMigrationEnv {
+     launchctl_calls: Mutex<Vec<Vec<String>>>,
+     launchctl_response: Mutex<LaunchctlOutput>,
+     launchctl_error: Mutex<Option<String>>,
++    aliases: Mutex<HashMap<PathBuf, PathBuf>>,
+ }
+ 
+ impl FakeMigrationEnv {
+@@ -226,6 +651,8 @@ impl FakeMigrationEnv {
+             now: Mutex::new(now),
+             current_uid: Mutex::new(0),
+             alive_pids: Mutex::new(HashSet::new()),
++            process_starts: Mutex::new(HashMap::new()),
++            process_cmdlines: Mutex::new(HashMap::new()),
+             pid_death_after_sleeps: Mutex::new(HashMap::new()),
+             operations: Arc::new(Mutex::new(Vec::new())),
+             terminate_calls: Mutex::new(Vec::new()),
+@@ -239,9 +666,14 @@ impl FakeMigrationEnv {
+                 stderr: String::new(),
+             }),
+             launchctl_error: Mutex::new(None),
++            aliases: Mutex::new(HashMap::new()),
+         }
+     }
+ 
++    pub fn add_alias(&self, from: impl Into<PathBuf>, to: impl Into<PathBuf>) {
++        self.aliases.lock().insert(from.into(), to.into());
++    }
++
+     pub fn set_now(&self, now: DateTime<Utc>) {
+         *self.now.lock() = now;
+     }
+@@ -259,9 +691,18 @@ impl FakeMigrationEnv {
+     }
+ 
+     pub fn set_pid_death_after_sleeps(&self, pid: i32, sleeps: usize) {
++        // Virtual-clock fixture: no wall-clock waiting.
+         self.pid_death_after_sleeps.lock().insert(pid, sleeps);
+     }
+ 
++    pub fn set_process_start_time(&self, pid: i32, start_time: u64) {
++        self.process_starts.lock().insert(pid, start_time);
++    }
++
++    pub fn set_process_command_line(&self, pid: i32, cmdline: impl Into<String>) {
++        self.process_cmdlines.lock().insert(pid, cmdline.into());
++    }
++
+     pub fn operations(&self) -> Vec<MigrationOperation> {
+         self.operations.lock().clone()
+     }
+@@ -344,6 +785,41 @@ impl Drop for FakeMigrationLock {
+ }
+ 
+ impl MigrationEnv for FakeMigrationEnv {
++    fn process_start_time(&self, pid: i32) -> Result<Option<u64>> {
++        self.operations
++            .lock()
++            .push(MigrationOperation::ProcessStartTime(pid));
++        Ok(self.process_starts.lock().get(&pid).copied())
++    }
++
++    fn process_command_line(&self, pid: i32) -> Result<Option<String>> {
++        self.operations
++            .lock()
++            .push(MigrationOperation::ProcessCommandLine(pid));
++        Ok(self.process_cmdlines.lock().get(&pid).cloned())
++    }
++
++    fn write_unique(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
++        self.ensure_writable(path)?;
++        let mut candidate = path.to_path_buf();
++        let mut files = self.files.lock();
++        while files.contains_key(&candidate) {
++            let mut name = path.as_os_str().to_os_string();
++            name.push(format!("-{}", uuid::Uuid::new_v4()));
++            candidate = PathBuf::from(name);
++        }
++        files.insert(candidate.clone(), bytes.to_vec());
++        drop(files);
++        self.record_parent_directories(&candidate);
++        self.write_calls
++            .lock()
++            .push((candidate.clone(), bytes.to_vec()));
++        self.operations
++            .lock()
++            .push(MigrationOperation::Write(candidate.clone()));
++        Ok(candidate)
++    }
++
+     fn read_to_string(&self, path: &Path) -> Result<String> {
+         String::from_utf8(self.read(path)?).map_err(|error| {
+             OmonError::Config(format!(
+@@ -399,6 +875,24 @@ impl MigrationEnv for FakeMigrationEnv {
+         Ok(())
+     }
+ 
++    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
++        let mut normalized = PathBuf::new();
++        for comp in path.components() {
++            match comp {
++                std::path::Component::ParentDir => {
++                    normalized.pop();
++                }
++                std::path::Component::CurDir => {}
++                c => normalized.push(c),
++            }
++        }
++        if let Some(target) = self.aliases.lock().get(&normalized) {
++            Ok(target.clone())
++        } else {
++            Ok(normalized)
++        }
++    }
++
+     fn acquire_jobs_lock(&self, path: &Path) -> Result<Box<dyn MigrationLock>> {
+         self.operations
+             .lock()
+@@ -503,6 +997,9 @@ impl MigrationEnv for FakeMigrationEnv {
+         self.launchctl_calls
+             .lock()
+             .push(args.iter().map(|arg| (*arg).to_string()).collect());
++        self.operations.lock().push(MigrationOperation::Bootout(
++            args.iter().map(|arg| (*arg).to_owned()).collect(),
++        ));
+         if let Some(message) = self.launchctl_error.lock().clone() {
+             Err(OmonError::Config(message))
+         } else {
+@@ -513,10 +1010,16 @@ impl MigrationEnv for FakeMigrationEnv {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{FakeMigrationEnv, LaunchctlOutput, MigrationEnv, OsEnv};
++    use super::{
++        run_command_with_timeout, run_command_with_timeout_injected, FakeMigrationEnv,
++        LaunchctlOutput, MigrationEnv, OsEnv,
++    };
++    use crate::OmonError;
+     use chrono::{TimeZone, Utc};
+     use std::any::{type_name, type_name_of_val};
+     use std::path::Path;
++    use std::process::Command;
++    use std::time::Duration;
+ 
+     #[test]
+     fn fake_records_process_and_launchctl_calls_without_os_env() {
+@@ -617,4 +1120,129 @@ mod tests {
+         assert!(error.to_string().contains("read-only"));
+         assert!(env.write_calls().is_empty());
+     }
++
++    #[test]
++    fn subprocess_timeout_kills_and_reaps_owned_child() {
++        let temp = tempfile::tempdir().unwrap();
++        let signal_file = temp.path().join("started.txt");
++        let signal_path = signal_file.display().to_string();
++        let mut cmd = Command::new("/bin/sh");
++        cmd.args([
++            "-c",
++            &format!("echo started > '{signal_path}' && exec sleep 5"),
++        ]);
++        let start = std::time::Instant::now();
++        let result = run_command_with_timeout(cmd, Duration::from_millis(200));
++        let elapsed = start.elapsed();
++        assert!(result.is_err(), "expected timeout error, got {result:?}");
++        let err_msg = result.unwrap_err().to_string();
++        assert!(
++            err_msg.contains("timed out"),
++            "expected timeout message, got {err_msg}"
++        );
++        assert!(
++            elapsed < Duration::from_secs(2),
++            "elapsed {elapsed:?} exceeded bounded timeout"
++        );
++        assert!(
++            signal_file.exists(),
++            "child should have signaled start before holding"
++        );
++
++        let pid_str = err_msg
++            .split("command pid ")
++            .nth(1)
++            .and_then(|s| s.split_whitespace().next())
++            .unwrap();
++        let child_pid: i32 = pid_str.parse().unwrap();
++        #[cfg(unix)]
++        {
++            let ret = unsafe { libc::kill(child_pid, 0) };
++            assert_ne!(ret, 0, "child pid {child_pid} should have been reaped");
++        }
++    }
++
++    #[test]
++    fn subprocess_injected_notifier_failure_kills_and_reaps_child_without_hang() {
++        let mut cmd = Command::new("/bin/sh");
++        cmd.args(["-c", "exec cat"]);
++        cmd.stdin(std::process::Stdio::piped());
++
++        let (pid_tx, pid_rx) = std::sync::mpsc::channel();
++        let (res_tx, res_rx) = std::sync::mpsc::channel();
++        let start = std::time::Instant::now();
++
++        let test_thread = std::thread::spawn(move || {
++            let res =
++                run_command_with_timeout_injected(cmd, Duration::from_secs(5), |pid, _timeout| {
++                    let _ = pid_tx.send(pid);
++                    Err(OmonError::Config(format!(
++                        "injected notifier failure for pid {pid}"
++                    )))
++                });
++            let _ = res_tx.send(res);
++        });
++
++        let child_pid = pid_rx
++            .recv_timeout(Duration::from_secs(2))
++            .expect("notifier should observe child pid immediately after spawn");
++
++        let result = res_rx.recv_timeout(Duration::from_secs(2)).expect(
++            "run_command_with_timeout_injected should complete without hanging on reader join",
++        );
++        let elapsed = start.elapsed();
++
++        test_thread
++            .join()
++            .expect("test runner thread should join cleanly");
++
++        assert!(
++            result.is_err(),
++            "expected error from injected notifier failure"
++        );
++        assert!(
++            elapsed < Duration::from_secs(2),
++            "elapsed {elapsed:?} should be bounded and not hang"
++        );
++        let err_msg = result.unwrap_err().to_string();
++        assert!(
++            err_msg.contains(&format!("injected notifier failure for pid {child_pid}")),
++            "error should contain notifier message: {err_msg}"
++        );
++        #[cfg(unix)]
++        {
++            let ret = unsafe { libc::kill(child_pid, 0) };
++            assert_ne!(
++                ret, 0,
++                "child pid {child_pid} should have been reaped, not leaked"
++            );
++        }
++    }
++
++    #[test]
++    fn subprocess_simultaneous_large_stdout_stderr_does_not_deadlock() {
++        let mut cmd = Command::new("/bin/sh");
++        cmd.args(["-c", "printf '%131072s' E >&2; printf '%131072s' O"]);
++        let output = run_command_with_timeout(cmd, Duration::from_secs(2))
++            .expect("should not deadlock on simultaneous large stderr/stdout");
++        assert_eq!(output.stdout.len(), 131072);
++        assert_eq!(output.stderr.len(), 131072);
++        assert_eq!(output.stdout.last(), Some(&b'O'));
++        assert_eq!(output.stderr.last(), Some(&b'E'));
++        assert!(output.status.success());
++    }
++
++    #[test]
++    fn os_env_reads_self_command_line() {
++        let env = OsEnv;
++        let self_pid = std::process::id() as i32;
++        let cmd = env.process_command_line(self_pid).unwrap();
++        assert!(cmd.is_some(), "expected to read self command line");
++        let cmd = cmd.unwrap();
++        assert!(!cmd.is_empty());
++        assert!(
++            !crate::migrate::gateway_down::looks_like_gateway_runtime_command_line(&cmd),
++            "test runner should not look like gateway runtime: {cmd}"
++        );
++    }
+ }
+diff --git a/tests/test_migrate.rs b/tests/test_migrate.rs
+index 47e53f8..7752f88 100644
+--- a/tests/test_migrate.rs
++++ b/tests/test_migrate.rs
+@@ -8,8 +8,143 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+ 
++#[test]
++fn secret_files_are_private_and_backup_unique() {
++    use omon_gateway::migrate::config_import::import_config;
++    use omon_gateway::migrate::sys::OsEnv;
++    use std::os::unix::fs::PermissionsExt;
++
++    let dir = tempfile::tempdir().unwrap();
++    let root = dir.path();
++    let target = root.join("gateway.env");
++    let original = b"DEFAULT_MODEL=old\n";
++    fs::write(
++        root.join("config.yaml"),
++        "model:\n  default: new\n  api_key: sentinel-private\n",
++    )
++    .unwrap();
++    fs::write(&target, original).unwrap();
++    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
++    let old_inode = root.join("old-inode");
++    fs::hard_link(&target, &old_inode).unwrap();
++    let imported = import_config(&OsEnv, root, &target, false).unwrap();
++    let backup = imported.backup_path.unwrap();
++    let target_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
++    let backup_mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
++    let atomic = fs::read(&old_inode).unwrap() == original;
++
++    let env = FakeMigrationEnv::new(Utc.with_ymd_and_hms(2026, 9, 5, 12, 0, 0).unwrap());
++    env.write(&root.join("config.yaml"), b"model:\n  default: new\n")
++        .unwrap();
++    env.write(&target, original).unwrap();
++    let first = import_config(&env, root, &target, false)
++        .unwrap()
++        .backup_path
++        .unwrap();
++    let intermediate = env.read(&target).unwrap();
++    let second = import_config(&env, root, &target, false)
++        .unwrap()
++        .backup_path
++        .unwrap();
++    let unique = first != second
++        && env.read(&first).unwrap() == original
++        && env.read(&second).unwrap() == intermediate;
++    env.set_read_only(&target, true);
++    let failed = import_config(&env, root, &target, false).is_err();
++    let intact = env.read(&target).unwrap() == intermediate;
++    let no_temps = env
++        .read_dir(root)
++        .unwrap()
++        .iter()
++        .all(|p| !p.to_string_lossy().contains(".tmp-omon-migration-"));
++    println!("C05 target_mode={target_mode:o} backup_mode={backup_mode:o} atomic={atomic} unique={unique} failed={failed} intact={intact} no_temps={no_temps}");
++    assert!(
++        target_mode == 0o600
++            && backup_mode == 0o600
++            && atomic
++            && unique
++            && failed
++            && intact
++            && no_temps
++    );
++}
++
+ const JOBS: &str = r#"{"jobs":[{"id":"daily","name":"Daily","prompt":"status","schedule":{"kind":"cron","expr":"0 9 * * *"},"enabled":true}],"updated_at":"old"}"#;
+ 
++#[tokio::test]
++async fn private_migration_os_surface_controls() {
++    use omon_gateway::migrate::sys::OsEnv;
++    use std::os::unix::fs::{symlink, PermissionsExt};
++    let dir = tempfile::tempdir().unwrap();
++    let root = dir.path();
++    fs::create_dir(root.join("cron")).unwrap();
++    fs::write(root.join("cron/jobs.json"), JOBS).unwrap();
++    fs::write(
++        root.join("config.yaml"),
++        "model:\n  default: new\n  api_key: sentinel\n",
++    )
++    .unwrap();
++    let database = Database::connect("sqlite::memory:").await.unwrap();
++    let summary = run_migrate_with(
++        MigrateArgs {
++            dry_run: false,
++            no_cutover: false,
++        },
++        &OsEnv,
++        MigrationPaths {
++            hermes_root: root.to_owned(),
++            target_env: root.join("gateway.env"),
++            launch_agents_dir: root.join("absent-agents"),
++        },
++        Some(database.pool().clone()),
++    )
++    .await
++    .unwrap();
++    assert_eq!(summary.cron_imported, 1);
++    assert!(summary.pids_stopped.is_empty());
++    let cron_backup = fs::read_dir(root.join("cron"))
++        .unwrap()
++        .map(|e| e.unwrap().path())
++        .find(|p| p.to_string_lossy().contains(".bak-omon-migration-"))
++        .unwrap();
++    assert_eq!(fs::read(&cron_backup).unwrap(), JOBS.as_bytes());
++    for path in [
++        root.join("gateway.env"),
++        root.join("cron/jobs.json"),
++        cron_backup,
++    ] {
++        assert_eq!(
++            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
++            0o600
++        );
++    }
++    let occupied = root.join("occupied");
++    let sentinel = root.join("sentinel");
++    fs::write(&sentinel, b"untouched").unwrap();
++    symlink(&sentinel, &occupied).unwrap();
++    let first = OsEnv.write_unique(&occupied, b"first").unwrap();
++    let second = OsEnv.write_unique(&occupied, b"second").unwrap();
++    assert_ne!(first, second);
++    assert_eq!(fs::read(first).unwrap(), b"first");
++    assert_eq!(fs::read(second).unwrap(), b"second");
++    assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
++    let blocked = root.join("blocked");
++    fs::create_dir(&blocked).unwrap();
++    fs::write(blocked.join("original"), b"original").unwrap();
++    assert!(OsEnv.write_atomic(&blocked, b"replacement").is_err());
++    assert_eq!(fs::read(blocked.join("original")).unwrap(), b"original");
++    for directory in [root.to_owned(), root.join("cron")] {
++        assert!(fs::read_dir(directory).unwrap().all(|e| !e
++            .unwrap()
++            .file_name()
++            .to_string_lossy()
++            .contains(".tmp-omon-migration-")));
++    }
++    database.pool().close().await;
++    dir.close().unwrap();
++    println!("OsEnv full migration: private config/cron/backup; exclusive symlink collision; failed rename cleanup; fixture removed");
++}
++
+ struct Fixture {
+     root: PathBuf,
+     target_env: PathBuf,
+@@ -69,10 +204,12 @@ fn seed_fake(env: &FakeMigrationEnv, fixture: &Fixture, include_cutover: bool) {
+     if include_cutover {
+         env.write(
+             &fixture.root.join("gateway.lock"),
+-            br#"{"pid":4242,"kind":"hermes-gateway"}"#,
++            br#"{"pid":4242,"kind":"hermes-gateway","start_time":1}"#,
+         )
+         .unwrap();
+         env.set_pid_alive(4242, true);
++        env.set_process_start_time(4242, 1);
++        env.set_process_command_line(4242, "python3 -m hermes_cli.main gateway run");
+         env.set_current_uid(501);
+         env.write(
+             &fixture.launch_agents.join("ai.hermes.gateway.plist"),
+@@ -215,3 +352,502 @@ async fn dry_run_without_database_reports_creation_without_creating_it() {
+     assert_eq!(env.write_calls(), writes_before);
+     assert!(!Path::new(&fixture.root.join("missing.db")).exists());
+ }
++
++#[tokio::test]
++async fn cutover_survives_startup_sync() {
++    use omon_gateway::cron::{
++        CronAuthority, CronScheduler, HermesStore, HermesStoreSynchronizer, PayloadTaskExecutor,
++    };
++    use std::sync::Arc;
++
++    let fixture = Fixture::new();
++    let env = FakeMigrationEnv::new(Utc.with_ymd_and_hms(2026, 8, 15, 15, 0, 0).unwrap());
++    seed_fake(&env, &fixture, true);
++    let database = Database::connect("sqlite::memory:").await.unwrap();
++
++    let summary = run_migrate_with(
++        MigrateArgs {
++            dry_run: false,
++            no_cutover: false,
++        },
++        &env,
++        fixture.paths(),
++        Some(database.pool().clone()),
++    )
++    .await
++    .unwrap();
++
++    assert_eq!(summary.cron_imported, 1);
++    let imported_count: i64 =
++        sqlx::query_scalar("SELECT COUNT(*) FROM cron_jobs WHERE id = 'hermes:default:daily'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(imported_count, 1, "job must be present after migration");
++
++    // Verify authority is omon_owned after successful cutover
++    let authority: String =
++        sqlx::query_scalar("SELECT authority FROM cron_jobs WHERE id = 'hermes:default:daily'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(
++        authority, "omon_owned",
++        "cutover job must have omon_owned authority"
++    );
++
++    // Verify source provenance is strictly retained
++    let payload: String =
++        sqlx::query_scalar("SELECT payload_json FROM cron_jobs WHERE id = 'hermes:default:daily'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert!(
++        payload.contains("_omon_hermes_source"),
++        "_omon_hermes_source provenance must not be erased"
++    );
++    assert!(payload.contains("status"), "payload prompt must be status");
++
++    // Cutover emptied the store in migration env; persist empty store to fixture file for production synchronizer
++    let emptied = env.read(&fixture.root.join("cron/jobs.json")).unwrap();
++    fs::write(fixture.root.join("cron/jobs.json"), &emptied).unwrap();
++
++    // Production synchronizer runs on startup against the emptied store
++    let synchronizer = HermesStoreSynchronizer::new(
++        database.pool().clone(),
++        vec![HermesStore::new("default", &fixture.root)],
++    );
++
++    // Startup sync 1
++    let sync1_imported = synchronizer.sync().await.unwrap();
++    assert_eq!(sync1_imported, 0);
++    let count_after_sync1: i64 =
++        sqlx::query_scalar("SELECT COUNT(*) FROM cron_jobs WHERE id = 'hermes:default:daily'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    println!("C01 RED check: count after migrate = {imported_count}, count after startup sync = {count_after_sync1}");
++    assert_eq!(
++        count_after_sync1, 1,
++        "cutover owned job must survive first startup sync (RED: count 1 -> 0)"
++    );
++
++    // Startup sync 2 (TWO exact startup syncs retaining owned job)
++    let sync2_imported = synchronizer.sync().await.unwrap();
++    assert_eq!(sync2_imported, 0);
++    let count_after_sync2: i64 =
++        sqlx::query_scalar("SELECT COUNT(*) FROM cron_jobs WHERE id = 'hermes:default:daily'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(
++        count_after_sync2, 1,
++        "cutover owned job must survive second startup sync"
++    );
++
++    // Verify live source sync cannot overwrite omon_owned job
++    fs::write(
++        fixture.root.join("cron/jobs.json"),
++        br#"{"jobs":[{"id":"daily","prompt":"attempted-overwrite","schedule":{"kind":"cron","expr":"0 9 * * *"}}],"updated_at":"new"}"#,
++    )
++    .unwrap();
++    let sync_overwrite = synchronizer.sync().await.unwrap();
++    assert_eq!(
++        sync_overwrite, 0,
++        "live sync must not overwrite omon_owned row"
++    );
++    let payload_after_sync: String =
++        sqlx::query_scalar("SELECT payload_json FROM cron_jobs WHERE id = 'hermes:default:daily'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert!(
++        payload_after_sync.contains("status"),
++        "payload must not be overwritten by live sync"
++    );
++    // Restore empty store
++    fs::write(fixture.root.join("cron/jobs.json"), &emptied).unwrap();
++
++    // Actual due-job claim via scheduler (no Discord)
++    let past = Utc::now() - chrono::Duration::seconds(120);
++    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = 'hermes:default:daily'")
++        .bind(past)
++        .execute(database.pool())
++        .await
++        .unwrap();
++
++    let scheduler = CronScheduler::new(database.pool().clone(), Arc::new(PayloadTaskExecutor));
++    let claimed = scheduler.run_due_jobs().await.unwrap();
++    assert_eq!(
++        claimed, 1,
++        "due cutover owned job must be claimed by scheduler"
++    );
++
++    // Verify pending authority blocks scheduler claims atomically (scheduled + manual trigger)
++    scheduler
++        .set_authority("hermes:default:daily", CronAuthority::CutoverPending)
++        .await
++        .unwrap();
++    assert_eq!(
++        scheduler
++            .get_authority("hermes:default:daily")
++            .await
++            .unwrap(),
++        Some(CronAuthority::CutoverPending)
++    );
++
++    // Scheduled run must ignore cutover_pending
++    sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = 'hermes:default:daily'")
++        .bind(past)
++        .execute(database.pool())
++        .await
++        .unwrap();
++    // Also complete or clear any running run from previous claim so status is not blocked by active lease
++    sqlx::query("UPDATE cron_runs SET status = 'succeeded' WHERE job_id = 'hermes:default:daily'")
++        .execute(database.pool())
++        .await
++        .unwrap();
++
++    let claimed_pending = scheduler.run_due_jobs().await.unwrap();
++    assert_eq!(
++        claimed_pending, 0,
++        "pending authority must block scheduled claims atomically"
++    );
++
++    // Manual trigger must also be blocked by cutover_pending
++    let triggered_pending = scheduler.trigger_job("hermes:default:daily").await.unwrap();
++    assert!(
++        !triggered_pending,
++        "pending authority must block manual trigger atomically"
++    );
++
++    // Restoring to omon_owned unblocks manual trigger
++    scheduler
++        .set_authority("hermes:default:daily", CronAuthority::OmonOwned)
++        .await
++        .unwrap();
++    let triggered_owned = scheduler.trigger_job("hermes:default:daily").await.unwrap();
++    assert!(triggered_owned, "omon_owned job unblocks manual trigger");
++
++    database.close().await;
++}
++
++#[tokio::test]
++async fn changed_payload_blocks_cutover() {
++    let fixture = Fixture::new();
++    let env = FakeMigrationEnv::new(Utc.with_ymd_and_hms(2026, 8, 15, 15, 0, 0).unwrap());
++    seed_fake(&env, &fixture, true);
++    let database = Database::connect("sqlite::memory:").await.unwrap();
++
++    // 1. Initial state: DB has daily job with prompt "old"
++    sqlx::query(
++        "INSERT INTO cron_jobs (id, expression, payload_json, enabled, authority)
++         VALUES ('hermes:default:daily', '0 9 * * *', '{\"id\":\"daily\",\"name\":\"Daily\",\"prompt\":\"old\",\"schedule\":{\"kind\":\"cron\",\"expr\":\"0 9 * * *\"}}', 1, 'hermes_mirror')",
++    )
++    .execute(database.pool())
++    .await
++    .unwrap();
++
++    // 2. Source store has same ID "daily", but prompt "new" before cutover read
++    let new_source = r#"{"jobs":[{"id":"daily","name":"Daily","prompt":"new","schedule":{"kind":"cron","expr":"0 9 * * *"},"enabled":true}],"updated_at":"new"}"#;
++    env.write(&fixture.root.join("cron/jobs.json"), new_source.as_bytes())
++        .unwrap();
++
++    // 3. Perform cutover
++    let cutover_result = omon_gateway::migrate::cron_cutover::cutover_cron_stores(
++        &env,
++        &fixture.root,
++        database.pool(),
++        false,
++    )
++    .await;
++
++    // GREEN: cutover must refuse due to changed payload without mutating source
++    assert!(
++        cutover_result.is_err(),
++        "cutover must refuse on changed payload"
++    );
++    let current_source = env
++        .read_to_string(&fixture.root.join("cron/jobs.json"))
++        .unwrap();
++    assert_eq!(
++        current_source, new_source,
++        "source store must be retained intact on payload mismatch (RED: emptied source with old DB)"
++    );
++    let db_payload: String =
++        sqlx::query_scalar("SELECT payload_json FROM cron_jobs WHERE id = 'hermes:default:daily'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert!(db_payload.contains("old"));
++}
++
++#[tokio::test]
++async fn cutover_second_store_failure_preserves_bytes_and_receipt() {
++    use omon_gateway::cron::{CronScheduler, PayloadTaskExecutor};
++    use omon_gateway::migrate::cron_cutover::reconcile_pending_cutover;
++    use omon_gateway::migrate::sys::MigrationOperation;
++    use std::sync::Arc;
++
++    let fixture = Fixture::new();
++    let env = FakeMigrationEnv::new(Utc.with_ymd_and_hms(2026, 8, 15, 15, 0, 0).unwrap());
++    seed_fake(&env, &fixture, true);
++    let database = Database::connect("sqlite::memory:").await.unwrap();
++
++    // 1. Setup two stores: default and work profile
++    let work_store = fixture.root.join("profiles/work/cron/jobs.json");
++    let work_jobs = r#"{"jobs":[{"id":"standup","name":"Standup","prompt":"standup-check","schedule":{"kind":"cron","expr":"0 10 * * *"},"enabled":true}],"updated_at":"old"}"#;
++    env.write(&work_store, work_jobs.as_bytes()).unwrap();
++
++    // Seed DB with matching canonical payloads for both jobs
++    sqlx::query(
++        "INSERT INTO cron_jobs (id, expression, payload_json, enabled, authority)
++         VALUES ('hermes:default:daily', '0 9 * * *', '{\"id\":\"daily\",\"name\":\"Daily\",\"prompt\":\"status\",\"schedule\":{\"kind\":\"cron\",\"expr\":\"0 9 * * *\"},\"enabled\":true}', 1, 'hermes_mirror')",
++    )
++    .execute(database.pool())
++    .await
++    .unwrap();
++
++    sqlx::query(
++        "INSERT INTO cron_jobs (id, expression, payload_json, enabled, authority)
++         VALUES ('hermes:work:standup', '0 10 * * *', '{\"id\":\"standup\",\"name\":\"Standup\",\"prompt\":\"standup-check\",\"schedule\":{\"kind\":\"cron\",\"expr\":\"0 10 * * *\"},\"enabled\":true}', 1, 'hermes_mirror')",
++    )
++    .execute(database.pool())
++    .await
++    .unwrap();
++
++    // 2. Inject failure on second store rewrite by making work_store path read-only
++    env.set_read_only(&work_store, true);
++
++    // 3. Run full cutover via run_migrate_with
++    let result = run_migrate_with(
++        MigrateArgs {
++            dry_run: false,
++            no_cutover: false,
++        },
++        &env,
++        fixture.paths(),
++        Some(database.pool().clone()),
++    )
++    .await;
++
++    assert!(
++        result.is_err(),
++        "cutover must fail on injected second-store failure"
++    );
++
++    // 4. Assert operation ordering in FakeMigrationEnv
++    let operations = env.operations();
++    let bootout_idx = operations
++        .iter()
++        .position(|op| matches!(op, MigrationOperation::Bootout(_)))
++        .expect("gateway bootout");
++    let term_idx = operations
++        .iter()
++        .position(|op| matches!(op, MigrationOperation::Terminate(4242)))
++        .expect("process terminate");
++
++    let default_lock = fixture.root.join("cron/.jobs.lock");
++    let work_lock = fixture.root.join("profiles/work/cron/.jobs.lock");
++
++    let lock1_idx = operations
++        .iter()
++        .position(|op| op == &MigrationOperation::LockAcquired(default_lock.clone()))
++        .expect("default lock acquired");
++    let lock2_idx = operations
++        .iter()
++        .position(|op| op == &MigrationOperation::LockAcquired(work_lock.clone()))
++        .expect("work lock acquired");
++
++    // Quiesce precedes locks
++    assert!(bootout_idx < lock1_idx);
++    assert!(term_idx < lock1_idx);
++    // Canonical sorted lock acquisition
++    assert!(
++        lock1_idx < lock2_idx,
++        "locks must be acquired in canonical sorted order"
++    );
++
++    // Assert backups for ALL stores are prepared before the first source rewrite
++    let default_backup_idx = operations
++        .iter()
++        .position(|op| {
++            matches!(op, MigrationOperation::Write(p) if p.to_string_lossy().contains("cron/jobs.json.bak-omon-migration-"))
++        })
++        .expect("default backup written");
++    let work_backup_idx = operations
++        .iter()
++        .position(|op| {
++            matches!(op, MigrationOperation::Write(p) if p.to_string_lossy().contains("profiles/work/cron/jobs.json.bak-omon-migration-"))
++        })
++        .expect("work backup written");
++
++    let first_rename_idx = operations
++        .iter()
++        .position(|op| matches!(op, MigrationOperation::Rename(_, to) if to == &fixture.root.join("cron/jobs.json")))
++        .expect("first source rename");
++
++    assert!(
++        default_backup_idx < first_rename_idx,
++        "default backup must precede first rewrite"
++    );
++    assert!(
++        work_backup_idx < first_rename_idx,
++        "all backups must be prepared before first rewrite"
++    );
++
++    // Assert locks released after failure
++    let release1_idx = operations
++        .iter()
++        .position(|op| op == &MigrationOperation::LockReleased(default_lock.clone()))
++        .expect("default lock released");
++    let release2_idx = operations
++        .iter()
++        .position(|op| op == &MigrationOperation::LockReleased(work_lock.clone()))
++        .expect("work lock released");
++    assert!(first_rename_idx < release1_idx);
++    assert!(first_rename_idx < release2_idx);
++
++    // 5. Assert every store's bytes on injected second-store failure
++    let default_current: serde_json::Value =
++        serde_json::from_slice(&env.read(&fixture.root.join("cron/jobs.json")).unwrap()).unwrap();
++    assert_eq!(
++        default_current["jobs"],
++        serde_json::json!([]),
++        "first store was replaced"
++    );
++
++    let work_current = env.read_to_string(&work_store).unwrap();
++    assert_eq!(
++        work_current, work_jobs,
++        "second store bytes must remain unmutated on injected failure"
++    );
++
++    // Verify backups exist and match original bytes for both stores
++    let default_backup = env
++        .write_calls()
++        .into_iter()
++        .find(|(p, _)| {
++            p.to_string_lossy()
++                .contains("cron/jobs.json.bak-omon-migration-")
++        })
++        .expect("default backup");
++    assert_eq!(default_backup.1, JOBS.as_bytes());
++
++    let work_backup = env
++        .write_calls()
++        .into_iter()
++        .find(|(p, _)| {
++            p.to_string_lossy()
++                .contains("profiles/work/cron/jobs.json.bak-omon-migration-")
++        })
++        .expect("work backup");
++    assert_eq!(work_backup.1, work_jobs.as_bytes());
++
++    // 6. Assert durable pending receipt in SQLite
++    let receipt_status: String =
++        sqlx::query_scalar("SELECT status FROM cron_cutover_receipts LIMIT 1")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(receipt_status, "pending");
++
++    let default_phase: String = sqlx::query_scalar(
++        "SELECT phase FROM cron_cutover_receipt_stores WHERE profile = 'default'",
++    )
++    .fetch_one(database.pool())
++    .await
++    .unwrap();
++    assert_eq!(default_phase, "replaced");
++
++    let work_phase: String =
++        sqlx::query_scalar("SELECT phase FROM cron_cutover_receipt_stores WHERE profile = 'work'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(work_phase, "backed_up");
++
++    let daily_auth: String =
++        sqlx::query_scalar("SELECT authority FROM cron_jobs WHERE id = 'hermes:default:daily'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(daily_auth, "cutover_pending");
++
++    // 7. Assert scheduler execution blocked while receipt is pending
++    let past = Utc::now() - chrono::Duration::seconds(60);
++    sqlx::query("UPDATE cron_jobs SET next_run_at = ?")
++        .bind(past)
++        .execute(database.pool())
++        .await
++        .unwrap();
++
++    let scheduler = CronScheduler::new(database.pool().clone(), Arc::new(PayloadTaskExecutor));
++    let claimed_while_pending = scheduler.run_due_jobs().await.unwrap();
++    assert_eq!(
++        claimed_while_pending, 0,
++        "scheduler must claim zero jobs while cutover receipt is pending"
++    );
++    let triggered_while_pending = scheduler.trigger_job("hermes:default:daily").await.unwrap();
++    assert!(
++        !triggered_while_pending,
++        "manual trigger blocked while cutover receipt is pending"
++    );
++
++    // 8. Reopen twice
++    // Reopen 1: scheduler is STILL blocked
++    let claimed_reopen1 = scheduler.run_due_jobs().await.unwrap();
++    assert_eq!(
++        claimed_reopen1, 0,
++        "scheduler blocked on reopen 1 before recovery"
++    );
++
++    // Unfreeze second store and perform recovery on Reopen 2
++    env.set_read_only(&work_store, false);
++    let recovered_op = reconcile_pending_cutover(&env, database.pool())
++        .await
++        .unwrap();
++    assert!(
++        recovered_op.is_some(),
++        "reconcile must complete pending cutover"
++    );
++
++    // 9. Post-recovery verification
++    let work_recovered: serde_json::Value =
++        serde_json::from_slice(&env.read(&work_store).unwrap()).unwrap();
++    assert_eq!(
++        work_recovered["jobs"],
++        serde_json::json!([]),
++        "second store emptied after recovery roll-forward"
++    );
++
++    let committed_status: String =
++        sqlx::query_scalar("SELECT status FROM cron_cutover_receipts LIMIT 1")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(committed_status, "committed");
++
++    let daily_owned: String =
++        sqlx::query_scalar("SELECT authority FROM cron_jobs WHERE id = 'hermes:default:daily'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(daily_owned, "omon_owned");
++
++    let standup_owned: String =
++        sqlx::query_scalar("SELECT authority FROM cron_jobs WHERE id = 'hermes:work:standup'")
++            .fetch_one(database.pool())
++            .await
++            .unwrap();
++    assert_eq!(standup_owned, "omon_owned");
++
++    // Scheduler now successfully claims due jobs
++    let claimed_after_recovery = scheduler.run_due_jobs().await.unwrap();
++    assert_eq!(
++        claimed_after_recovery, 2,
++        "both due jobs claimed after cutover committed"
++    );
++
++    database.close().await;
++}

@@ -19,8 +19,17 @@ pub const ACK_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 pub async fn run_ack_command(command: &str, timeout: Duration) -> std::io::Result<Output> {
     // kill_on_drop: when the timeout drops the in-flight future, the child
     // is killed instead of left running.
-    let child = tokio::process::Command::new("sh")
-        .arg("-c")
+    let (shell, arg) = if cfg!(windows) {
+        if std::path::Path::new("C:\\Program Files\\Git\\bin\\bash.exe").exists() {
+            ("C:\\Program Files\\Git\\bin\\bash.exe", "-c")
+        } else {
+            ("cmd", "/C")
+        }
+    } else {
+        ("sh", "-c")
+    };
+    let child = tokio::process::Command::new(shell)
+        .arg(arg)
         .arg(command)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

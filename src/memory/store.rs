@@ -36,6 +36,7 @@ impl MemoryStore {
         metadata: Value,
     ) -> Result<Memory> {
         let content = content.into();
+        ensure_session(&self.pool, session).await?;
         if crate::storage::write_approval_enabled() {
             let payload = serde_json::json!({
                 "session_key": session.storage_key(),
@@ -56,7 +57,6 @@ impl MemoryStore {
                 score: 0.0,
             });
         }
-        ensure_session(&self.pool, session).await?;
         let id = Uuid::new_v4().to_string();
         let metadata_json = serde_json::to_string(&metadata)
             .map_err(|error| OmonError::Database(error.to_string()))?;

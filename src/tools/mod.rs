@@ -145,10 +145,24 @@ impl ToolRegistry {
             })?;
 
             if !requester.is_yolo(session).await {
+                use sha2::{Digest, Sha256};
+
                 let display_target = format!("<{name}>");
+                // Length-prefix the name to keep the rule identity unambiguous.
+                // Policy identity must not be inferred from the display target.
+                let mut digest = Sha256::new();
+                digest.update((name.len() as u64).to_be_bytes());
+                digest.update(name.as_bytes());
+                digest.update(reason.as_bytes());
+                let pattern_key = format!("tool-rule:v1:{:x}", digest.finalize());
                 let decision = tokio::time::timeout(
                     self.approval_timeout,
-                    requester.request_approval(session, &display_target, &reason),
+                    requester.request_approval_scoped(
+                        session,
+                        &display_target,
+                        &reason,
+                        &pattern_key,
+                    ),
                 )
                 .await
                 .map_err(|_| OmonError::Approval("approval request timed out".into()))?
@@ -199,6 +213,162 @@ mod tests {
     }
 
     struct GatedDummyTool;
+
+    #[tokio::test]
+    async fn tool_approval_scopes_do_not_cross_rules() {
+        use crate::{
+            Database, DiscordApprovalRequester, OutboundAction, OutboundDispatcher,
+            SmartApprovalGuard,
+        };
+
+        struct Resolver {
+            guard: SmartApprovalGuard,
+            prompts: Arc<Mutex<Vec<(String, String)>>>,
+        }
+        #[async_trait]
+        impl OutboundDispatcher for Resolver {
+            async fn dispatch(&self, action: OutboundAction) -> crate::Result<()> {
+                if let OutboundAction::ApprovalRequest {
+                    request_id,
+                    command,
+                    reason,
+                    ..
+                } = action
+                {
+                    let mut prompts = self.prompts.lock().await;
+                    prompts.push((command, reason));
+                    let decision = if prompts.len() == 1 { "always" } else { "deny" };
+                    assert!(
+                        self.guard
+                            .resolve_custom_id(&format!("omon:approval:{request_id}:{decision}"))
+                            .await
+                    );
+                }
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let fixture_calls = calls.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+                let calls = fixture_calls.clone();
+                async move {
+                    assert_eq!(request["method"], "tools/call");
+                    assert!(
+                        ["rule_a", "rule_b"].contains(&request["params"]["name"].as_str().unwrap())
+                    );
+                    calls.lock().await.push(request["params"].clone());
+                    axum::Json(
+                        json!({"jsonrpc":"2.0", "id":request["id"], "result":request["params"]}),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    stopped.await.unwrap();
+                })
+                .await
+                .unwrap();
+        });
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let guard = SmartApprovalGuard::new().with_pool(db.pool().clone());
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let requester = Arc::new(DiscordApprovalRequester::new(
+            guard.clone(),
+            Duration::from_secs(5),
+        ));
+        requester
+            .set_dispatcher(Arc::new(Resolver {
+                guard: guard.clone(),
+                prompts: prompts.clone(),
+            }))
+            .await;
+        let mut registry =
+            ToolRegistry::default().with_approval_requester(requester, Duration::from_secs(5));
+        registry.register(McpTool::new(
+            [("client_a", "rule_a"), ("client_b", "rule_b")]
+                .into_iter()
+                .map(|(name, remote)| {
+                    McpClientTool::new(
+                        name,
+                        remote,
+                        "fixture",
+                        json!({}),
+                        McpTransport::Sse {
+                            url: url.clone(),
+                            bearer_token: None,
+                        },
+                    )
+                    .with_approval(true)
+                })
+                .collect(),
+        ));
+        let session = SessionKey::new("discord", None::<String>, "a", None::<String>, "u");
+        let other = SessionKey::new("discord", None::<String>, "b", None::<String>, "u");
+        let a = json!({"tool":"client_a", "arguments":{"sentinel":"A"}});
+        let b = json!({"tool":"client_b", "arguments":{"sentinel":"B"}});
+        let first = registry
+            .execute_with_context("mcp", a.clone(), Some(&session))
+            .await
+            .unwrap();
+        assert_eq!(first["arguments"], a["arguments"]);
+        // Recreate the requester and guard from SQLite: Always must remain global,
+        // but must never become a grant for another rule under the same tool.
+        let restored = SmartApprovalGuard::new().with_pool(db.pool().clone());
+        assert_eq!(restored.load_persisted_allowlist().await.unwrap(), 1);
+        let requester = Arc::new(DiscordApprovalRequester::new(
+            restored.clone(),
+            Duration::from_secs(5),
+        ));
+        requester
+            .set_dispatcher(Arc::new(Resolver {
+                guard: restored.clone(),
+                prompts: prompts.clone(),
+            }))
+            .await;
+        registry.set_approval_requester(requester.clone(), Duration::from_secs(5));
+        registry
+            .execute_with_context("mcp", a, Some(&other))
+            .await
+            .unwrap();
+        assert_eq!(prompts.lock().await.len(), 1);
+        let second = registry.execute_with_context("mcp", b, Some(&other)).await;
+        let prompt_count = prompts.lock().await.len();
+        let call_count = calls.lock().await.len();
+        // Terminal category grants deliberately remain broad.
+        let terminal_key = crate::security::derive_pattern_key("rm -rf /tmp/one");
+        restored.approve_session(&other, &terminal_key).await;
+        assert!(requester
+            .request_approval(&other, "rm -rf /tmp/two", "recursive delete")
+            .await
+            .unwrap()
+            .is_approved());
+        assert_eq!(guard.pending_count().await, 0);
+        assert_eq!(restored.pending_count().await, 0);
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        db.pool().close().await;
+        println!(
+            "AP06 prompts={prompt_count}, MCP calls={call_count}, rule B denied={}",
+            second.is_err()
+        );
+        assert_eq!(
+            prompt_count, 2,
+            "rule B autoapproved using rule A's Always grant"
+        );
+        assert!(matches!(second, Err(OmonError::Approval(_))));
+        assert_eq!(call_count, 2, "denied rule B must not reach MCP");
+    }
     #[async_trait]
     impl Tool for GatedDummyTool {
         fn name(&self) -> &str {

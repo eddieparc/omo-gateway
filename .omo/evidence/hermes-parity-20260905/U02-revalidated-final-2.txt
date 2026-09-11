@@ -1,0 +1,12 @@
+$ cargo test --lib tools::tests::test_tool_approval_hook_dispatch -- --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 2 tests
+test tools::tests::test_tool_approval_hook_dispatch_approved ... ok
+test tools::tests::test_tool_approval_hook_dispatch_denied ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 299 filtered out; finished in 0.00s
+
+
+EXIT_CODE=0

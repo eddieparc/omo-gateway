@@ -1,0 +1,4 @@
+[
+  "cargo test --lib tools::skills::tests::staged_write_replays_once_to_original_destination -- --exact --nocapture",
+  "cargo test --lib storage::db::tests::staged_memory_claim_is_atomic -- --exact --nocapture"
+]

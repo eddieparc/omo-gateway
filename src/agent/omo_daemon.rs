@@ -12,17 +12,19 @@ use crate::{OmonError, Result};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, Instant};
 
 static SPAWN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const READY_WAIT_AFTER_SPAWN: Duration = Duration::from_secs(30);
 const RESTART_BACKOFF: Duration = Duration::from_secs(2);
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
+const MAX_RESTARTS: usize = 3;
 
 /// True when the daemon URL targets this machine (auto-spawn eligible).
 pub fn is_local_url(url: &str) -> bool {
@@ -67,21 +69,52 @@ async fn probe_readyz(ws_url: &str, limit: Duration) -> bool {
 /// path separator and cannot be found on `path_env`, fall back to well-known
 /// absolute install locations. Explicit paths are returned untouched.
 fn resolve_daemon_bin(bin: &str, path_env: &str) -> String {
-    if bin.contains('/') {
+    if bin.contains('/') || (cfg!(windows) && bin.contains('\\')) {
         return bin.to_string();
     }
 
-    let on_path = path_env
-        .split(':')
-        .filter(|dir| !dir.is_empty())
-        .any(|dir| {
-            std::path::Path::new(dir)
-                .join(bin)
-                .try_exists()
-                .unwrap_or(false)
-        });
-    if on_path {
-        return bin.to_string();
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let exts: &[&str] = if cfg!(windows) {
+        &[".cmd", ".exe", ".bat", ""]
+    } else {
+        &[""]
+    };
+
+    for dir in path_env.split(sep).filter(|dir| !dir.is_empty()) {
+        for ext in exts {
+            let candidate = std::path::Path::new(dir).join(format!("{bin}{ext}"));
+            if candidate.try_exists().unwrap_or(false) {
+                #[cfg(windows)]
+                return candidate.to_string_lossy().into_owned();
+                #[cfg(not(windows))]
+                return bin.to_string();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            for ext in [".cmd", ".exe", ".bat"] {
+                let npm_cmd = format!("{appdata}\\npm\\{bin}{ext}");
+                if std::path::Path::new(&npm_cmd).try_exists().unwrap_or(false) {
+                    return npm_cmd;
+                }
+            }
+        }
+        if let Ok(userprofile) = std::env::var("USERPROFILE") {
+            for candidate in [
+                format!("{userprofile}\\AppData\\Roaming\\npm\\{bin}.cmd"),
+                format!("{userprofile}\\.bun\\bin\\{bin}.exe"),
+            ] {
+                if std::path::Path::new(&candidate)
+                    .try_exists()
+                    .unwrap_or(false)
+                {
+                    return candidate;
+                }
+            }
+        }
     }
 
     if let Ok(home) = std::env::var("HOME") {
@@ -115,12 +148,23 @@ fn resolve_daemon_bin(bin: &str, path_env: &str) -> String {
 
 /// Build the spawn command for a local daemon. Exposed for tests.
 fn daemon_command(bin: &str, listen_url: &str) -> Command {
+    #[cfg(windows)]
+    let mut cmd = if bin.ends_with(".cmd") || bin.ends_with(".bat") {
+        let mut c = Command::new("cmd.exe");
+        c.arg("/c").arg(bin);
+        c
+    } else {
+        Command::new(bin)
+    };
+    #[cfg(not(windows))]
     let mut cmd = Command::new(bin);
+
     cmd.args(["app-server", "--listen", listen_url, "--ws-auth", "off"])
         .stdin(Stdio::null())
         .kill_on_drop(true);
 
     let log_file = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .map(|home| {
             let port = listen_url
@@ -128,9 +172,9 @@ fn daemon_command(bin: &str, listen_url: &str) -> Command {
                 .next()
                 .and_then(|p| p.split('/').next())
                 .unwrap_or("default");
-            std::path::PathBuf::from(home)
-                .join(".omon")
-                .join(format!("omo-appserver-{port}.log"))
+            let dir = std::path::PathBuf::from(home).join(".omon");
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join(format!("omo-appserver-{port}.log"))
         })
         .and_then(|path| {
             std::fs::OpenOptions::new()
@@ -172,6 +216,12 @@ pub struct OmoDaemonSupervisor {
 }
 
 impl OmoDaemonSupervisor {
+    /// False after shutdown or a terminal restart/readiness failure.
+    /// Live backend readiness still requires probing the daemon's readyz endpoint.
+    pub fn is_available(&self) -> bool {
+        !self.shutdown.load(Ordering::Acquire)
+    }
+
     /// Ensure a daemon is serving `cfg.appserver_url`, spawning a local one
     /// when necessary. Returns `Ok(None)` when an externally managed daemon
     /// is already serving (or autospawn is disabled / URL is non-local).
@@ -243,6 +293,7 @@ impl OmoDaemonSupervisor {
         let child_slot = Arc::clone(&self.child);
         let shutdown = Arc::clone(&self.shutdown);
         tokio::spawn(async move {
+            let mut restarts = std::collections::VecDeque::new();
             loop {
                 if shutdown.load(Ordering::Acquire) {
                     return;
@@ -267,7 +318,7 @@ impl OmoDaemonSupervisor {
                     return;
                 }
                 tracing::warn!(url = %url, "omo app-server daemon exited; checking before restart");
-                sleep(Duration::from_millis(100)).await;
+                sleep(RESTART_BACKOFF).await;
                 if shutdown.load(Ordering::Acquire) {
                     return;
                 }
@@ -281,24 +332,58 @@ impl OmoDaemonSupervisor {
                     );
                     return;
                 }
+                let now = Instant::now();
+                while restarts
+                    .front()
+                    .is_some_and(|at| now.duration_since(*at) >= RESTART_WINDOW)
+                {
+                    restarts.pop_front();
+                }
+                if restarts.len() == MAX_RESTARTS {
+                    shutdown.store(true, Ordering::Release);
+                    tracing::error!(url = %url, available = false, "omo app-server restart circuit open");
+                    return;
+                }
+                restarts.push_back(now);
                 match daemon_command(&bin, &url).spawn() {
                     Ok(child) => {
                         child_slot.lock().await.replace(child);
                         let deadline = Instant::now() + READY_WAIT_AFTER_SPAWN;
+                        let mut ready = false;
+                        let mut exited = false;
                         while Instant::now() < deadline {
                             if shutdown.load(Ordering::Acquire) {
                                 return;
                             }
-                            if probe_readyz(&url, READY_PROBE_TIMEOUT).await {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if probe_readyz(&url, READY_PROBE_TIMEOUT.min(remaining)).await {
                                 tracing::info!(url = %url, "restarted omo app-server daemon ready");
+                                ready = true;
+                                break;
+                            }
+                            exited = child_slot
+                                .lock()
+                                .await
+                                .as_mut()
+                                .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))));
+                            if exited {
                                 break;
                             }
                             sleep(Duration::from_millis(200)).await;
                         }
+                        if !ready && !exited {
+                            if let Some(mut child) = child_slot.lock().await.take() {
+                                if let Err(error) = child.kill().await {
+                                    tracing::error!(%error, "failed to kill/reap unready omo app-server");
+                                }
+                            }
+                            shutdown.store(true, Ordering::Release);
+                            tracing::error!(url = %url, available = false, "omo app-server replacement readiness deadline expired");
+                            return;
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "failed to restart omo app-server daemon");
-                        sleep(RESTART_BACKOFF).await;
                     }
                 }
             }
@@ -324,6 +409,344 @@ impl Drop for OmoDaemonSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Re-exec only this test: daemon_command opens logs in the supervisor's
+    // HOME, so changing just the spawned daemon's environment is insufficient.
+    async fn isolated_home(test: &str) -> bool {
+        let id = format!("agent::omo_daemon::tests::{test}");
+        if std::env::var("U62_ISOLATED_TEST").as_deref() == Ok(id.as_str()) {
+            return false;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".omon")).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([&id, "--exact", "--nocapture"])
+            .env("U62_ISOLATED_TEST", &id)
+            .env("HOME", home.path())
+            .env("OMON_OMO_AUTOSPAWN", "on")
+            .kill_on_drop(true);
+        let output = timeout(Duration::from_secs(45), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        println!(
+            "isolated {id}: {}\n{}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            for entry in std::fs::read_dir(home.path().join(".omon")).unwrap() {
+                let path = entry.unwrap().path();
+                println!(
+                    "fixture log {}:\n{}",
+                    path.display(),
+                    std::fs::read_to_string(&path).unwrap()
+                );
+            }
+        }
+        assert!(output.status.success());
+        if matches!(
+            test,
+            "daemon_exiting_child_budget_local_surface"
+                | "daemon_restart_budget_stops_spawn_failures"
+                | "daemon_restart_budget_and_unready_child"
+                | "daemon_ensure_owned_local_surface"
+                | "test_daemon_command_arguments"
+        ) {
+            assert!(
+                std::fs::read_dir(home.path().join(".omon"))
+                    .unwrap()
+                    .next()
+                    .is_some(),
+                "production log opening must execute inside the isolated HOME"
+            );
+        }
+        let home_path = home.path().to_owned();
+        home.close().unwrap();
+        assert!(!home_path.exists());
+        println!("isolated {id}: subprocess reaped; HOME removed");
+        true
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn daemon_exiting_child_budget_local_surface() {
+        if isolated_home("daemon_exiting_child_budget_local_surface").await {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let events = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bin = dir.path().join("exit-daemon");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+''''test -x /opt/homebrew/bin/python3 && exec /opt/homebrew/bin/python3 "$0" "$@"; exec /usr/bin/python3 "$0" "$@" # '''
+import socket
+s = socket.create_connection(('127.0.0.1', {}))
+s.sendall(b'S')
+s.recv(1)
+"#,
+                events.local_addr().unwrap().port()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = OmoDaemonSupervisor {
+            child: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        supervisor.spawn_watcher("invalid-url".into(), bin.to_string_lossy().into_owned());
+        for _ in 0..MAX_RESTARTS {
+            let (mut event, _) = timeout(Duration::from_secs(10), events.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.read_u8().await.unwrap(), b'S');
+            // Observe actual process exit before advancing the restart clock.
+            let mut slot = supervisor.child.lock().await;
+            event.write_all(b"X").await.unwrap();
+            timeout(Duration::from_secs(5), slot.as_mut().unwrap().wait())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(slot);
+        }
+        tokio::time::pause();
+        sleep(Duration::from_secs(4)).await;
+        assert!(!supervisor.is_available());
+        assert!(timeout(Duration::from_secs(120), events.accept())
+            .await
+            .is_err());
+        assert!(supervisor
+            .child
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn daemon_external_takeover_is_untouched() {
+        if isolated_home("daemon_external_takeover_is_untouched").await {
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let supervisor = OmoDaemonSupervisor {
+            child: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 1024];
+                let _ = socket.read(&mut buf).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        supervisor.spawn_watcher(url.clone(), "/nonexistent/U62-daemon".into());
+        // The external server survives supervisor shutdown; no child is adopted.
+        assert!(probe_readyz(&url, Duration::from_secs(5)).await);
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(supervisor.child.lock().await.is_none());
+        assert!(supervisor.is_available());
+        supervisor.kill();
+    }
+
+    #[tokio::test]
+    async fn daemon_ensure_external_local_surface() {
+        if isolated_home("daemon_ensure_external_local_surface").await {
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = OmoBackendConfig::new(format!("ws://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        assert!(OmoDaemonSupervisor::ensure(&cfg).await.unwrap().is_none());
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn daemon_ensure_owned_local_surface() {
+        if isolated_home("daemon_ensure_owned_local_surface").await {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = OmoBackendConfig::new(format!("ws://{}", port.local_addr().unwrap()));
+        drop(port);
+        let bin = dir.path().join("ready-daemon");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+''''test -x /opt/homebrew/bin/python3 && exec /opt/homebrew/bin/python3 "$0" "$@"; exec /usr/bin/python3 "$0" "$@" # '''
+import socket, sys
+s = socket.socket()
+s.bind(('127.0.0.1', int(sys.argv[3].rsplit(':', 1)[1])))
+s.listen()
+while True:
+    c, _ = s.accept()
+    c.recv(4096)
+    c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n')
+    c.close()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // This process re-executes exactly one test with its own HOME/env.
+        std::env::set_var("OMON_OMO_BIN", &bin);
+        let supervisor = timeout(Duration::from_secs(10), OmoDaemonSupervisor::ensure(&cfg))
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("public ensure must own the newly spawned daemon");
+        assert!(supervisor.is_available());
+        assert!(probe_readyz(&cfg.appserver_url, READY_PROBE_TIMEOUT).await);
+        supervisor.kill();
+        let mut slot = supervisor.child.lock().await;
+        let status = timeout(Duration::from_secs(5), slot.as_mut().unwrap().wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.success());
+        assert!(!supervisor.is_available());
+        assert!(!probe_readyz(&cfg.appserver_url, READY_PROBE_TIMEOUT).await);
+        println!(
+            "public ensure: owned HTTP-200 child ready, shutdown child reaped, socket refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_restart_budget_stops_spawn_failures() {
+        if isolated_home("daemon_restart_budget_stops_spawn_failures").await {
+            return;
+        }
+        tokio::time::pause();
+        let supervisor = OmoDaemonSupervisor {
+            child: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        supervisor.spawn_watcher("invalid-url".into(), "/nonexistent/U62-daemon".into());
+        // Auto-advance drives the actual backoff timers, not wall time.
+        sleep(Duration::from_secs(15)).await;
+        let stopped = supervisor.shutdown.load(Ordering::Acquire);
+        supervisor.kill();
+        assert!(
+            stopped,
+            "restart circuit did not stop failed spawn attempts"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn daemon_restart_budget_and_unready_child() {
+        if isolated_home("daemon_restart_budget_and_unready_child").await {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        // Given an exited owned daemon and a replacement that stays alive,
+        // announces its PID over a real socket, and only serves HTTP 503.
+        let dir = tempfile::tempdir().unwrap();
+        let events = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", port.local_addr().unwrap());
+        drop(port);
+        let bin = dir.path().join("daemon");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+''''test -x /opt/homebrew/bin/python3 && exec /opt/homebrew/bin/python3 "$0" "$@"; exec /usr/bin/python3 "$0" "$@" # '''
+import os, socket, sys
+s = socket.socket()
+s.bind(('127.0.0.1', int(sys.argv[3].rsplit(':', 1)[1])))
+s.listen()
+event = socket.create_connection(('127.0.0.1', {}))
+event.sendall(str(os.getpid()).encode() + b'\n')
+while True:
+    c, _ = s.accept()
+    c.recv(4096)
+    c.sendall(b'HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n')
+    c.close()
+"#,
+                events.local_addr().unwrap().port()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut initial = Command::new("/usr/bin/true").spawn().unwrap();
+        initial.wait().await.unwrap();
+        let supervisor = OmoDaemonSupervisor {
+            child: Arc::new(Mutex::new(Some(initial))),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        // Subscribe before starting the real production watcher.
+        let started = events.accept();
+        supervisor.spawn_watcher(url.clone(), bin.to_string_lossy().into_owned());
+        let (mut event, _) = timeout(Duration::from_secs(10), started)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut pid = Vec::new();
+        loop {
+            let byte = event.read_u8().await.unwrap();
+            if byte == b'\n' {
+                break;
+            }
+            pid.push(byte);
+        }
+        assert!(!probe_readyz(&url, READY_PROBE_TIMEOUT).await);
+        // Time is the behavior under test: advance beyond the readiness bound.
+        tokio::time::pause();
+        tokio::time::advance(READY_WAIT_AFTER_SPAWN + Duration::from_secs(3)).await;
+        tokio::time::resume();
+        let eof = timeout(Duration::from_secs(2), event.read_u8()).await;
+        let mut slot = supervisor.child.lock().await;
+        let reaped = match slot.as_mut() {
+            Some(child) => child.try_wait().unwrap().is_some(),
+            None => true,
+        };
+        // Cleanup also on RED, before the assertion.
+        if let Some(child) = slot.as_mut() {
+            if !reaped {
+                child.kill().await.unwrap();
+            }
+        }
+        drop(slot);
+        let unavailable = !supervisor.is_available();
+        supervisor.kill();
+        assert!(unavailable);
+        assert!(
+            reaped && matches!(eof, Ok(Err(_))),
+            "owned HTTP-503 replacement PID {} survived readiness deadline",
+            String::from_utf8_lossy(&pid)
+        );
+    }
 
     #[test]
     fn test_is_local_url() {
@@ -363,6 +786,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_resolve_daemon_bin_falls_back_to_known_install_paths() {
         // launchd hands the gateway a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
         // that excludes ~/.bun/bin, so a bare "omo" fails to spawn with ENOENT.
@@ -386,8 +810,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_daemon_command_arguments() {
+    #[tokio::test]
+    async fn test_daemon_command_arguments() {
+        if isolated_home("test_daemon_command_arguments").await {
+            return;
+        }
         let cmd = daemon_command("omo", "ws://127.0.0.1:19742");
         // Command internals are not inspectable portably; assert via as_std.
         let std_cmd = cmd.as_std();

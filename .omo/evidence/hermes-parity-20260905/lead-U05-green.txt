@@ -1,0 +1,31 @@
+status: completed exit_code: 0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 11s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+warning=Err(Approval("command was rejected by the user")); invalid=Err(Approval("BLOCKED (external security scanner): External security scanner unavailable: missing or unknown scanner action")); prompts=1; executions=0
+Never=Ok(Object {"exit_code": Number(0), "stderr": String(""), "stderr_truncated": Bool(false), "stdout": String("u05\n"), "stdout_truncated": Bool(false), "success": Bool(true)}); hardline=Err(Approval("BLOCKED (hardline): system shutdown/reboot. This command is on the unconditional blocklist and cannot be executed.")); user_deny=Err(Approval("BLOCKED: this command matches the user-defined deny rule 'npm publish *' (APPROVALS_DENY). It cannot be executed via the agent — not even with /yolo or approval bypass. Do NOT retry or rephrase this command; the user has explicitly forbidden it.")); scanner_requests=2
+test security::tirith::tests::scanner_warning_and_invalid_payload_never_silently_pass ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 300 filtered out; finished in 0.16s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.64s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+action=warn combined=false prompts=2 executions=3 persisted=0 HTTP=3
+action=warn combined=true prompts=2 executions=3 persisted=0 HTTP=3
+action=block combined=false prompts=3 executions=3 persisted=0 HTTP=3
+action=block combined=true prompts=3 executions=3 persisted=0 HTTP=3
+test security::tirith::tests::scanner_caps_precede_persistence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 300 filtered out; finished in 0.24s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+AP06 prompts=2, MCP calls=2, rule B denied=true
+test tools::tests::tool_approval_scopes_do_not_cross_rules ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 300 filtered out; finished in 0.12s

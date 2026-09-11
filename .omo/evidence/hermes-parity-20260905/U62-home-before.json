@@ -1,0 +1,62 @@
+{
+  "/Users/indo/.omon/omo-appserver-50270.log": {
+    "size": 0,
+    "mtime_ns": 1788602250935367973,
+    "birthtime": 1788602250.935368,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "/Users/indo/.omon/omo-appserver-61640.log": {
+    "size": 0,
+    "mtime_ns": 1788601687609256110,
+    "birthtime": 1788601687.609256,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "/Users/indo/.omon/omo-appserver-60412.log": {
+    "size": 0,
+    "mtime_ns": 1788601551128259848,
+    "birthtime": 1788601551.12826,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "/Users/indo/.omon/omo-appserver-49306.log": {
+    "size": 0,
+    "mtime_ns": 1788602150229111826,
+    "birthtime": 1788602150.229112,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "/Users/indo/.omon/omo-appserver-64518.log": {
+    "size": 0,
+    "mtime_ns": 1788602037276110564,
+    "birthtime": 1788602037.2761106,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "/Users/indo/.omon/omo-appserver-49945.log": {
+    "size": 0,
+    "mtime_ns": 1788602202753444735,
+    "birthtime": 1788602202.7534447,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "/Users/indo/.omon/omo-appserver-invalid-url.log": {
+    "size": 0,
+    "mtime_ns": 1788601644889101889,
+    "birthtime": 1788601644.889102,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "/Users/indo/.omon/omo-appserver-63238.log": {
+    "size": 0,
+    "mtime_ns": 1788601920612251023,
+    "birthtime": 1788601920.612251,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "/Users/indo/.omon/omo-appserver-19742.log": {
+    "size": 7017,
+    "mtime_ns": 1788540090294232270,
+    "birthtime": 1788507989.0962353,
+    "sha256": "8b5babe16745eef21389fef5e8286749c6cb9c372f841c7be90b288f285278de"
+  },
+  "/Users/indo/.omon/omo-appserver-19743.log": {
+    "size": 1408,
+    "mtime_ns": 1788540091154942651,
+    "birthtime": 1788508184.333848,
+    "sha256": "50f7dac3e0a7d51e2cb49493e78d9d40dda6596253af0b0a218861970b3250d3"
+  }
+}

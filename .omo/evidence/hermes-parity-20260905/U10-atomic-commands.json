@@ -1,0 +1,53 @@
+{
+  "unit": "U10-atomic",
+  "commands": [
+    {
+      "command": "cargo test --lib test_atomic_concurrent_notifications_single_send_decision -- --nocapture",
+      "purpose": "Capture pre-hardening RED for concurrent same-time notifications from two stores/calls (failed: 2 sends instead of 1)",
+      "exit_code": 101,
+      "log": "U10-atomic-red-notification.log"
+    },
+    {
+      "command": "cargo test --lib test_atomic_concurrent_failed_attempts_lockout -- --nocapture",
+      "purpose": "Capture pre-hardening RED for concurrent failed attempts (failed: UNIQUE constraint failure on pairing_platform_lockout)",
+      "exit_code": 101,
+      "log": "U10-atomic-red-lockout.log"
+    },
+    {
+      "command": "cargo test --lib test_atomic_concurrent_issuance_and_capacity -- --nocapture",
+      "purpose": "Capture pre-hardening RED for concurrent issuance and pending capacity (failed: divergent codes issued for same user)",
+      "exit_code": 101,
+      "log": "U10-atomic-red-capacity.log"
+    },
+    {
+      "command": "cargo test --lib test_atomic_concurrent -- --nocapture",
+      "purpose": "Capture pre-hardening RED summary across all concurrent tests",
+      "exit_code": 101,
+      "log": "U10-atomic-red.log"
+    },
+    {
+      "command": "cargo test --lib test_atomic_concurrent -- --nocapture",
+      "purpose": "Verify all 4 deterministic concurrent tests pass cleanly (GREEN)",
+      "exit_code": 0,
+      "log": "U10-atomic-green.log"
+    },
+    {
+      "command": "cargo test --lib discord::pairing && cargo test --lib discord::adapter",
+      "purpose": "Verify all adjacent pairing and adapter tests pass without regression (57 tests total)",
+      "exit_code": 0,
+      "log": "U10-atomic-adjacent.log"
+    },
+    {
+      "command": "cargo build",
+      "purpose": "Full workspace build verification",
+      "exit_code": 0,
+      "log": "U10-atomic-build.log"
+    },
+    {
+      "command": "git --no-pager diff --check src/discord/pairing.rs src/discord/adapter.rs",
+      "purpose": "Scoped whitespace and syntax check on touched files",
+      "exit_code": 0,
+      "log": "U10-atomic-diff.log"
+    }
+  ]
+}

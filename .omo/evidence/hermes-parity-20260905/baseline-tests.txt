@@ -1,0 +1,208 @@
+status: completed exit_code: 0
+
+running 29 tests
+test legacy::runner_tests::maps_hermes_web_toolset_to_both_web_tools ... ok
+test legacy::runner_tests::parses_cron_script_timeout_secs_from_env ... ok
+test legacy::runner_tests::parses_bool_from_env_variants ... ok
+test legacy::runner_tests::parses_approval_timeout_secs_from_env ... ok
+test legacy::dashboard_runtime::tests::split_csv_trims_and_drops_empty_values ... ok
+test legacy::runner_tests::resolves_cron_script_timeout_with_overrides_and_fallbacks ... ok
+test legacy::runner_tests::parses_extra_tool_roots_colon_separated ... ok
+test legacy::runner_tests::test_build_cron_llm_config_overrides ... ok
+test legacy::runner_tests::hermes_skill_dirs_use_documented_roots ... ok
+test legacy::dashboard::tests::canonical_session_key_parser_handles_embedded_separators_and_bot_identity ... ok
+test legacy::runner_tests::cli_rejects_unknown_subcommands ... ok
+test legacy::runner_tests::cli_defaults_to_run_without_a_subcommand ... ok
+test legacy::runner_tests::rejects_cron_workdir_outside_authorized_roots ... ok
+test legacy::runner_tests::cli_maps_explicit_run_to_the_run_path ... ok
+test legacy::dashboard_runtime::tests::dashboard_config_exposes_message_context_policy_matrix ... ok
+test legacy::runner_tests::cli_parses_migrate_flags ... ok
+test tests::cli_defaults_to_gateway_run ... ok
+test legacy::runner_tests::test_resolve_workspace_instructions ... ok
+test tests::cli_accepts_dashboard_and_serve_alias ... ok
+test legacy::runner_tests::test_load_cron_skills_missing_skill_resilience ... ok
+test legacy::runner_tests::test_resolve_skill_bundle_and_expansion ... ok
+test legacy::dashboard::tests::config_endpoint_never_exposes_provider_secret_values ... ok
+test legacy::dashboard::tests::health_and_status_endpoints_report_runtime_state ... ok
+test legacy::runner_tests::test_suspended_session_suppresses_auto_resume ... ok
+test legacy::runner_tests::test_restart_loop_guard_suppresses_crash_loop_auto_resume ... ok
+test legacy::dashboard::tests::cron_crud_routes_use_scheduler_semantics ... ok
+test legacy::dashboard::tests::sessions_list_and_transcript_are_paginated ... ok
+test legacy::runner_tests::test_recover_pending_delivery_obligations_redispatches_dead_process_rows ... ok
+test legacy::runner_tests::test_recover_resume_pending_sessions_redispatches_unfinished_turn ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/test_agent_tools.rs (target/debug/deps/test_agent_tools-6c8e165504a1b8a5)
+
+running 7 tests
+test file_tool_reads_writes_lists_searches_and_blocks_traversal ... ok
+test builds_provider_specific_llm_payloads_and_parses_tool_calls ... ok
+test memory_search_ranks_relevant_session_scoped_results ... ok
+test mcp_stdio_drains_large_stderr_without_blocking_jsonrpc_response ... ok
+test truncates_oversized_terminal_and_file_tool_outputs ... ok
+test tools_support_multiple_authorized_roots_for_terminal_and_file ... ok
+test terminal_executes_processes_and_captures_status ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/test_discord_adapter.rs (target/debug/deps/test_discord_adapter-96164a28882a7d0f)
+
+running 39 tests
+test chunks_markdown_at_discord_limit_and_balances_code_fences ... ok
+test final_live_edit_preempts_a_sleeping_intermediate_update ... ok
+test final_live_edit_deletes_surplus_chunk_messages ... ok
+test live_edits_use_typing_and_debounce_subsequent_updates ... ok
+test approval_guard_resolves_all_four_buttons_and_times_out ... ok
+test channel_allow_and_ignore_lists ... ok
+test every_bot_answers_its_own_direct_messages_regardless_of_primary_bot ... ok
+test every_explicitly_mentioned_bot_owns_exactly_its_target ... ok
+test slash_authorization_defaults_open_and_enforces_allowlist ... ok
+test converts_serenity_dm_mentions_threads_and_attachments ... ok
+test coalesces_split_messages_and_unions_attachments ... ok
+test only_primary_bot_owns_unmentioned_threads_and_free_channels ... ok
+test test_approval_buttons_and_parse_custom_id ... ok
+test scoped_thread_participation_gates_unmentioned_and_allows_mentioned ... ok
+test test_allow_bots_policy_modes ... ok
+test test_compose_reply_context ... ok
+test test_derive_auto_thread_name_formatting_and_capping ... ok
+test test_dm_accepted_when_channel_type_private_regardless_of_guild_id_or_secondary_bot ... ok
+test single_preview_during_streaming_truncates_without_sending_extra_messages ... ok
+test test_is_authorized_clicker ... ok
+test test_inbound_hydrates_reply_context_and_attachments ... ok
+test test_safe_allowed_mentions ... ok
+test test_shared_vs_per_user_thread_sessions ... ok
+test test_thread_require_mention_option ... ok
+test user_authorization_allow_all_and_roles ... ok
+test test_forwarded_message_snapshots_routing ... ok
+test rejects_discord_attachment_over_size_limit_before_network ... ok
+test test_dead_target_short_circuit_in_egress ... ok
+test discord_egress_dispatches_upload_file_to_target_channel ... ok
+test encodes_supported_images_as_openai_and_anthropic_vision_blocks ... ok
+test hydrate_does_not_inline_binary_attachment ... ok
+test downloads_discord_attachment_once_and_reuses_cache ... ok
+test renders_complete_attachment_context_for_attachment_only_turns ... ok
+test renders_downloaded_attachment_local_path ... ok
+test hydrates_and_inlines_small_text_attachment ... ok
+test test_format_channel_context_empty_and_skip_empty_lines ... ok
+test test_format_channel_context_ordering_and_truncation ... ok
+test discord_delivery_claims_deduplicate_per_target_bot ... ok
+test discord_egress_handles_typing_start_and_stop ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/test_e2e_stress.rs (target/debug/deps/test_e2e_stress-ae63b4d91a1afaf5)
+
+running 3 tests
+test delivery_ledger_is_idempotent_during_a_128_way_duplicate_storm ... ok
+test routes_120_messages_in_order_per_session_and_in_parallel_across_sessions ... ok
+test scale_to_zero_evicts_all_sessions_during_high_turnover ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/test_message_context.rs (target/debug/deps/test_message_context-752c8a2b40f2b761)
+
+running 8 tests
+test persisted_policy_override_applies_without_rebuilding_provider ... ok
+test cross_channel_policy_checks_allowlist_and_same_guild_metadata ... ok
+test replies_scans_ordinary_references_when_no_thread_exists ... ok
+test get_message_returns_single_message_and_conversation_metadata ... ok
+test replies_prefers_native_thread_and_exposes_forum_post_metadata ... ok
+test transcript_insert_trigger_populates_fts_index ... ok
+test recent_pagination_and_fts_rest_backfill_are_integrated ... ok
+test persisted_policy_limits_are_enforced_per_operation ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/test_migrate.rs (target/debug/deps/test_migrate-05eff5be456e48b7)
+
+running 3 tests
+test dry_run_without_database_reports_creation_without_creating_it ... ok
+test dry_run_projects_every_step_with_zero_writes_or_side_effects ... ok
+test full_migration_imports_config_and_cron_before_cutover ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/test_multiplexer.rs (target/debug/deps/test_multiplexer-b1f731f9cf6f51b5)
+
+running 11 tests
+test delivery_ledger_deduplicates_concurrent_claims_and_records_latency ... ok
+test route_reports_actor_startup_failure_instead_of_acknowledging_a_lost_event ... ok
+test gc_does_not_evict_an_actor_with_an_active_turn ... ok
+test stop_immediately_cancels_the_active_turn ... ok
+test stop_cancels_active_turn_and_clears_queued_events ... ok
+test dropping_multiplexer_releases_actor_cycle_and_flushes_dirty_state ... ok
+test scale_to_zero_evicts_and_flushes_idle_sessions ... ok
+test events_arriving_during_running_turn_are_queued_and_processed_in_order ... ok
+test routes_multiple_sessions_in_parallel ... ok
+test handles_events_sequentially_within_one_session ... ok
+test transcript_level_inbound_dedup_skips_duplicate_platform_message_id ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/test_omo_backend.rs (target/debug/deps/test_omo_backend-e85d760fcf7cdf1d)
+
+running 22 tests
+test test_omo_backend_ignores_turn_completed_for_other_thread ... ok
+test test_omo_backend_aborts_turn_on_repeated_approval_denials ... ok
+test test_omo_backend_omits_workspace_when_per_agent_disabled ... ok
+test test_omo_backend_cron_sessions_always_start_fresh_thread ... ok
+test test_omo_backend_replaces_stale_cached_thread ... ok
+test test_omo_backend_completes_from_final_agent_message_when_turn_terminal_is_missing ... ok
+test test_omo_backend_emits_hermes_activity_lines ... ok
+test test_omo_backend_cron_session_suppresses_activity_lines_and_delivers_only_final_result ... ok
+test test_omo_backend_provisions_agent_workspace_and_passes_to_thread_start ... ok
+test test_omo_backend_surfaces_turn_start_rpc_error_immediately ... ok
+test test_omo_backend_persists_without_preexisting_session_row ... ok
+test test_omo_backend_runs_ack_command_after_cron_delivery ... ok
+test test_omo_backend_e2e_thread_lifecycle_and_streaming ... ok
+test test_omo_backend_skips_ack_when_delivery_fails ... ok
+test test_omo_backend_accepts_received_completion_at_deadline_edge ... ok
+test test_omo_backend_deadline_fires_on_ping_only_stream ... ok
+test test_omo_backend_empty_terminal_past_grace_fails_fast ... ok
+test test_omo_backend_ignores_turn_completed_without_content ... ok
+test test_omo_backend_retries_once_after_connection_drop ... ok
+test test_omo_backend_deadline_interrupts_looping_turn ... ok
+test test_omo_backend_waits_for_final_message_after_tool_activity ... ok
+test test_omo_backend_unreachable_daemon_error ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.65s
+
+     Running tests/test_profile_routing.rs (target/debug/deps/test_profile_routing-82e83727b1ccbe5c)
+
+running 4 tests
+test test_json_parsing_edge_cases ... ok
+test test_profile_router_hierarchical_precedence ... ok
+test test_multiplexer_does_not_clobber_existing_explicit_model ... ok
+test test_multiplexer_routes_inbound_with_profile_defaults ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/test_voice_cron.rs (target/debug/deps/test_voice_cron-3308988bea012bda)
+
+running 9 tests
+test audio_frame_buffer_serializes_without_losing_pcm_samples ... ok
+test dead_process_expired_lease_is_reclaimed_by_scheduler ... ok
+test failed_interval_advances_next_run_and_applies_backoff ... ok
+test cron_scheduler_registers_triggers_and_manages_jobs ... ok
+test failed_one_shot_due_run_disables_job_and_records_failed_lease ... ok
+test live_process_expired_lease_is_not_reclaimed_and_completes_successfully ... ok
+test background_scheduler_executes_due_interval_and_notifies_channel ... ok
+test active_lease_blocks_duplicate_claims_until_success_commits_one_shot ... ok
+test repeated_failures_scale_backoff_deterministically ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/test_wiring_e2e.rs (target/debug/deps/test_wiring_e2e-cf6c46b01c648593)
+
+running 2 tests
+test test_boot_time_backend_selection_parsing ... ok
+test test_e2e_actor_omo_backend_persists_assistant_message ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+   Doc-tests omon_gateway
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

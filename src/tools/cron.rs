@@ -6,7 +6,9 @@ use serde_json::{json, Value};
 use sqlx::{FromRow, SqlitePool};
 
 use super::Tool;
-use crate::{check_gateway_lifecycle, next_run, scan_cron_prompt, CronScheduler, OmonError};
+use crate::{
+    check_gateway_lifecycle, next_run, scan_cron_prompt, CronJobSpec, CronScheduler, OmonError,
+};
 
 #[derive(Clone, Debug, FromRow, Serialize, Deserialize)]
 pub struct DbCronJob {
@@ -20,25 +22,64 @@ pub struct DbCronJob {
     pub updated_at: String,
 }
 
+#[derive(sqlx::FromRow)]
+pub struct DbCronRun {
+    pub run_id: String,
+    pub job_id: String,
+    pub claim_token: String,
+    pub lease_expires_at: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub status: String,
+    pub attempt: i64,
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct CronTool {
     pool: SqlitePool,
-    scheduler: Option<Arc<CronScheduler>>,
+    scheduler: Arc<parking_lot::RwLock<Option<Arc<CronScheduler>>>>,
+}
+
+async fn check_imported_read_only(pool: &SqlitePool, id: &str) -> Result<(), OmonError> {
+    if id.starts_with("hermes:") {
+        return Err(OmonError::ToolExecution(format!(
+            "cannot modify imported job '{id}' (read-only)"
+        )));
+    }
+    let authority: Option<(String,)> =
+        sqlx::query_as("SELECT authority FROM cron_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| OmonError::Database(e.to_string()))?;
+    if let Some((auth,)) = authority {
+        if auth == "hermes_mirror" || auth == "hermes_synced" {
+            return Err(OmonError::ToolExecution(format!(
+                "cannot modify imported job '{id}' (read-only)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl CronTool {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
-            scheduler: None,
+            scheduler: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
     pub fn with_scheduler(pool: SqlitePool, scheduler: Arc<CronScheduler>) -> Self {
         Self {
             pool,
-            scheduler: Some(scheduler),
+            scheduler: Arc::new(parking_lot::RwLock::new(Some(scheduler))),
         }
+    }
+
+    pub fn bind_scheduler(&self, scheduler: Arc<CronScheduler>) {
+        *self.scheduler.write() = Some(scheduler);
     }
 }
 
@@ -59,8 +100,12 @@ impl Tool for CronTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "get", "add", "create", "delete", "remove", "pause", "resume", "trigger", "run", "run_now", "update"],
-                    "description": "The cron operation to perform (list, get, add, delete, pause, resume, trigger, update)."
+                    "enum": [
+                        "list", "get", "add", "create", "delete", "remove", "pause", "resume",
+                        "trigger", "run", "run_now", "update", "runs", "status", "ack", "acknowledge", "ack_incident",
+                        "notepad", "notepad_set", "notepad_get", "notepad_list", "notepad_delete"
+                    ],
+                    "description": "The cron operation to perform (list, get, add, delete, pause, resume, trigger, update, runs, status, ack, notepad)."
                 },
                 "id": {
                     "type": "string",
@@ -98,6 +143,26 @@ impl Tool for CronTool {
                 "name": {
                     "type": "string",
                     "description": "Alternative alias for description."
+                },
+                "signature": {
+                    "type": "string",
+                    "description": "Error signature of incident to acknowledge (optional)."
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Notepad key."
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Notepad value (max 16 KiB)."
+                },
+                "op": {
+                    "type": "string",
+                    "description": "Notepad sub-operation (set, get, list, delete)."
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Target profile for profile-scoped operations (default: 'default')."
                 }
             },
             "required": ["action"]
@@ -122,7 +187,16 @@ impl Tool for CronTool {
                     if args.get("deliver").is_none()
                         || args.get("deliver").and_then(Value::as_str) == Some("local")
                     {
-                        args["deliver"] = Value::String(format!("discord:{}", session.channel_id));
+                        if let Some(ref tid) = session.thread_id {
+                            args["deliver"] =
+                                Value::String(format!("discord:{}:{}", session.channel_id, tid));
+                        } else {
+                            args["deliver"] =
+                                Value::String(format!("discord:{}", session.channel_id));
+                        }
+                    }
+                    if let Some(ref bid) = session.bot_id {
+                        args["bot_id"] = Value::String(bid.clone());
                     }
                     args["_session_key"] = Value::String(session.storage_key());
                 }
@@ -176,6 +250,7 @@ impl Tool for CronTool {
             }
             "delete" | "remove" => {
                 let id = id_param.ok_or_else(|| OmonError::ToolExecution("missing 'id'".into()))?;
+                check_imported_read_only(&self.pool, id).await?;
 
                 let res = sqlx::query("DELETE FROM cron_jobs WHERE id = ?")
                     .bind(id)
@@ -190,8 +265,10 @@ impl Tool for CronTool {
             }
             "pause" => {
                 let id = id_param.ok_or_else(|| OmonError::ToolExecution("missing 'id'".into()))?;
+                check_imported_read_only(&self.pool, id).await?;
 
-                if let Some(scheduler) = &self.scheduler {
+                let scheduler_opt = self.scheduler.read().clone();
+                if let Some(scheduler) = &scheduler_opt {
                     let paused = scheduler.pause(id).await?;
                     if !paused {
                         return Err(OmonError::ToolExecution(format!(
@@ -223,8 +300,10 @@ impl Tool for CronTool {
             }
             "resume" => {
                 let id = id_param.ok_or_else(|| OmonError::ToolExecution("missing 'id'".into()))?;
+                check_imported_read_only(&self.pool, id).await?;
 
-                let next_run_str = if let Some(scheduler) = &self.scheduler {
+                let scheduler_opt = self.scheduler.read().clone();
+                let next_run_str = if let Some(scheduler) = &scheduler_opt {
                     let resumed = scheduler.resume(id).await?;
                     if !resumed {
                         return Err(OmonError::ToolExecution(format!(
@@ -286,7 +365,8 @@ impl Tool for CronTool {
                     )));
                 }
 
-                if let Some(scheduler) = &self.scheduler {
+                let scheduler_opt = self.scheduler.read().clone();
+                if let Some(scheduler) = &scheduler_opt {
                     let triggered = scheduler.trigger(id).await?;
                     if !triggered {
                         return Err(OmonError::ToolExecution(format!(
@@ -372,11 +452,24 @@ impl Tool for CronTool {
                     .and_then(Value::as_bool)
                     .unwrap_or(job.enabled);
 
+                let expression_changed = args
+                    .get("expression")
+                    .or_else(|| args.get("schedule"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|new_expr| new_expr != job.expression);
+
+                let enabled_changed = args
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|new_enabled| new_enabled != job.enabled);
+
                 let now = chrono::Utc::now();
-                let next_run_at = if enabled {
-                    Some(next_run(expression, now)?)
-                } else {
+                let next_run_at: Option<String> = if !enabled {
                     None
+                } else if expression_changed || (enabled_changed && job.next_run_at.is_none()) {
+                    Some(next_run(expression, now)?.to_rfc3339())
+                } else {
+                    job.next_run_at
                 };
 
                 let payload_json = serde_json::to_string(&payload)
@@ -390,7 +483,7 @@ impl Tool for CronTool {
                 .bind(expression)
                 .bind(&payload_json)
                 .bind(enabled)
-                .bind(next_run_at)
+                .bind(&next_run_at)
                 .bind(now)
                 .bind(id)
                 .execute(&self.pool)
@@ -453,31 +546,83 @@ impl Tool for CronTool {
                     .or_else(|| args.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let payload = json!({
+                let mut payload = json!({
                     "name": desc,
                     "prompt": prompt.unwrap_or_default(),
                     "script": script,
                     "deliver": args.get("deliver").and_then(Value::as_str).unwrap_or("local"),
+                    "bot_id": args.get("bot_id").and_then(Value::as_str),
                     "enabled_toolsets": args.get("enabled_toolsets").cloned().unwrap_or(Value::Null)
                 });
+                if let Some(repeat) = args.get("repeat") {
+                    payload["repeat"] = repeat.clone();
+                }
+                if let Some(context_from) = args.get("context_from") {
+                    payload["context_from"] = context_from.clone();
+                }
+                if let Some(skills) = args.get("skills") {
+                    payload["skills"] = skills.clone();
+                }
+                if let Some(skill) = args.get("skill") {
+                    payload["skill"] = skill.clone();
+                }
+                if let Some(no_agent) = args.get("no_agent") {
+                    payload["no_agent"] = no_agent.clone();
+                }
+                if let Some(ack) = args.get("ack_command") {
+                    payload["ack_command"] = ack.clone();
+                }
+                if let Some(timeout) = args.get("timeout").or_else(|| args.get("timeout_secs")) {
+                    payload["timeout_secs"] = timeout.clone();
+                }
+                if let Some(model) = args.get("model") {
+                    payload["model"] = model.clone();
+                }
+                let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                payload["enabled"] = Value::Bool(enabled);
+
                 let session_key = args
                     .get("_session_key")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+
+                let scheduler_opt = self.scheduler.read().clone();
+                if let Some(scheduler) = &scheduler_opt {
+                    let mut spec = CronJobSpec::new(&expression, payload.clone());
+                    spec.session_key = session_key.clone();
+                    let mut job = scheduler.register_with_id(id, spec).await?;
+                    if !enabled {
+                        scheduler.pause(id).await?;
+                        job.enabled = false;
+                    }
+                    return Ok(json!({
+                        "status": "registered",
+                        "id": id,
+                        "expression": expression,
+                        "enabled": job.enabled,
+                        "next_run_at": job.next_run_at
+                    }));
+                }
+
                 let payload_json = serde_json::to_string(&payload)
                     .map_err(|error| OmonError::ToolExecution(error.to_string()))?;
-                let next_run_at = next_run(&expression, now)?;
+                let next_run_at = if enabled {
+                    Some(next_run(&expression, now)?)
+                } else {
+                    None
+                };
 
                 sqlx::query(
                     "INSERT INTO cron_jobs (id, session_key, expression, payload_json, enabled, next_run_at, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(id) DO UPDATE SET session_key=excluded.session_key, expression=excluded.expression, payload_json=excluded.payload_json,
-                     enabled=1, next_run_at=excluded.next_run_at, updated_at=excluded.updated_at",
+                     enabled=excluded.enabled, next_run_at=excluded.next_run_at, updated_at=excluded.updated_at",
                 )
                 .bind(id)
                 .bind(session_key)
                 .bind(&expression)
                 .bind(payload_json)
+                .bind(enabled)
                 .bind(next_run_at)
                 .bind(now)
                 .bind(now)
@@ -493,6 +638,194 @@ impl Tool for CronTool {
                     "prompt": prompt,
                     "script": script
                 }))
+            }
+            "runs" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(20)
+                    .clamp(1, 100);
+
+                let rows: Vec<DbCronRun> = if let Some(job_id) = id_param {
+                    sqlx::query_as(
+                        "SELECT run_id, job_id, claim_token, lease_expires_at, started_at, completed_at, status, attempt, error
+                         FROM cron_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT ?",
+                    )
+                    .bind(job_id)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| OmonError::Database(e.to_string()))?
+                } else {
+                    sqlx::query_as(
+                        "SELECT run_id, job_id, claim_token, lease_expires_at, started_at, completed_at, status, attempt, error
+                         FROM cron_runs ORDER BY started_at DESC LIMIT ?",
+                    )
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| OmonError::Database(e.to_string()))?
+                };
+
+                let runs: Vec<Value> = rows
+                    .into_iter()
+                    .map(|r| {
+                        json!({
+                            "run_id": r.run_id,
+                            "job_id": r.job_id,
+                            "claim_token": r.claim_token,
+                            "lease_expires_at": r.lease_expires_at,
+                            "started_at": r.started_at,
+                            "completed_at": r.completed_at,
+                            "status": r.status,
+                            "attempt": r.attempt,
+                            "error": r.error
+                        })
+                    })
+                    .collect();
+
+                Ok(json!({ "runs": runs }))
+            }
+            "status" => {
+                let total_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cron_jobs")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| OmonError::Database(e.to_string()))?;
+
+                let enabled_jobs: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM cron_jobs WHERE enabled = 1")
+                        .fetch_one(&self.pool)
+                        .await
+                        .map_err(|e| OmonError::Database(e.to_string()))?;
+
+                let paused_jobs = total_jobs - enabled_jobs;
+
+                let scheduler_opt = self.scheduler.read().clone();
+                let (running, active_claims, ticker_health) = if let Some(scheduler) = scheduler_opt
+                {
+                    let running = scheduler.is_running().await;
+                    let active = scheduler.active_executions_count().await;
+                    let health = if running { "healthy" } else { "stopped" };
+                    (running, active, health)
+                } else {
+                    (true, 0, "unbound")
+                };
+
+                Ok(json!({
+                    "status": "ok",
+                    "running": running,
+                    "total_jobs": total_jobs,
+                    "enabled_jobs": enabled_jobs,
+                    "paused_jobs": paused_jobs,
+                    "active_executions": active_claims,
+                    "ticker": {
+                        "health": ticker_health,
+                        "running": running
+                    }
+                }))
+            }
+            "ack" | "acknowledge" | "ack_incident" => {
+                let id = id_param.ok_or_else(|| OmonError::ToolExecution("missing 'id'".into()))?;
+                let signature = args.get("signature").and_then(Value::as_str);
+
+                let scheduler_opt = self.scheduler.read().clone();
+                let acknowledged = if let Some(scheduler) = &scheduler_opt {
+                    scheduler.acknowledge_incident(id, signature).await?
+                } else {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let rows = if let Some(sig) = signature {
+                        sqlx::query(
+                            "UPDATE cron_incidents SET acknowledged = 1, updated_at = ? WHERE job_id = ? AND error_signature = ?",
+                        )
+                        .bind(&now)
+                        .bind(id)
+                        .bind(sig)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| OmonError::Database(e.to_string()))?
+                        .rows_affected()
+                    } else {
+                        sqlx::query(
+                            "UPDATE cron_incidents SET acknowledged = 1, updated_at = ? WHERE job_id = ?",
+                        )
+                        .bind(&now)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| OmonError::Database(e.to_string()))?
+                        .rows_affected()
+                    };
+                    rows > 0
+                };
+
+                Ok(json!({
+                    "status": "acknowledged",
+                    "id": id,
+                    "acknowledged": acknowledged
+                }))
+            }
+            "notepad" | "notepad_set" | "notepad_get" | "notepad_list" | "notepad_delete" => {
+                let id = id_param.ok_or_else(|| OmonError::ToolExecution("missing 'id'".into()))?;
+                let profile = args
+                    .get("profile")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
+
+                let op = if action == "notepad" {
+                    args.get("op").and_then(Value::as_str).unwrap_or("list")
+                } else {
+                    action.trim_start_matches("notepad_")
+                };
+
+                match op {
+                    "set" => {
+                        let key = args
+                            .get("key")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| OmonError::ToolExecution("missing 'key'".into()))?;
+                        let value = args
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| OmonError::ToolExecution("missing 'value'".into()))?;
+
+                        crate::cron::set_cron_notepad(&self.pool, profile, id, key, value).await?;
+                        Ok(json!({
+                            "status": "ok",
+                            "profile": profile,
+                            "id": id,
+                            "key": key,
+                            "value": value
+                        }))
+                    }
+                    "get" | "list" => {
+                        let entries =
+                            crate::cron::get_cron_notepads(&self.pool, profile, id).await?;
+                        let map: serde_json::Map<String, Value> = entries
+                            .into_iter()
+                            .map(|(k, v)| (k, Value::String(v)))
+                            .collect();
+                        Ok(json!({
+                            "status": "ok",
+                            "profile": profile,
+                            "id": id,
+                            "notes": Value::Object(map)
+                        }))
+                    }
+                    "delete" | "remove" => {
+                        let key = args.get("key").and_then(Value::as_str);
+                        let deleted =
+                            crate::cron::delete_cron_notepad(&self.pool, profile, id, key).await?;
+                        Ok(json!({
+                            "status": "ok",
+                            "profile": profile,
+                            "id": id,
+                            "deleted": deleted
+                        }))
+                    }
+                    _ => Err(OmonError::ToolExecution(format!(
+                        "unknown notepad op: {op}"
+                    ))),
+                }
             }
             _ => Err(OmonError::ToolExecution(format!(
                 "unknown action: {action}"

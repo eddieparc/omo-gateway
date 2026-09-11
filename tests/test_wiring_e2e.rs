@@ -243,6 +243,7 @@ async fn test_e2e_actor_omo_backend_persists_assistant_message() {
         model: Some("persona-model-override".into()),
         system_prompt: Some("You are a specialized profile persona.".into()),
         enabled_toolsets: None,
+        ..Default::default()
     };
     let profile_router = ProfileRouter::new(vec![profile_route]);
 

@@ -1,0 +1,334 @@
+{
+  "units": [
+    {
+      "id": "U72",
+      "title": "Bound final response message count",
+      "findings": [
+        "UP.IO-01"
+      ],
+      "files": [
+        "src/discord/throttler.rs",
+        "src/discord/adapter.rs",
+        "tests/test_discord_adapter.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U35"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### IO-01 - No per-response Discord message-count ceiling\n\n**Status: applicable live output gap, P1.** This is a new upstream behavior, not old pagination or PNG attachment batching (Discord D16).\n\n- Upstream `plugins/platforms/discord/adapter.py:996` sets `MAX_SPLIT_MESSAGES = 8`; `:2787-2807` keeps the first seven chunks and replaces the remainder with an explicit truncation notice. `:2809-2895` calls that cap after normal formatting/chunking in `send`. Installed `plugins/platforms/discord/adapter.py:2869-2921` splits and sends every chunk with no corresponding cap.\n- Rust `src/discord/throttler.rs:166-180` edits/sends every result from `chunk_markdown`; `:277-350` terminates only when the entire input has been consumed. `src/discord/adapter.rs:1842-1880` routes actual completed OMO output through that throttler; SendMessage independently loops all chunks at `:2005-2045`. `src/agent/omo_backend.rs:627-677` sends full content, with no final message-count ceiling, then persists it.\n- Impact: a degenerate 60,698-character final produces at least 31 Discord content messages, potentially more with pagination/fence overhead. Final-only does not prevent this flood: every message belongs to one completed turn. This is different from the already-reported 11-PNG attachment limit. Existing `tests/test_discord_adapter.rs:91-112,194-246` checks per-message length/fences and continuation delivery, not a whole-response ceiling.\n- Minimal implementation boundary: a bounded final-delivery chunk plan shared by `DiscordEgress::stream`/LiveEditThrottler and SendMessage (including forum continuation). Keep normal under-limit bytes, balanced fences, safe mentions and PNG rendering. Preserve the full original response in durable history; final delivery must explicitly disclose truncation rather than falsely implying all bytes reached Discord. Do not port upstream table-to-bullets or preview streaming. Do not globally truncate the daemon's authoritative history. Count content messages separately from the D16 PNG upload groups.\n- Exact deterministic RED/GREEN regression (proposed): `cargo test --test test_discord_adapter completed_response_has_bounded_message_count -- --exact`. Given a 60,698-character ASCII final and pagination enabled explicitly in fixture configuration, dispatch one final Stream via real DiscordEgress to a loopback REST surrogate that records POST/PATCH bodies and returns unique message IDs. Await dispatch completion with a bounded timeout; no sleeps. RED: more than eight final content messages. GREEN: at most eight, all <=2,000 characters, explicit truncation disposition, durable original content length exactly 60,698. Parameterize the same test fixture for SendMessage and forum destination, plus a short response control and a fenced-code overflow control. The initial zero-width Stream placeholder is not a separate final content message but its final edited body counts. Tests should assert counts, machine-visible truncation status and preserved payload, not fixed notice prose.\n- Local surface scenario: loopback OMO peer emits one completed 60,698-character answer through real backend/dispatcher, while an isolated SQLite store and REST surrogate retain original text and emitted messages. Zero interim prose; the final stream respects the ceiling; typing lifecycle remains the already-owned D09/R11 contract. No production Discord.\n- Executed corroboration: AST-extracted pinned `_cap_split_chunks` evaluated in memory with 31 chunks and the verified constant 8 produced exactly 8 chunks. This proves the upstream helper outcome only. Rust's unlimited caller loop is source-proven; no Rust runtime result is claimed.\n",
+      "redCommand": "cargo test --test test_discord_adapter completed_response_has_bounded_message_count -- --exact",
+      "status": "pending",
+      "evidenceSource": "delta-io.md"
+    },
+    {
+      "id": "U73",
+      "title": "Recover owned transport failures while running",
+      "findings": [
+        "UP.IO-02"
+      ],
+      "files": [
+        "src/ledger/service.rs",
+        "src/discord/adapter.rs",
+        "src/main.rs",
+        "tests/test_discord_adapter.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U36",
+        "U72"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### IO-02 - No same-process, bot-scoped retry of definitively failed transport delivery\n\n**Status: applicable recovery extension, P1; dependent on cron C01 / sessions F13 live outbox wiring.** Existing reports cover missing obligation producers, boot recovery, false ACK, owner start-stamps, retention and lost bot identity. They do not cover recovery when the process stays alive and only the Discord transport reconnects. Implement this as an extension of their outbox owner, not a second recovery subsystem.\n\n- Upstream `plugins/platforms/discord/adapter.py:217-249` distinguishes connection-shaped transport failures from timeout ambiguity and ordinary HTTP rejections. `:2809-2895` returns `send_path_degraded` plus retryable status for a dead connection instead of generic failure. `gateway/delivery_ledger.py:274-320` adds `sweep_failed_for_runtime`: exact process-start ownership, failed state, allowlisted error, exact adapter profile, attempt/staleness limits and atomic attempting-state claim. `:189-207` releases a claim without consuming an attempt when no send started. `:228-271` additionally scopes boot claims to connected `(platform, adapter_profile)` pairs. `gateway/platforms/base.py:3644-3665` records failure and calls runtime redelivery if a replacement adapter is already live, closing the reconnect-before-failure-record race. Installed `gateway/delivery_ledger.py:205-273` has only the dead-owner sweep.\n- Rust `src/ledger/service.rs:291-314` skips every row with a live owner PID, including this process's failed rows. There is no runtime failed-row API or typed transport-retry classification. `src/main.rs:301-365,1297` invokes only boot recovery; `src/discord/adapter.rs:1040-1063` Ready handling starts inbound backfill only. Concrete transport methods in `src/discord/throttler.rs:41-80` propagate SDK errors without a delivery disposition. Source caller search confirmed `sweep_recoverable` is called only by boot recovery/tests and `record_obligation` has no live producer.\n- Impact: fixing only baseline outbox creation and ACK propagation still leaves a response stranded after a transient, definitively rejected transport send until a process restart. Recovering bot A must not spend bot B's budget or send through A. A reconnect/ready event can precede recording the failure, so a Ready-only callback is insufficient. A timeout must not become a silent retry; earlier chunks may already be visible, so recovered output must retain explicit at-least-once ambiguity rather than promise exactly-once delivery.\n- Minimal implementation boundary: extend existing delivery ledger with exact owner-instance/bot identity and compare-and-set failed->attempting runtime claims, narrow typed retryable error disposition at Discord egress, and one bot-scoped reconnect/replacement event consumer. Also retry scheduling after a late failure record when the transport is already restored. Share attempt/expiry policy and baseline outbox producer/receipt implementation. Release unsent claims without consuming budget; leave permissions, malformed requests and ambiguous timeout errors out of automatic unmarked retries. Never rerun the agent, create another daemon or reset a sticky conversation.\n- Exact deterministic RED/GREEN regression (proposed): `cargo test --test test_discord_adapter reconnect_replays_only_owned_transport_failures -- --exact`. Seed real temporary SQLite with current-owner bot A failed/connection-refused row, A timeout row, A forbidden row, bot B connection-refused row, and another process-instance row (same PID/different start stamp). Use an explicit local transport recovery event, subscribed before trigger; join two simultaneous sweep requests at a barrier. RED: A failed row remains failed with no delivery (current live-owner skip). GREEN: exactly A's definitive transport row is claimed/sent once and then delivered; all other rows and budgets unchanged. The REST surrogate validates bot client, channel, content and returned ACK; a structured recovered/ambiguous disposition is asserted instead of pinning recovery notice prose. Separate table-driven cases cover stale/exhausted abandonment, claim release before send, and disconnected-bot boot eligibility.\n- Local surface scenario: the same gateway runtime and SQLite pool survive a local connection-refused send. Restore the loopback transport, trigger the actual adapter lifecycle hook, and observe redelivery without another turn/start. A second case restores transport before the original failure is persisted and confirms the completion-side catch-up schedules exactly one claim. Use event gates, no fixed sleeps or polling; isolated bot IDs and no Discord network calls.\n- Executed corroboration: an in-memory SQLite/OS-liveness evaluation of the Rust source predicate found one current-owner failed row and zero eligible dead-owner rows. This was a source-predicate model, NOT execution of DeliveryLedgerService. Pinned source supplies the positive runtime-claim contract; its imported production module was not executed against the real Hermes home.\n",
+      "redCommand": "cargo test --test test_discord_adapter reconnect_replays_only_owned_transport_failures -- --exact",
+      "status": "pending",
+      "evidenceSource": "delta-io.md"
+    },
+    {
+      "id": "U74",
+      "title": "Break slow repeated restart cycles",
+      "findings": [
+        "UP.DS01"
+      ],
+      "files": [
+        "src/multiplexer/restart_loop_guard.rs",
+        "src/main.rs"
+      ],
+      "tests": [],
+      "dependsOn": [],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DS01 - Slow restart loops evade the existing auto-resume breaker (runtime defect)\n\n- **Upstream change:** `gateway/restart_loop_guard.py:26-34,56-88,98-114` replaces the 60s sliding window with an unbroken inter-boot chain, default maximum gap 300s. Installed `gateway/restart_loop_guard.py:72-88` used the short window. This is not runtime R06 (daemon supervisor respawn budget), nor a duplicate of PRESENT runtime R05 / sessions S03.\n- **Rust proof:** `src/multiplexer/restart_loop_guard.rs:81-105` discards each predecessor older than 60s; `src/main.rs:1303-1319` uses that verdict to auto-resume. A repeating 150s failure cycle never accumulates three boots and keeps restarting the same work.\n- **Minimal boundary:** only the persisted restart-interrupted boot classifier and its tests; keep explicit real-message resume and the existing pending markers. Add a maximum-gap policy and bounded retained history; do not redesign the supervisor.\n- **RED/GREEN:** `cargo test --lib restart_chain_trips_for_slow_cycles`. Given fresh temp state, call the public guard at times 0, 150, 300, recreating the guard between calls. RED verdicts false/false/false; GREEN false/false/true. A separate gap=301 fixture must reset the chain. Existing fast-cycle case remains a control; deliberately update the old window-only expectation.\n- **Local surface:** seed one pending session and the boot-chain fixture, invoke boot recovery through the same decision seam as main with fixed now=300. GREEN zero automatic backend starts, pending retained, then an explicitly routed user event still runs. This also avoids relying on the existing bot-key recovery defect.\n",
+      "redCommand": "cargo test --lib restart_chain_trips_for_slow_cycles",
+      "status": "pending",
+      "evidenceSource": "delta-state.md"
+    },
+    {
+      "id": "U75",
+      "title": "Expire stale drain requests by age",
+      "findings": [
+        "UP.DS02"
+      ],
+      "files": [
+        "src/drain_control.rs"
+      ],
+      "tests": [],
+      "dependsOn": [
+        "U63"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DS02 - Same-epoch orphan drain markers never expire (runtime defect)\n\n- **Upstream change:** `gateway/drain_control.py:29-34,95-129` treats a parseable marker older than 3600s as inactive, while preserving fail-safe handling for missing/malformed/future timestamps. This is additional to runtime R02 reversible drain and R10 macOS epoch portability.\n- **Rust proof:** `src/drain_control.rs:95-119` checks action and epoch only; `:168-175,202-215` accepts that old marker and sends shutdown=true. On a same-process epoch, or a portable legacy marker without an epoch, an abandoned operator request can stop a healthy gateway long after its purpose ended.\n- **Minimal boundary:** timestamp-aware marker validation using a supplied clock; existing watcher consumes its result. Do not change notification policy or lifecycle ownership here.\n- **RED/GREEN:** `cargo test --lib drain_marker_expiry_is_lenient_and_bounded`. At fixed T, marker `requested_at=T-3601s`, epoch equal current -> RED Some / GREEN None. At T-3600s -> Some. Missing, malformed or future timestamps -> Some; definite wrong epoch -> None.\n- **Local surface:** actual temporary marker file -> `check_drain_requested` -> watcher decision with injected time. Verify an expired marker is classified inactive at an explicit scan-completed barrier, not by waiting to see whether a watch event arrives. Rewrite timestamp=T and verify the subscribed state-change signal fires.\n",
+      "redCommand": "cargo test --lib drain_marker_expiry_is_lenient_and_bounded",
+      "status": "pending",
+      "evidenceSource": "delta-state.md"
+    },
+    {
+      "id": "U76",
+      "title": "Retire overdue unclaimed one shot jobs",
+      "findings": [
+        "UP.DS03"
+      ],
+      "files": [
+        "src/cron/scheduler.rs",
+        "tests/test_voice_cron.rs"
+      ],
+      "tests": [
+        "tests/test_voice_cron.rs"
+      ],
+      "dependsOn": [
+        "U47"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DS03 - Persisted one-shots older than grace still execute (runtime defect; new upstream policy)\n\n- **Upstream change:** `cron/jobs.py:2827-2839,2921-2923` now retires an unclaimed one-shot more than 120s late, retaining a missed-run diagnostic. **This supersedes cron-audit C20's installed-source conclusion**, which correctly noted that the older reference did not categorically discard already-persisted overdue one-shots. Do not retroactively call that report wrong.\n- **Rust proof:** `src/cron/scheduler.rs:698-714,760-795` selects every enabled `next_run_at <= now`, with no lower age bound before claim. Import preserves a supplied old timestamp at `src/cron/store.rs:426-431`. Creation-time grace does not protect restart dispatch. Stale time-sensitive reminders/scripts can execute hours late.\n- **Minimal boundary:** due-scan/claim-time grace gate for automatic one-shots, with retained terminal missed state; preserve explicit rearm/manual-run semantics and do not disable recurring catch-up. Coordinate existing C03 claim accounting, but this is a distinct eligibility predicate.\n- **RED/GREEN:** `cargo test --test test_voice_cron persisted_oneshot_past_grace_is_retired`. Seed a real DB row directly with once schedule and next_run=T-121s, no running claim; run due scan at T. RED claim count=1/backend execution; GREEN claim count=0, disabled/no next run and retained missed record. Boundary T-120s must claim once; overdue recurring job remains eligible. Use fixed clock, not Utc timing margins.\n- **Local surface:** import an enabled old once job from a temp Hermes store and run the actual scheduler dispatch pass; capturing executor must receive zero calls and dashboard-visible job/run state must distinguish missed from succeeded. Existing `active_lease_blocks_duplicate_claims_until_success_commits_one_shot` covers a one-second-old row, not expiration.\n",
+      "redCommand": "cargo test --test test_voice_cron persisted_oneshot_past_grace_is_retired",
+      "status": "pending",
+      "evidenceSource": "delta-state.md"
+    },
+    {
+      "id": "U77",
+      "title": "Terminate owned cron script descendant trees",
+      "findings": [
+        "UP.DS04"
+      ],
+      "files": [
+        "src/main.rs"
+      ],
+      "tests": [],
+      "dependsOn": [
+        "U41"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DS04 - Cron script timeout kills only the direct child, not its descendants (runtime defect)\n\n- **Upstream change:** `cron/scheduler_script.py:188-212,338-378` starts a new session and terminates a snapshotted descendant tree on timeout/cancellation, including grandchildren that called setsid. Installed `cron/scheduler.py:2197-2243` used `subprocess.run(timeout=...)`; tree ownership is new hardening, not merely moving the function.\n- **Rust proof:** Hermes scripts use `src/main.rs:1081-1091`, native scripts `:618-640`: `kill_on_drop(true)` around `Command::output()` owns only the direct process. No process-group/tree ownership is established. A bash/python script can leave child work alive after a timeout reports failure, allowing side effects to continue and overlap a later run. This is not sessions F04's remote OMO cancellation bug.\n- **Minimal boundary:** local cron subprocess lifecycle in both executor paths; own descendant identity before terminating parent, bounded terminate/reap and pipe cleanup. Apply the same ownership policy to cancellation. Do not kill unrelated children or another daemon.\n- **RED/GREEN:** `cargo test --bin omo-gateway cron_script_timeout_reaps_descendants`. A harmless fixture script spawns a child which optionally starts its own session, reports PID/start identity and READY through a dedicated pipe, then waits on a control pipe. After READY, advance the executor's timer to its configured deadline; await return and process-exit signals. RED descendant identity remains live after timeout; GREEN child/grandchild gone and timeout error retained. Use a fixture supervisor capable of observing/reaping descendants; always terminate remaining fixture children in teardown, including RED. No literal dangerous command is executed.\n- **Local surface:** run both real `run_cron_script` and native executor with that temp script, through AgentCronExecutor and scheduler. Assert no descendant can accept a post-timeout RELEASE command to write a temp marker, using exit/pipe state as the causal barrier, not a fixed observation delay. ACK must not occur (existing C11).\n",
+      "redCommand": "cargo test --bin omo-gateway cron_script_timeout_reaps_descendants",
+      "status": "pending",
+      "evidenceSource": "delta-state.md"
+    },
+    {
+      "id": "U78",
+      "title": "Persist change monitor gates per job",
+      "findings": [
+        "UP.DS05"
+      ],
+      "files": [
+        "src/cron/store.rs",
+        "src/cron/scheduler.rs",
+        "src/main.rs"
+      ],
+      "tests": [],
+      "dependsOn": [
+        "U39",
+        "U77"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DS05 - Change-monitor jobs are accepted but ignore the monitor gate (optional gateway parity)\n\n- **Upstream:** new `cron/monitor.py:107-167` runs a script or URL source, compares output hash, persists the changed snapshot before the agent, and treats source errors as errors without advancing the hash. `cron/scheduler.py:1307-1344,2032-2034` gates before agent machinery; `cron/jobs.py:1635-1653` rejects conflicting monitor modes.\n- **Rust proof:** `src/cron/store.rs:112-180` captures unknown `monitor_script`, `monitor_url`, `monitor_state` into `extra`, and sync serializes them at `:418-425`. `src/main.rs:479-505,549-604` only runs `script` and otherwise calls the backend for each nonempty prompt. No monitor field consumer was found. A migrated monitor job runs every tick with no source/diff rather than only on change.\n- **Boundary:** optional deterministic scheduler feature, not Hermes LLM classifier intelligence. Implement a profile/job-scoped hash/snapshot gate at executor preflight with existing script/path limits; alternatively explicitly reject unsupported monitor fields before importing/executing. Do not silently accept them. No blueprints/classifier engine required.\n- **RED/GREEN (implementation option):** `cargo test --bin omo-gateway cron_monitor_unchanged_skips_agent`. Loopback source returns bytes A for two separately signalled runs; recreate executor after first. RED two backend starts, zero source reads; GREEN two source reads, one backend start. Variant B causes one new start and a changed persisted hash; source error leaves previous hash unchanged and starts no agent. Compare machine-consumed hash/state/call counts, not generated explanatory prose.\n- **Local surface:** temp-store import -> actual executor with loopback URL -> recording OMO backend. Inspect the run-completed barrier after each dispatch and persisted profile-local monitor state. A feature-rejection implementation instead requires import to produce an explicit unsupported-monitor result and zero enabled runnable rows.\n",
+      "redCommand": "cargo test --bin omo-gateway cron_monitor_unchanged_skips_agent",
+      "status": "pending",
+      "evidenceSource": "delta-state.md"
+    },
+    {
+      "id": "U79",
+      "title": "Route cron failures to configured lane",
+      "findings": [
+        "UP.DS06"
+      ],
+      "files": [
+        "src/cron/store.rs",
+        "src/cron/scheduler.rs",
+        "tests/test_voice_cron.rs"
+      ],
+      "tests": [
+        "tests/test_voice_cron.rs"
+      ],
+      "dependsOn": [
+        "U43",
+        "U44",
+        "U76",
+        "U78"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DS06 - Separate failure delivery routing is silently ignored (optional Discord parity)\n\n- **Upstream:** `cron/scheduler_delivery.py:784-803` resolves `failure_deliver` on failed runs, including `local` suppression; `cron/scheduler.py:2748-2756` passes the failed outcome to that resolver. The field is not present in the installed Rust contract or six findings.\n- **Rust proof:** `src/cron/store.rs:160-180,216-274` preserves the unknown field but only resolves `deliver`. `src/cron/scheduler.rs:1107-1109,1142-1152` computes one destination list before execution and sends failures to it too. `deliver:discord:42,failure_deliver:local` still posts an error to 42; `deliver:local,failure_deliver:discord:43` drops the intended alert.\n- **Minimal boundary:** outcome-aware target selection in the scheduler and import/tool validation; reuse existing normalized target parser after its C10 fixes. This is distinct from C11's ACK-on-error problem and ordinary fanout parsing. Explicit rejection is acceptable until optional support is selected.\n- **RED/GREEN:** `cargo test --test test_voice_cron failure_delivery_uses_its_own_lane`. Error executor, success lane42/failure lane43 -> RED capture42 / GREEN capture43 only. Separate failure lane local -> GREEN zero sends, error run still recorded. Success case with lane43 override must continue to use42. Assert destination IDs and error state, not error wording.\n- **Local surface:** imported script-only job with a harmless `exit 1`, actual scheduler and loopback/capturing egress, await joined execution; verify no success ACK and exact failure target. No external Discord calls.\n",
+      "redCommand": "cargo test --test test_voice_cron failure_delivery_uses_its_own_lane",
+      "status": "pending",
+      "evidenceSource": "delta-state.md"
+    },
+    {
+      "id": "U80",
+      "title": "Suppress acknowledged repeated cron failure incidents",
+      "findings": [
+        "UP.DS07"
+      ],
+      "files": [
+        "src/cron/scheduler.rs",
+        "src/tools/cron.rs",
+        "tests/test_voice_cron.rs"
+      ],
+      "tests": [
+        "tests/test_voice_cron.rs"
+      ],
+      "dependsOn": [
+        "U49",
+        "U79"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DS07 - Acknowledged cron incidents cannot suppress repeated failure pings (optional operations parity)\n\n- **Upstream:** new `cron/incidents.py:134-203` persists normalized job+error-signature incidents with terminal acknowledgement; `cron/scheduler.py:2621-2628` suppresses an acknowledged signature. A changed error creates a new incident. This is not merely C17 run history: the new state changes delivery behavior.\n- **Rust proof:** `src/cron/scheduler.rs:1142-1152` posts every failed run, `:972-1103` records attempts/backoff but no acknowledged incident, and `src/tools/cron.rs:143-195` plus its action dispatch has no incident acknowledgement operation. No incident field/store/consumer was found in `src/cron`.\n- **Minimal boundary:** optional profile/job/signature state alongside the existing cron run store; an explicit local acknowledgement operation and failure-delivery decision. Do not add automated diagnosis or a second monitoring architecture. Failed dispatch must not mark alerted (C11 receipt boundary).\n- **RED/GREEN:** `cargo test --test test_voice_cron acknowledged_failure_signature_stays_silent`. Seed a closed incident for job J/error E, execute J returning E: RED one outbound failure / GREEN zero, while a failed run row still exists. Separate E2 emits once and has a distinct incident ID; another profile/J remains independent. Normalization fixtures differ only in supported whitespace/case handling.\n- **Local surface:** real cron status/control service acknowledges a seeded failure, scheduler executes the same failing harmless script after restart, recording egress sees no repeat. Existing run history remains available; acknowledgement does not disable the schedule.\n",
+      "redCommand": "cargo test --test test_voice_cron acknowledged_failure_signature_stays_silent",
+      "status": "pending",
+      "evidenceSource": "delta-state.md"
+    },
+    {
+      "id": "U81",
+      "title": "Persist profile scoped cron cursor notes",
+      "findings": [
+        "UP.DS08"
+      ],
+      "files": [
+        "src/cron/store.rs",
+        "src/main.rs",
+        "src/tools/cron.rs"
+      ],
+      "tests": [],
+      "dependsOn": [
+        "U40",
+        "U78",
+        "U80"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DS08 - Durable per-job notepad is not carried into cron runs (optional gateway state parity)\n\n- **Upstream:** new `cron/notepad.py:71-97,118-158` stores bounded profile/job KV state (16KiB value, 64KiB total); `cron/scheduler_prompt.py:229-234` injects it each run. It is operator/CLI-written cursor state, not the independent classifier or a model-generated memory policy.\n- **Rust proof:** `src/main.rs:531-549` loads only predecessor outputs/skills before the stored prompt; `src/cron/store.rs:112-180` has no notepad store, `src/tools/cron.rs:143` action dispatch has no notepad operations. No notepad consumer was found. Imported scripts/prompts relying on durable Hermes cron cursor notes lose that supplied state, even though fresh cron threads are intentional.\n- **Minimal boundary:** optional profile/job-scoped cursor store/read bridge and bounded executor context input; explicit migration unsupported-state warning is the minimal alternative. Do not substitute global agent memory or merge profiles. Not a duplicate of C04 predecessor output persistence.\n- **RED/GREEN:** `cargo test --bin omo-gateway cron_notepad_is_durable_and_profile_scoped`. Temp profiles A/B same job J with different sentinel cursor values; reconstruct executor and run A. RED no notepad input / GREEN only A's cursor in the structured context projection supplied to request assembly. Add exact UTF-8 byte-limit fixtures and rejected oversized upsert preserves old value. No test pins explanatory prompt prose.\n- **Local surface:** local notepad set/get operation -> store recreation -> actual AgentCronExecutor request capture. Verify input provenance/value equality from the fixture, not a fake that returns expected context without exercising the store. If selecting only rejection, import must explicitly disclose unresolved notepad state rather than report full migration parity.\n",
+      "redCommand": "cargo test --bin omo-gateway cron_notepad_is_durable_and_profile_scoped",
+      "status": "pending",
+      "evidenceSource": "delta-state.md"
+    },
+    {
+      "id": "U82",
+      "title": "Preflight configured cron delivery transports",
+      "findings": [
+        "UP.DS09"
+      ],
+      "files": [
+        "src/cron/scheduler.rs",
+        "src/main.rs"
+      ],
+      "tests": [],
+      "dependsOn": [
+        "U37",
+        "U79",
+        "U81"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DS09 - Unconfigured Discord delivery is not preflight-blocked before agent work (optional gateway parity)\n\n- **Upstream:** new `cron/scheduler_preflight.py:217-274` checks explicit success/failure delivery platforms against configured connected platforms (with a routed-primary exception); `cron/scheduler.py:1438-1489` blocks before agent construction and persists alert-once state. Local/origin/all bypass this particular check; transient configuration loading failures are not a blanket refusal. Provider-key/skill-readiness parts belong to Hermes intelligence/configuration and are not proposed here.\n- **Rust proof:** `src/cron/scheduler.rs:1107-1109` parses target text but executes immediately; `src/main.rs:553-604` constructs the Discord target and runs OMO without checking whether its actual bot transport is configured. Invalid/missing egress is only found after expensive work, or can be masked by existing backend delivery behavior. No blocked-config/alert-once preflight consumer exists in the cron executor.\n- **Minimal boundary:** optional explicit-Discord transport-availability preflight using the already-owned live egress registry, after silence/monitor gates and before backend start. Do not copy Hermes provider resolution or require every destination's live REST reachability. Associate by correct bot/profile (existing C14).\n- **RED/GREEN:** `cargo test --bin omo-gateway cron_preflight_blocks_unconfigured_discord`. Explicit Discord job with no configured Discord transport: RED backend start count1 / GREEN0 plus blocked-config result. Same fixture with transport configured -> one start. Local-only job must remain runnable. Repeated identical blocked state emits at most one available administrative notice, not a falsely delivered message to the unconfigured target.\n- **Local surface:** actual executor constructed with a test transport registry and local OMO peer, invoke two runs with completion barriers; then attach the configured local transport and run once. Count real protocol starts and persisted state, no provider billing or Discord traffic.\n",
+      "redCommand": "cargo test --bin omo-gateway cron_preflight_blocks_unconfigured_discord",
+      "status": "pending",
+      "evidenceSource": "delta-state.md"
+    },
+    {
+      "id": "U83",
+      "title": "Recheck current authorization before startup replay",
+      "findings": [
+        "UP.DC01"
+      ],
+      "files": [
+        "src/main.rs",
+        "src/discord/adapter.rs",
+        "src/multiplexer/router.rs"
+      ],
+      "tests": [],
+      "dependsOn": [
+        "U09",
+        "U19",
+        "U57"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DC01 - Startup replay bypasses current authorization\n\n**Status: FIX, security boundary; existing reference behavior, newly identified audit omission.**\n\n- Upstream: `U:gateway/run_startup.py:423-436` fails closed on current owner authorization; `:465-466` checks it before scheduling. Installed counterpart `H:gateway/run.py:7246-7265` already performs the same check. Thus this is not a feature invented by the file split.\n- Rust: `src/main.rs:370-422` receives only pool/multiplexer, clears a pending marker and routes its reconstructed event at `:409`; no current ACL is available. `src/multiplexer/router.rs:234-249` queues without ingress authorization. Normal command admission is separate (`src/discord/commands.rs:179-205`). Live startup calls recovery at `src/main.rs:1314`.\n- Impact: a previously admitted user removed from current policy can have unfinished work replayed on restart without renewed admission. Important qualification: current bot-scoped rows are usually masked by the already-known reconstruction bug (`src/storage/db.rs:135-166`, sessions F01/runtime R03). Legacy bot-less rows, also used by the existing real recovery test at `src/main.rs:1763-1836`, reach the bypass now. Fixing canonical identity alone exposes the same missing gate to normal bot rows. No claim of a currently demonstrated remote exploit or live Discord send.\n- Not duplicate: sessions F01-F03/runtime R03-R04 cover key loss, premature marker clear and duplicate history, not revocation/current-policy replay admission. Config C03 covers profile-policy association, not recovery checking it.\n- Minimal boundary: inject an effective bot/profile recovery admission service into this startup function and check before consuming eligibility or dispatching. Use stored real initiator/provenance, not a synthetic shared-session user as authority. Unknown identity or failed role/policy lookup must defer/deny rather than borrow default-bot authority. Reuse ingress policy; do not put a Discord-specific ACL into all multiplexer traffic or implement a second daemon.\n- Exact proposed test: `cargo test --bin omo-gateway recovery_rechecks_current_owner_authorization`. Seed temporary SQLite with an unfinished legacy Discord session for user 42, a pending marker, and current allowed-users `[7]`; construct the real multiplexer with a recording runner. Await recovery's returned admission count, then an explicit actor/barrier completion if a route was admitted. **RED:** recovered count 1 and runner observes user42. **GREEN:** recovered count 0, no actor admitted, no user42 runner invocation, marker retained/deferred with a machine-readable denial reason. Separate allowed-user7 control must admit exactly once. After identity repair, repeat with bot84 whose ACL differs from bot42. No sleep/negative timing window.\n- Local surface scenario: call the production startup recovery entry against file-backed temp SQLite and a loopback recording daemon; restart construction with a narrower ACL, then inspect actual `turn/start` requests after the recovery completion barrier. No request for the revoked owner; authorized control still reaches its exact bot/agent workspace. This test does not need real Discord credentials.\n",
+      "redCommand": "cargo test --bin omo-gateway recovery_rechecks_current_owner_authorization",
+      "status": "pending",
+      "evidenceSource": "delta-config.md"
+    },
+    {
+      "id": "U84",
+      "title": "Classify disk pressure using absolute headroom",
+      "findings": [
+        "UP.DC02"
+      ],
+      "files": [
+        "src/readiness.rs",
+        "src/dashboard.rs"
+      ],
+      "tests": [],
+      "dependsOn": [
+        "U68"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DC02 - Disk safety reports healthy with critically low absolute headroom\n\n**Status: FIX, operational classification; added upstream helper.**\n\n- Upstream: `U:gateway/disk_status.py:19-39` combines absolute free-space floors and percentage/headroom, and returns unknown on invalid samples. `:43-60` exposes the resulting pressure. The assigned file is absent from the install.\n- Rust: `src/readiness.rs:66-83` uses percentage alone and calls zero total healthy; `:97-123` feeds that result into real disk probes. `src/readiness.rs:190` includes the probe in runtime readiness. `src/dashboard.rs:697-720` exposes raw capacity, but no pressure classification. HTTP `/readyz` independently tests only path metadata (`:661-685`), already covered generally by runtime R09.\n- Impact: a 1000 MiB data filesystem with 200 MiB free is only 80% used, so the 90%-threshold Rust disk probe says ok although pinned upstream says critical. Conversely, 95% used with 50000 MiB free is degraded in Rust but not pressure-critical/elevated upstream. Zero-size sample is incorrectly positive. This is a disk-classifier defect, not absence of all disk monitoring or a claim that SQLite will necessarily fail at 200 MiB.\n- Not duplicate: runtime R09's concrete cases cover daemon/credentials/connection truthfulness and metadata-only HTTP readiness; none of the six reports identify absolute headroom or zero-capacity classification. Coordinate with R09's owner for the shared readiness surface rather than open a second HTTP rewrite.\n- Minimal boundary: update the existing disk classifier to incorporate the upstream absolute floors and represent unknown/degraded for unusable capacity, retaining byte metrics. Feed that one classification to exposed status/readiness where disk health is represented. No Linux cgroup, heartbeat file, full OOM-forensics stack or dashboard redesign is required.\n- Exact proposed test: `cargo test --lib readiness::tests::disk_pressure_uses_absolute_headroom`. Inputs in bytes: total `1000*1048576`, free `200*1048576`; total `1000000*1048576`, free `50000*1048576`; total/free 0. **RED:** first is ok, second degraded, third ok. **GREEN:** first degraded with critical pressure, second ok, third nonhealthy/unknown. Pure injected values; no disk filling or wall clock. Extend machine-valued existing tests, not assertions on human-readable detail text.\n- Local surface scenario: construct actual readiness/status HTTP service with a narrow disk-sampling seam returning the above samples and real temp SQLite/workspace. Issue loopback GET to the exposed readiness/status routes; assert serialized pressure/capacity and the selected nonhealthy policy, while `/health` stays live. The sampler may be fake; classifier and HTTP serialization must be production code.\n",
+      "redCommand": "cargo test --lib readiness::tests::disk_pressure_uses_absolute_headroom",
+      "status": "pending",
+      "evidenceSource": "delta-config.md"
+    },
+    {
+      "id": "U85",
+      "title": "Confirm destructive scoped Discord session commands",
+      "findings": [
+        "UP.DC03"
+      ],
+      "files": [
+        "src/discord/commands.rs",
+        "src/migrate/config_import.rs",
+        "tests/test_discord_adapter.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U03",
+        "U26",
+        "U56"
+      ],
+      "category": "unspecified-low",
+      "reason": "Lead reread pinned source and Rust callers; bounded gateway extension, not agent or other-platform port.",
+      "scenario": "### DC03 - Destructive Discord commands have no confirmation gate\n\n**Status: OPTIONAL-DISCORD parity, confirmed missing feature; existing reference behavior, not new upstream.**\n\n- Upstream: `U:gateway/run_busy.py:1037-1076` defaults `approvals.destructive_slash_confirm` to true, runs only after consent, and supports operator opt-out; `:1122-1155` registers the request before sending buttons/fallback. Installed `H:gateway/run.py:15617-15677` already has this gate.\n- Rust: `src/discord/commands.rs:572-589` immediately deletes messages AND memories on `/reset`; `:719-744` immediately calls undo. General `command_check` (`:179-205`) establishes admission only. `src/migrate/config_import.rs:42-45` parses approval mode only, with no destructive-confirm preference.\n- Impact: a valid but accidental reset/undo irreversibly changes local data immediately. This is not an authorization bypass, and does not imply the remote conversation reset is correct (already D12/sessions F09). Sticky conversations rule out automatic resets, not confirmation of an explicitly requested destructive command. Optional consent UI is an exception for a user command, not restoration of intermediate agent chatter.\n- Not duplicate: AP02/AP08/AP22 concern agent-tool approvals and their lifecycle/yolo; D12/F09 concern authoritative session control. None specifies confirmation before destructive slash mutation. Config C02 owns generic unsupported-config reporting; coordinate rather than duplicate its implementation package.\n- Minimal boundary if selected: one gateway command-confirmation lease for reset/undo, exact bot/channel/session and requesting interaction binding, no mutation before authenticated decision. Cancel/expiry does nothing. Apply the confirmed command via the serialized authoritative-control boundary from F09; do not build a parallel reset implementation. Preserve explicit operator opt-out. Persistence failure of an Always preference must not claim it was saved.\n- Exact proposed test: `cargo test --test test_discord_adapter destructive_slash_waits_for_confirmation`. Seed real SQLite with one exchange and memory. Drive a real local interaction handler through a REST capture transport. Subscribe to confirmation dispatch before invoking reset; inspect DB while dispatch is held: **RED:** rows already deleted/no confirmation. **GREEN:** rows unchanged until matching Once, then one serialized reset; Cancel/expiry retains bytes. A component from another bot/session cannot resolve it. Use explicit dispatch/resolution barriers and paused time for expiry; no sleeps.\n- Local surface scenario: loopback Discord interaction/REST fixture plus real command service/multiplexer and stateful fake daemon. Observe button payload, cancel first request, accept second, verify local and remote control once only. This remains optional work requiring feature selection, not a prerequisite to claim an exploit fixed.\n",
+      "redCommand": "cargo test --test test_discord_adapter destructive_slash_waits_for_confirmation",
+      "status": "pending",
+      "evidenceSource": "delta-config.md"
+    }
+  ],
+  "coverage": {
+    "assignedPaths": 176,
+    "unmentionedPaths": 0,
+    "newFindings": 14
+  }
+}

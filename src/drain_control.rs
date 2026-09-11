@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::error::{OmonError, Result};
 
 pub const DRAIN_REQUEST_FILENAME: &str = ".drain_request.json";
+const DRAIN_REQUEST_MAX_AGE: chrono::TimeDelta = chrono::TimeDelta::seconds(3600);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DrainRequest {
@@ -47,7 +48,7 @@ static PROCESS_EPOCH: OnceLock<String> = OnceLock::new();
 /// Computes the instantiation epoch for this container/VM/process.
 ///
 /// On Linux: reads boot_id from /proc and starttime of PID 1.
-/// On macOS / non-Linux: generates a process-boot identifier stable for the process lifetime.
+/// Without either identity source: returns an empty epoch, accepting external markers.
 pub fn current_instantiation_epoch() -> &'static str {
     PROCESS_EPOCH.get_or_init(|| {
         let mut boot_id = String::new();
@@ -68,8 +69,8 @@ pub fn current_instantiation_epoch() -> &'static str {
         if !boot_id.is_empty() || !pid1_start.is_empty() {
             format!("{boot_id}:{pid1_start}")
         } else {
-            // macOS / non-Linux fallback: stable process boot UUID
-            format!("boot:{}", Uuid::new_v4())
+            // Unknown boot identity must not make other processes' markers stale.
+            String::new()
         }
     })
 }
@@ -88,11 +89,19 @@ pub fn is_marker_epoch_stale(marker_epoch: Option<&str>, current_epoch: &str) ->
     }
 }
 
-/// Validates the raw JSON marker content against the current epoch.
+/// Validates the raw JSON marker content against the current epoch and time.
 ///
 /// Returns `Some(DrainRequest)` if a valid (non-stale) drain request is present,
 /// or `None` if the marker is stale or explicitly requests a non-drain action.
 pub fn validate_marker(content: &str, current_epoch: &str) -> Option<DrainRequest> {
+    validate_marker_at(content, current_epoch, Utc::now())
+}
+
+fn validate_marker_at(
+    content: &str,
+    current_epoch: &str,
+    now: DateTime<Utc>,
+) -> Option<DrainRequest> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Some(DrainRequest::default());
@@ -105,6 +114,12 @@ pub fn validate_marker(content: &str, current_epoch: &str) -> Option<DrainReques
             }
             if is_marker_epoch_stale(req.epoch.as_deref(), current_epoch) {
                 return None;
+            }
+            // Missing, malformed and future timestamps remain fail-safe active.
+            if let Some(requested_at) = req.requested_at.as_deref().and_then(parse_requested_at) {
+                if now.signed_duration_since(requested_at) > DRAIN_REQUEST_MAX_AGE {
+                    return None;
+                }
             }
             Some(req)
         }
@@ -119,6 +134,25 @@ pub fn validate_marker(content: &str, current_epoch: &str) -> Option<DrainReques
             })
         }
     }
+}
+
+// Like upstream's ISO parser, offset-free timestamps are UTC, not local time.
+fn parse_requested_at(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|date| date.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
+                .iter()
+                .find_map(|format| NaiveDateTime::parse_from_str(raw, format).ok())
+                .map(|date| date.and_utc())
+        })
+        .or_else(|| {
+            NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .ok()?
+                .and_hms_opt(0, 0, 0)
+                .map(|date| date.and_utc())
+        })
 }
 
 pub fn drain_request_path(dir: &Path) -> PathBuf {
@@ -166,12 +200,20 @@ pub fn clear_drain_request(dir: &Path) -> Result<bool> {
 
 /// Checks the state dir for an active, valid drain request marker.
 pub fn check_drain_requested(dir: &Path, current_epoch: &str) -> Option<DrainRequest> {
+    check_drain_requested_at(dir, current_epoch, Utc::now())
+}
+
+fn check_drain_requested_at(
+    dir: &Path,
+    current_epoch: &str,
+    now: DateTime<Utc>,
+) -> Option<DrainRequest> {
     let path = drain_request_path(dir);
     if !path.exists() {
         return None;
     }
     match fs::read_to_string(&path) {
-        Ok(content) => validate_marker(&content, current_epoch),
+        Ok(content) => validate_marker_at(&content, current_epoch, now),
         Err(_) => None,
     }
 }
@@ -205,23 +247,325 @@ impl DrainWatcher {
             let mut ticker = tokio::time::interval(self.interval);
             loop {
                 ticker.tick().await;
-                if let Some(req) = check_drain_requested(&self.state_dir, &epoch) {
-                    tracing::warn!(
-                        principal = ?req.principal,
-                        epoch = ?req.epoch,
-                        "valid drain request detected by drain watcher"
-                    );
-                    let _ = self.drain_tx.send(true);
-                    break;
-                }
+                self.scan_at(&epoch, Utc::now());
             }
         })
+    }
+
+    /// One completed file scan; the caller owns the existing watcher lifecycle.
+    pub fn scan_at(&self, epoch: &str, now: DateTime<Utc>) -> bool {
+        if let Some(req) = check_drain_requested_at(&self.state_dir, epoch, now) {
+            tracing::warn!(
+                principal = ?req.principal,
+                epoch = ?req.epoch,
+                "valid drain request detected by drain watcher"
+            );
+            self.drain_tx.send_if_modified(|val| {
+                if !*val {
+                    *val = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            true
+        } else {
+            self.drain_tx.send_if_modified(|val| {
+                if *val {
+                    *val = false;
+                    true
+                } else {
+                    false
+                }
+            });
+            false
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_marker_expiry_is_lenient_and_bounded() {
+        // Given a fixed scan time, independent of the date this test runs.
+        let now = "2026-09-05T12:00:00Z".parse().unwrap();
+        for (id, timestamp, epoch, current, active) in [
+            (
+                "expired_same_epoch",
+                Some("2026-09-05T10:59:59Z"),
+                Some("boot:1"),
+                "boot:1",
+                false,
+            ),
+            (
+                "exact_boundary",
+                Some("2026-09-05T11:00:00Z"),
+                Some("boot:1"),
+                "boot:1",
+                true,
+            ),
+            (
+                "fraction_past_boundary",
+                Some("2026-09-05T10:59:59.999Z"),
+                Some("boot:1"),
+                "boot:1",
+                false,
+            ),
+            (
+                "fresh",
+                Some("2026-09-05T12:00:00Z"),
+                Some("boot:1"),
+                "boot:1",
+                true,
+            ),
+            ("missing", None, Some("boot:1"), "boot:1", true),
+            (
+                "malformed",
+                Some("not-a-time"),
+                Some("boot:1"),
+                "boot:1",
+                true,
+            ),
+            (
+                "future",
+                Some("2026-09-05T12:00:01Z"),
+                Some("boot:1"),
+                "boot:1",
+                true,
+            ),
+            ("wrong_epoch", None, Some("old:1"), "boot:1", false),
+            (
+                "legacy_expired",
+                Some("2026-09-05T10:59:59Z"),
+                None,
+                "boot:1",
+                false,
+            ),
+            (
+                "unknown_epoch_expired",
+                Some("2026-09-05T10:59:59Z"),
+                Some("old:1"),
+                "",
+                false,
+            ),
+            (
+                "unknown_epoch_fresh",
+                Some("2026-09-05T12:00:00Z"),
+                Some("old:1"),
+                "",
+                true,
+            ),
+            (
+                "offset_expired",
+                Some("2026-09-05T12:59:59+02:00"),
+                Some("boot:1"),
+                "boot:1",
+                false,
+            ),
+            (
+                "naive_utc_expired",
+                Some("2026-09-05T10:59:59"),
+                Some("boot:1"),
+                "boot:1",
+                false,
+            ),
+            (
+                "space_utc_expired",
+                Some("2026-09-05 10:59:59"),
+                Some("boot:1"),
+                "boot:1",
+                false,
+            ),
+            (
+                "date_utc_expired",
+                Some("2026-09-05"),
+                Some("boot:1"),
+                "boot:1",
+                false,
+            ),
+        ] {
+            let payload = serde_json::json!({
+                "action": "drain", "requested_at": timestamp, "epoch": epoch,
+                "principal": "u75-operator", "suppress_notification": true
+            })
+            .to_string();
+            // When the marker is validated at that exact time.
+            let actual = validate_marker_at(&payload, current, now);
+            println!("case={id} T={now} current={current:?} payload={payload} expected_active={active} actual={actual:?}");
+            // Then only definite expiry or epoch mismatch makes it inactive.
+            assert_eq!(actual.is_some(), active, "{id}");
+            if let Some(req) = actual {
+                assert_eq!(req.principal.as_deref(), Some("u75-operator"));
+                assert!(req.suppress_notification);
+            }
+        }
+        for payload in ["", "{malformed", "{}", r#"{"requested_at":42}"#] {
+            assert!(validate_marker_at(payload, "boot:1", now).is_some());
+            println!("fail_safe payload={payload:?} active=true");
+        }
+        assert!(validate_marker_at(r#"{"action":"restart"}"#, "boot:1", now).is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_marker_expiry_local_surface() {
+        // Given a real marker and a receiver subscribed before either scan.
+        let temp = tempfile::tempdir().unwrap();
+        let now = "2026-09-05T12:00:00Z".parse().unwrap();
+        let epoch = current_instantiation_epoch();
+        let watcher = DrainWatcher::new(temp.path().to_path_buf(), Duration::from_secs(3));
+        let mut rx = watcher.receiver();
+        let path = drain_request_path(temp.path());
+        let mut req = DrainRequest {
+            requested_at: Some("2026-09-05T10:59:59Z".to_string()),
+            principal: Some("u75-surface".to_string()),
+            suppress_notification: true,
+            ..DrainRequest::default()
+        };
+        let expired = serde_json::to_string(&req).unwrap();
+        fs::write(&path, &expired).unwrap();
+        // When the exact production watcher scan completes with injected time.
+        let active = watcher.scan_at(epoch, now);
+        println!(
+            "scan_completed=true payload={expired} T={now} active={active} receiver={}",
+            *rx.borrow()
+        );
+        // Then the completed scan (not an event timeout) proves inactivity.
+        assert!(!active);
+        assert!(!*rx.borrow());
+        assert!(!rx.has_changed().unwrap());
+        assert!(check_drain_requested_at(temp.path(), epoch, now).is_none());
+
+        // Given the same subscribed receiver, refresh only the timestamp to T.
+        req.requested_at = Some("2026-09-05T12:00:00Z".to_string());
+        let fresh = serde_json::to_string(&req).unwrap();
+        fs::write(&path, &fresh).unwrap();
+        // When scanned again, then the exact subscribed state-change fires.
+        assert!(watcher.scan_at(epoch, now));
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*rx.borrow());
+        assert_eq!(check_drain_requested_at(temp.path(), epoch, now), Some(req));
+        println!("scan_completed=true payload={fresh} T={now} active=true state_change=true");
+
+        // Real public entry used by main: fresh writer -> check -> spawn -> signal.
+        let written = write_drain_request(temp.path(), Some("u75-public-entry"), true).unwrap();
+        assert_eq!(
+            check_drain_requested(temp.path(), epoch),
+            Some(written.clone())
+        );
+        let running = DrainWatcher::new(temp.path().to_path_buf(), Duration::from_secs(3));
+        let mut running_rx = running.receiver();
+        use futures_util::FutureExt;
+
+        let handle = running.spawn();
+        // Catch assertion panics so the owned watcher is reaped before unwinding.
+        let outcome = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(5), running_rx.changed())
+                .await
+                .expect("watcher must signal the fresh marker before the deadline")
+                .expect("watcher state channel must remain open");
+            assert!(*running_rx.borrow());
+        })
+        .catch_unwind()
+        .await;
+        handle.abort();
+        let cancelled = handle.await.expect_err("watcher must exit by cancellation");
+        assert!(cancelled.is_cancelled());
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        println!(
+            "public_entry payload={} watcher_active=true task_joined=true",
+            serde_json::to_string(&written).unwrap()
+        );
+        assert!(clear_drain_request(temp.path()).unwrap());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+        temp.close().unwrap();
+        println!("cleanup=closed empty_marker_directory=true");
+    }
+
+    #[tokio::test]
+    async fn drain_marker_process_helper() {
+        let Ok(dir) = std::env::var("U63_DRAIN_DIR") else {
+            return;
+        };
+        let dir = Path::new(&dir);
+        match std::env::var("U63_DRAIN_ROLE").unwrap().as_str() {
+            "write" => {
+                let req = write_drain_request(dir, Some("u63-external-writer"), true).unwrap();
+                println!("payload={}", serde_json::to_string(&req).unwrap());
+            }
+            "read" => {
+                let detected = check_drain_requested(dir, current_instantiation_epoch());
+                println!("detected={detected:?}");
+                let req = detected.expect("same-boot external marker must be active");
+                assert_eq!(req.principal.as_deref(), Some("u63-external-writer"));
+                assert!(req.suppress_notification);
+                let watcher = DrainWatcher::new(dir.to_path_buf(), Duration::from_secs(3));
+                let mut rx = watcher.receiver();
+                let handle = watcher.spawn();
+                let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+                handle.abort();
+                let joined = handle.await;
+                changed
+                    .expect("watcher must detect external marker")
+                    .unwrap();
+                assert!(*rx.borrow());
+                assert!(joined.is_ok() || joined.unwrap_err().is_cancelled());
+                println!("watcher_active=true");
+            }
+            role => panic!("unknown helper role: {role}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_marker_cross_process_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        for role in ["write", "read"] {
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "drain_control::tests::drain_marker_process_helper",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("U63_DRAIN_DIR", temp.path())
+                .env("U63_DRAIN_ROLE", role)
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+                .await
+                .expect("helper must exit")
+                .unwrap();
+            println!("{role}: {}", String::from_utf8_lossy(&output.stdout));
+            assert!(
+                output.status.success(),
+                "{role} helper failed: {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        // A known boot mismatch is still rejected; an unknown boot is lenient.
+        let path = drain_request_path(temp.path());
+        fs::write(&path, r#"{"action":"drain","epoch":"old-boot:1"}"#).unwrap();
+        assert!(check_drain_requested(temp.path(), "current-boot:2").is_none());
+        assert!(check_drain_requested(temp.path(), "").is_some());
+        fs::write(&path, r#"{"action":"restart"}"#).unwrap();
+        assert!(check_drain_requested(temp.path(), "").is_none());
+        fs::write(&path, "").unwrap();
+        assert!(check_drain_requested(temp.path(), "current-boot:2").is_some());
+        fs::write(&path, "{malformed").unwrap();
+        assert!(check_drain_requested(temp.path(), "current-boot:2").is_some());
+        assert!(clear_drain_request(temp.path()).unwrap());
+        assert!(!clear_drain_request(temp.path()).unwrap());
+        assert!(check_drain_requested(temp.path(), "").is_none());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+        temp.close().unwrap();
+    }
 
     #[test]
     fn test_marker_epoch_validation_fresh_vs_stale() {
@@ -245,10 +589,11 @@ mod tests {
     #[test]
     fn test_validate_marker_content() {
         let current = "epoch-abc";
+        let now = "2026-08-16T12:00:00Z".parse().unwrap();
 
         // Valid payload with matching epoch
         let json_matching = r#"{"action":"drain","requested_at":"2026-08-16T12:00:00Z","principal":"admin","epoch":"epoch-abc"}"#;
-        let validated = validate_marker(json_matching, current);
+        let validated = validate_marker_at(json_matching, current, now);
         assert!(validated.is_some());
         let req = validated.unwrap();
         assert_eq!(req.action, "drain");
@@ -257,19 +602,19 @@ mod tests {
 
         // Payload with mismatched epoch -> rejected as stale (None)
         let json_stale = r#"{"action":"drain","requested_at":"2026-08-16T12:00:00Z","principal":"admin","epoch":"old-epoch-xyz"}"#;
-        assert!(validate_marker(json_stale, current).is_none());
+        assert!(validate_marker_at(json_stale, current, now).is_none());
 
         // Payload with legacy/missing epoch -> accepted
         let json_no_epoch = r#"{"action":"drain","requested_at":"2026-08-16T12:00:00Z"}"#;
-        assert!(validate_marker(json_no_epoch, current).is_some());
+        assert!(validate_marker_at(json_no_epoch, current, now).is_some());
 
         // Action not drain -> rejected
         let json_other_action = r#"{"action":"restart","epoch":"epoch-abc"}"#;
-        assert!(validate_marker(json_other_action, current).is_none());
+        assert!(validate_marker_at(json_other_action, current, now).is_none());
 
         // Corrupt JSON -> accepted as fail-safe drain
         let json_corrupt = "{malformed json";
-        let fallback = validate_marker(json_corrupt, current);
+        let fallback = validate_marker_at(json_corrupt, current, now);
         assert!(fallback.is_some());
         assert_eq!(fallback.unwrap().action, "drain");
     }

@@ -1,0 +1,62 @@
+$ cargo test --lib drain_control::tests -- --nocapture
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.40s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 7 tests
+test drain_control::tests::test_marker_epoch_validation_fresh_vs_stale ... ok
+test drain_control::tests::drain_marker_process_helper ... ok
+test drain_control::tests::test_validate_marker_content ... ok
+case=expired_same_epoch T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05T10:59:59Z","suppress_notification":true} expected_active=false actual=None
+case=exact_boundary T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05T11:00:00Z","suppress_notification":true} expected_active=true actual=Some(DrainRequest { action: "drain", requested_at: Some("2026-09-05T11:00:00Z"), principal: Some("u75-operator"), epoch: Some("boot:1"), suppress_notification: true })
+case=fraction_past_boundary T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05T10:59:59.999Z","suppress_notification":true} expected_active=false actual=None
+case=fresh T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05T12:00:00Z","suppress_notification":true} expected_active=true actual=Some(DrainRequest { action: "drain", requested_at: Some("2026-09-05T12:00:00Z"), principal: Some("u75-operator"), epoch: Some("boot:1"), suppress_notification: true })
+case=missing T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":null,"suppress_notification":true} expected_active=true actual=Some(DrainRequest { action: "drain", requested_at: None, principal: Some("u75-operator"), epoch: Some("boot:1"), suppress_notification: true })
+case=malformed T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"not-a-time","suppress_notification":true} expected_active=true actual=Some(DrainRequest { action: "drain", requested_at: Some("not-a-time"), principal: Some("u75-operator"), epoch: Some("boot:1"), suppress_notification: true })
+case=future T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05T12:00:01Z","suppress_notification":true} expected_active=true actual=Some(DrainRequest { action: "drain", requested_at: Some("2026-09-05T12:00:01Z"), principal: Some("u75-operator"), epoch: Some("boot:1"), suppress_notification: true })
+case=wrong_epoch T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"old:1","principal":"u75-operator","requested_at":null,"suppress_notification":true} expected_active=false actual=None
+case=legacy_expired T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":null,"principal":"u75-operator","requested_at":"2026-09-05T10:59:59Z","suppress_notification":true} expected_active=false actual=None
+case=unknown_epoch_expired T=2026-09-05 12:00:00 UTC current="" payload={"action":"drain","epoch":"old:1","principal":"u75-operator","requested_at":"2026-09-05T10:59:59Z","suppress_notification":true} expected_active=false actual=None
+case=unknown_epoch_fresh T=2026-09-05 12:00:00 UTC current="" payload={"action":"drain","epoch":"old:1","principal":"u75-operator","requested_at":"2026-09-05T12:00:00Z","suppress_notification":true} expected_active=true actual=Some(DrainRequest { action: "drain", requested_at: Some("2026-09-05T12:00:00Z"), principal: Some("u75-operator"), epoch: Some("old:1"), suppress_notification: true })
+case=offset_expired T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05T12:59:59+02:00","suppress_notification":true} expected_active=false actual=None
+case=naive_utc_expired T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05T10:59:59","suppress_notification":true} expected_active=false actual=None
+case=space_utc_expired T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05 10:59:59","suppress_notification":true} expected_active=false actual=None
+case=date_utc_expired T=2026-09-05 12:00:00 UTC current="boot:1" payload={"action":"drain","epoch":"boot:1","principal":"u75-operator","requested_at":"2026-09-05","suppress_notification":true} expected_active=false actual=None
+fail_safe payload="" active=true
+fail_safe payload="{malformed" active=true
+fail_safe payload="{}" active=true
+fail_safe payload="{\"requested_at\":42}" active=true
+test drain_control::tests::drain_marker_expiry_is_lenient_and_bounded ... ok
+scan_completed=true payload={"action":"drain","requested_at":"2026-09-05T10:59:59Z","principal":"u75-surface","epoch":"","suppress_notification":true} T=2026-09-05 12:00:00 UTC active=false receiver=false
+test drain_control::tests::test_write_and_clear_drain_request_roundtrip ... ok
+scan_completed=true payload={"action":"drain","requested_at":"2026-09-05T12:00:00Z","principal":"u75-surface","epoch":"","suppress_notification":true} T=2026-09-05 12:00:00 UTC active=true state_change=true
+public_entry payload={"action":"drain","requested_at":"2026-09-05T15:04:18.328774+00:00","principal":"u75-public-entry","epoch":"","suppress_notification":true} watcher_active=true task_joined=true
+cleanup=closed empty_marker_directory=true
+test drain_control::tests::drain_marker_expiry_local_surface ... ok
+write: 
+running 1 test
+payload={"action":"drain","requested_at":"2026-09-05T15:04:18.334579+00:00","principal":"u63-external-writer","epoch":"","suppress_notification":true}
+test drain_control::tests::drain_marker_process_helper ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 319 filtered out; finished in 0.00s
+
+
+read: 
+running 1 test
+detected=Some(DrainRequest { action: "drain", requested_at: Some("2026-09-05T15:04:18.334579+00:00"), principal: Some("u63-external-writer"), epoch: Some(""), suppress_notification: true })
+watcher_active=true
+test drain_control::tests::drain_marker_process_helper ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 319 filtered out; finished in 0.00s
+
+
+test drain_control::tests::drain_marker_cross_process_epoch ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 313 filtered out; finished in 0.02s
+
+
+EXIT_CODE=0

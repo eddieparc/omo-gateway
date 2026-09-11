@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 pub const DISK_DEGRADED_PERCENT: f64 = 90.0;
+pub const DISK_BYTES_PER_MB: u64 = 1024 * 1024;
+pub const DISK_CRITICAL_FREE_FLOOR_MB: u64 = 256;
+pub const DISK_CRITICAL_PERCENT_FLOOR: f64 = 95.0;
+pub const DISK_CRITICAL_HEADROOM_MB: u64 = 1024;
+pub const DISK_ELEVATED_FREE_FLOOR_MB: u64 = 512;
+pub const DISK_ELEVATED_PERCENT_FLOOR: f64 = 85.0;
+pub const DISK_ELEVATED_HEADROOM_MB: u64 = 4096;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CheckResult {
@@ -62,24 +69,65 @@ impl ReadinessReport {
     }
 }
 
-/// Calculates disk headroom status and used percentage from total and free byte counts.
+/// Classifies disk pressure from total and free byte counts into "ok", "elevated", "critical", or "unknown".
+pub fn classify_disk_pressure(total_bytes: u64, free_bytes: u64) -> &'static str {
+    classify_disk_pressure_opt(Some(total_bytes), Some(free_bytes))
+}
+
+/// Classifies disk pressure from optional total and free byte counts.
+///
+/// Unreadable or zero-capacity samples return "unknown" so unusable filesystems are never reported as healthy.
+pub fn classify_disk_pressure_opt(
+    total_bytes: Option<u64>,
+    free_bytes: Option<u64>,
+) -> &'static str {
+    let (Some(total), Some(free)) = (total_bytes, free_bytes) else {
+        return "unknown";
+    };
+    if total == 0 || free > total {
+        return "unknown";
+    }
+    let total_mb = total / DISK_BYTES_PER_MB;
+    let free_mb = free / DISK_BYTES_PER_MB;
+    if total_mb == 0 || free_mb > total_mb {
+        return "unknown";
+    }
+    let used_percent = (1.0 - (free_mb as f64 / total_mb as f64)) * 100.0;
+    if free_mb < DISK_CRITICAL_FREE_FLOOR_MB
+        || (used_percent >= DISK_CRITICAL_PERCENT_FLOOR && free_mb < DISK_CRITICAL_HEADROOM_MB)
+    {
+        "critical"
+    } else if free_mb < DISK_ELEVATED_FREE_FLOOR_MB
+        || (used_percent >= DISK_ELEVATED_PERCENT_FLOOR && free_mb < DISK_ELEVATED_HEADROOM_MB)
+    {
+        "elevated"
+    } else {
+        "ok"
+    }
+}
+
+/// Calculates disk headroom status, used percentage, and pressure classification from total and free byte counts.
 pub fn calculate_disk_headroom(
     total_bytes: u64,
     free_bytes: u64,
-    threshold_pct: f64,
-) -> (String, f64) {
-    if total_bytes == 0 {
-        return ("ok".to_string(), 0.0);
+    _threshold_pct: f64,
+) -> (String, f64, String) {
+    if total_bytes == 0 || free_bytes > total_bytes {
+        return ("degraded".to_string(), 0.0, "unknown".to_string());
+    }
+    let pressure = classify_disk_pressure(total_bytes, free_bytes);
+    if pressure == "unknown" {
+        return ("degraded".to_string(), 0.0, "unknown".to_string());
     }
     let used_bytes = total_bytes.saturating_sub(free_bytes);
     let used_pct = (used_bytes as f64 / total_bytes as f64) * 100.0;
     let rounded_pct = (used_pct * 10.0).round() / 10.0;
-    let status = if rounded_pct >= threshold_pct {
-        "degraded".to_string()
-    } else {
+    let status = if pressure == "ok" {
         "ok".to_string()
+    } else {
+        "degraded".to_string()
     };
-    (status, rounded_pct)
+    (status, rounded_pct, pressure.to_string())
 }
 
 /// Probes SQLite database connectivity via a non-destructive read query.
@@ -99,27 +147,31 @@ pub fn probe_disk(workspace_root: &Path) -> CheckResult {
         Ok(t) => t,
         Err(err) => {
             return CheckResult::degraded(format!("failed to read total disk space: {err}"))
+                .with_metric("pressure", "unknown")
         }
     };
     let free = match fs2::available_space(workspace_root) {
         Ok(f) => f,
         Err(err) => {
             return CheckResult::degraded(format!("failed to read available disk space: {err}"))
+                .with_metric("total_bytes", total)
+                .with_metric("pressure", "unknown")
         }
     };
 
-    let (status, used_pct) = calculate_disk_headroom(total, free, DISK_DEGRADED_PERCENT);
+    let (status, used_pct, pressure) = calculate_disk_headroom(total, free, DISK_DEGRADED_PERCENT);
     let mut check = if status == "ok" {
         CheckResult::ok()
     } else {
-        CheckResult::degraded(format!(
-            "disk usage at {used_pct}% (>= {DISK_DEGRADED_PERCENT}%)"
-        ))
+        CheckResult::degraded(format!("disk pressure is {pressure}, usage at {used_pct}%"))
     };
     check = check
         .with_metric("total_bytes", total)
         .with_metric("free_bytes", free)
-        .with_metric("used_percent", used_pct);
+        .with_metric("total_mb", total / DISK_BYTES_PER_MB)
+        .with_metric("free_mb", free / DISK_BYTES_PER_MB)
+        .with_metric("used_percent", used_pct)
+        .with_metric("pressure", pressure);
     check
 }
 
@@ -177,6 +229,47 @@ pub fn probe_gateway(bot_count: usize) -> CheckResult {
     }
 }
 
+/// Probes the local agent backend daemon health.
+pub async fn probe_backend(appserver_url: Option<&str>) -> CheckResult {
+    let url = appserver_url.unwrap_or("http://127.0.0.1:18800");
+    let http_url = if let Some(stripped) = url.strip_prefix("ws://") {
+        format!("http://{stripped}")
+    } else if let Some(stripped) = url.strip_prefix("wss://") {
+        format!("https://{stripped}")
+    } else {
+        url.to_string()
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(800))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return CheckResult::degraded(format!("failed to build HTTP client: {e}")),
+    };
+
+    let base = http_url.trim_end_matches('/');
+    let target_readyz = format!("{base}/readyz");
+    let target_health = format!("{base}/health");
+
+    let resp = match client.get(&target_readyz).send().await {
+        Ok(r) if r.status().is_success() => return CheckResult::ok(),
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+            client.get(&target_health).send().await
+        }
+        Ok(r) => Ok(r),
+        Err(_) => client.get(&target_health).send().await,
+    };
+
+    match resp {
+        Ok(r) if r.status().is_success() => CheckResult::ok(),
+        Ok(r) => CheckResult::degraded(format!("backend returned HTTP {}", r.status())),
+        Err(err) => {
+            CheckResult::degraded(format!("backend connection refused or unreachable: {err}"))
+        }
+    }
+}
+
 /// Collects non-destructive startup and runtime readiness probes across database, disk, credentials, and gateway.
 pub async fn collect_runtime_readiness(
     pool: &SqlitePool,
@@ -190,6 +283,11 @@ pub async fn collect_runtime_readiness(
     checks.insert("disk".to_string(), probe_disk(workspace_root));
     checks.insert("credentials".to_string(), probe_credentials(default_model));
     checks.insert("gateway".to_string(), probe_gateway(bot_count));
+    let appserver_url = std::env::var("OMON_APPSERVER_URL").ok();
+    checks.insert(
+        "backend".to_string(),
+        probe_backend(appserver_url.as_deref()).await,
+    );
 
     let overall_status = if checks.values().all(|c| c.status == "ok") {
         "ok".to_string()
@@ -208,31 +306,131 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disk_pressure_uses_absolute_headroom() {
+        let sample1 = calculate_disk_headroom(
+            1000 * DISK_BYTES_PER_MB,
+            200 * DISK_BYTES_PER_MB,
+            DISK_DEGRADED_PERCENT,
+        );
+        let sample2 = calculate_disk_headroom(
+            1000000 * DISK_BYTES_PER_MB,
+            50000 * DISK_BYTES_PER_MB,
+            DISK_DEGRADED_PERCENT,
+        );
+        let sample3 = calculate_disk_headroom(0, 0, DISK_DEGRADED_PERCENT);
+
+        println!(
+            "case=1 total_mb=1000 free_mb=200 status={} pct={} pressure={}",
+            sample1.0, sample1.1, sample1.2
+        );
+        println!(
+            "case=2 total_mb=1000000 free_mb=50000 status={} pct={} pressure={}",
+            sample2.0, sample2.1, sample2.2
+        );
+        println!(
+            "case=3 total_mb=0 free_mb=0 status={} pct={} pressure={}",
+            sample3.0, sample3.1, sample3.2
+        );
+
+        // Case 1: 1000 MiB total, 200 MiB free (80% used, but < 256 MiB free floor)
+        // GREEN: status must be "degraded", pressure must be "critical"
+        assert_eq!(
+            sample1.0, "degraded",
+            "sample 1 must be degraded due to critical headroom"
+        );
+        assert_eq!(
+            sample1.2, "critical",
+            "sample 1 must classify as critical pressure"
+        );
+
+        // Case 2: 1000000 MiB total, 50000 MiB free (95% used, but 50 GB free headroom)
+        // GREEN: status must be "ok", pressure must be "ok"
+        assert_eq!(sample2.0, "ok", "sample 2 must be ok with 50 GB headroom");
+        assert_eq!(sample2.2, "ok", "sample 2 must classify as ok pressure");
+
+        // Case 3: 0 total, 0 free (unusable / zero capacity sample)
+        // GREEN: status must be nonhealthy ("degraded"), pressure must be "unknown"
+        assert_ne!(
+            sample3.0, "ok",
+            "sample 3 must not be healthy for zero total capacity"
+        );
+        assert_eq!(
+            sample3.0, "degraded",
+            "sample 3 must be degraded for zero total capacity"
+        );
+        assert_eq!(
+            sample3.2, "unknown",
+            "sample 3 must classify as unknown pressure"
+        );
+    }
+
+    #[test]
     fn test_disk_headroom_calculation() {
-        // 50% usage -> ok
-        let (status, pct) = calculate_disk_headroom(1000, 500, 90.0);
+        // 50% usage with sufficient headroom -> ok
+        let (status, pct, pressure) = calculate_disk_headroom(
+            100_000 * DISK_BYTES_PER_MB,
+            50_000 * DISK_BYTES_PER_MB,
+            DISK_DEGRADED_PERCENT,
+        );
         assert_eq!(status, "ok");
         assert_eq!(pct, 50.0);
+        assert_eq!(pressure, "ok");
 
-        // 89.9% usage -> ok
-        let (status, pct) = calculate_disk_headroom(1000, 101, 90.0);
+        // 89.9% usage with sufficient headroom -> ok
+        let (status, pct, pressure) = calculate_disk_headroom(
+            100_000 * DISK_BYTES_PER_MB,
+            10_100 * DISK_BYTES_PER_MB,
+            DISK_DEGRADED_PERCENT,
+        );
         assert_eq!(status, "ok");
         assert_eq!(pct, 89.9);
+        assert_eq!(pressure, "ok");
 
-        // 90.0% usage -> degraded
-        let (status, pct) = calculate_disk_headroom(1000, 100, 90.0);
+        // High usage (95%) but large absolute headroom (50 GB) -> ok
+        let (status, pct, pressure) = calculate_disk_headroom(
+            1_000_000 * DISK_BYTES_PER_MB,
+            50_000 * DISK_BYTES_PER_MB,
+            DISK_DEGRADED_PERCENT,
+        );
+        assert_eq!(status, "ok");
+        assert_eq!(pct, 95.0);
+        assert_eq!(pressure, "ok");
+
+        // Elevated: < 512 MB free (and < 95% used) -> degraded / elevated
+        let (status, pct, pressure) = calculate_disk_headroom(
+            4_000 * DISK_BYTES_PER_MB,
+            400 * DISK_BYTES_PER_MB,
+            DISK_DEGRADED_PERCENT,
+        );
         assert_eq!(status, "degraded");
         assert_eq!(pct, 90.0);
+        assert_eq!(pressure, "elevated");
 
-        // 95% usage -> degraded
-        let (status, pct) = calculate_disk_headroom(1000, 50, 90.0);
+        // Critical: >= 95% used AND < 1024 MB free -> degraded / critical
+        let (status, pct, pressure) = calculate_disk_headroom(
+            10_000 * DISK_BYTES_PER_MB,
+            400 * DISK_BYTES_PER_MB,
+            DISK_DEGRADED_PERCENT,
+        );
         assert_eq!(status, "degraded");
-        assert_eq!(pct, 95.0);
+        assert_eq!(pct, 96.0);
+        assert_eq!(pressure, "critical");
 
-        // 0 total -> ok fallback
-        let (status, pct) = calculate_disk_headroom(0, 0, 90.0);
-        assert_eq!(status, "ok");
+        // Critical: < 256 MB free -> degraded / critical
+        let (status, pct, pressure) = calculate_disk_headroom(
+            1_000 * DISK_BYTES_PER_MB,
+            200 * DISK_BYTES_PER_MB,
+            DISK_DEGRADED_PERCENT,
+        );
+        assert_eq!(status, "degraded");
+        assert_eq!(pct, 80.0);
+        assert_eq!(pressure, "critical");
+
+        // 0 total -> unusable capacity, degraded / unknown (not ok fallback)
+        let (status, pct, pressure) = calculate_disk_headroom(0, 0, DISK_DEGRADED_PERCENT);
+        assert_eq!(status, "degraded");
         assert_eq!(pct, 0.0);
+        assert_eq!(pressure, "unknown");
     }
 
     #[tokio::test]
@@ -275,6 +473,7 @@ mod tests {
         assert_eq!(report.checks["state_db"].status, "ok");
         assert!(report.checks["disk"].status == "ok" || report.checks["disk"].status == "degraded");
         assert!(report.checks["disk"].metrics.contains_key("used_percent"));
+        assert!(report.checks["disk"].metrics.contains_key("pressure"));
         assert_eq!(report.checks["gateway"].status, "ok");
         assert!(report.status == "ok" || report.status == "degraded");
     }

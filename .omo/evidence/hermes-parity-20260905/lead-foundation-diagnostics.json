@@ -1,0 +1,274 @@
+[
+  {
+    "file": "src/agent/omo_daemon.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/agent/omo_daemon.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false
+    },
+    "message": "No diagnostics found"
+  },
+  {
+    "file": "src/discord/approval.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/discord/approval.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false
+    },
+    "message": "No diagnostics found"
+  },
+  {
+    "file": "src/discord/table_render/mod.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/discord/table_render/mod.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false
+    },
+    "message": "No diagnostics found"
+  },
+  {
+    "file": "src/drain_control.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/drain_control.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false
+    },
+    "message": "No diagnostics found"
+  },
+  {
+    "file": "src/main.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/main.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/main.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/main.rs within 3000ms."
+  },
+  {
+    "file": "src/migrate/config_import.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/migrate/config_import.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/migrate/config_import.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/migrate/config_import.rs within 3000ms."
+  },
+  {
+    "file": "src/migrate/cron_cutover.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/migrate/cron_cutover.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/migrate/cron_cutover.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/migrate/cron_cutover.rs within 3000ms."
+  },
+  {
+    "file": "src/migrate/sys.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/migrate/sys.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/migrate/sys.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/migrate/sys.rs within 3000ms."
+  },
+  {
+    "file": "src/multiplexer/restart_loop_guard.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/multiplexer/restart_loop_guard.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/multiplexer/restart_loop_guard.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/multiplexer/restart_loop_guard.rs within 3000ms."
+  },
+  {
+    "file": "src/security/hardline.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/security/hardline.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/security/hardline.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/security/hardline.rs within 3000ms."
+  },
+  {
+    "file": "src/security/normalize.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/security/normalize.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/security/normalize.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/security/normalize.rs within 3000ms."
+  },
+  {
+    "file": "src/security/tirith.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/security/tirith.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/security/tirith.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/security/tirith.rs within 3000ms."
+  },
+  {
+    "file": "src/storage/db.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/storage/db.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/storage/db.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/storage/db.rs within 3000ms."
+  },
+  {
+    "file": "src/tools/mod.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/tools/mod.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/tools/mod.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/tools/mod.rs within 3000ms."
+  },
+  {
+    "file": "src/tools/skills.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/tools/skills.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/tools/skills.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/tools/skills.rs within 3000ms."
+  },
+  {
+    "file": "src/tools/terminal.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/tools/terminal.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/tools/terminal.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/tools/terminal.rs within 3000ms."
+  },
+  {
+    "file": "tests/test_migrate.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/tests/test_migrate.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/tests/test_migrate.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/tests/test_migrate.rs within 3000ms."
+  },
+  {
+    "file": "src/agent/omo_backend.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/agent/omo_backend.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/agent/omo_backend.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/agent/omo_backend.rs within 3000ms."
+  },
+  {
+    "file": "tests/test_omo_backend.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/tests/test_omo_backend.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/tests/test_omo_backend.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/tests/test_omo_backend.rs within 3000ms."
+  },
+  {
+    "file": "src/agent/omo_config.rs",
+    "result": {
+      "filePath": "/Users/indo/code/project/omon-gateway/src/agent/omo_config.rs",
+      "severity": "all",
+      "mode": "file",
+      "diagnostics": [],
+      "totalDiagnostics": 0,
+      "truncated": false,
+      "error": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/agent/omo_config.rs within 3000ms.",
+      "errorKind": "freshness_timeout"
+    },
+    "message": "Timed out waiting for fresh diagnostics for /Users/indo/code/project/omon-gateway/src/agent/omo_config.rs within 3000ms."
+  }
+]

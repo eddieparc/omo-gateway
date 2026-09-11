@@ -1,0 +1,9 @@
+$ cargo build
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on shared package cache
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 29.32s
+
+EXIT_CODE=0

@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 pub const DEFAULT_MAX_RESTARTS: usize = 3;
 pub const DEFAULT_WINDOW_SECONDS: u64 = 60;
+pub const DEFAULT_MAX_GAP_SECONDS: u64 = 300;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct BootLog {
@@ -14,12 +15,12 @@ struct BootLog {
     boots: Vec<f64>,
 }
 
-/// Persistent sliding-window circuit breaker to suppress crash-loop auto-resumes.
+/// Persistent consecutive-boot circuit breaker to suppress crash-loop auto-resumes.
 ///
 /// When an agent or turn triggers a fatal crash/SIGTERM, the supervisor (launchd /
 /// systemd) automatically restarts the gateway. On boot, if restart-interrupted
-/// sessions are pending and the gateway restarts >= `max_restarts` times within
-/// `window_seconds`, the breaker trips and skips auto-resuming those sessions.
+/// sessions are pending, consecutive boots separated by at most 300s remain one
+/// loop. A larger configured window widens that gap, never narrows it.
 #[derive(Clone, Debug)]
 pub struct RestartLoopGuard {
     path: PathBuf,
@@ -77,32 +78,41 @@ impl RestartLoopGuard {
         }
     }
 
-    /// Records that the gateway just booted with resume-pending sessions.
-    /// Prunes boots older than `window_seconds` and appends `now`.
+    fn boot_chain_at(&self, now: f64) -> Vec<f64> {
+        let mut boots = self.load_boots();
+        boots.sort_by(f64::total_cmp);
+        let gap = self.window_seconds.max(DEFAULT_MAX_GAP_SECONDS) as f64;
+        let mut previous = now;
+        let start = boots
+            .iter()
+            .rposition(|&boot| {
+                if boot > now {
+                    return false;
+                }
+                if previous - boot > gap {
+                    return true;
+                }
+                previous = boot;
+                false
+            })
+            .map_or(0, |index| index + 1);
+        boots.drain(..start);
+        boots
+    }
+
+    /// Records a restart-interrupted boot, keeping only its consecutive chain.
     pub fn record_boot_at(&self, now: f64) -> Vec<f64> {
-        let cutoff = now - (self.window_seconds.max(1) as f64);
-        let mut boots: Vec<f64> = self
-            .load_boots()
-            .into_iter()
-            .filter(|&t| t >= cutoff)
-            .collect();
+        let mut boots = self.boot_chain_at(now);
         boots.push(now);
+        let retained = 50.max(self.max_restarts);
+        boots.drain(..boots.len().saturating_sub(retained));
         self.save_boots(&boots);
         boots
     }
 
-    /// Returns `true` if the number of recent boots within `window_seconds` >= `max_restarts`.
+    /// Returns whether the unbroken boot chain has reached the configured limit.
     pub fn is_tripped_at(&self, now: f64) -> bool {
-        if self.max_restarts == 0 {
-            return false;
-        }
-        let cutoff = now - (self.window_seconds.max(1) as f64);
-        let recent_count = self
-            .load_boots()
-            .into_iter()
-            .filter(|&t| t >= cutoff)
-            .count();
-        recent_count >= self.max_restarts
+        self.max_restarts > 0 && self.boot_chain_at(now).len() >= self.max_restarts
     }
 
     /// Records this restart boot timestamp and checks if the breaker is tripped.
@@ -117,13 +127,10 @@ impl RestartLoopGuard {
         if tripped {
             warn!(
                 boots = boots.len(),
-                window_seconds = self.window_seconds,
+                max_gap_seconds = self.window_seconds.max(DEFAULT_MAX_GAP_SECONDS),
                 max_restarts = self.max_restarts,
                 path = %self.path.display(),
-                "Restart-loop breaker TRIPPED: {} boots within {}s (threshold {}). Skipping auto-resume to break crash loop.",
-                boots.len(),
-                self.window_seconds,
-                self.max_restarts,
+                "Restart-loop breaker TRIPPED: skipping auto-resume for consecutive interrupted boots"
             );
         }
         tripped
@@ -146,6 +153,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restart_chain_trips_for_slow_cycles() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("slow.json");
+        let verdicts: Vec<_> = [0.0, 150.0, 300.0]
+            .into_iter()
+            .map(|now| RestartLoopGuard::new(&path).check_and_record_at(now))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [false, false, true],
+            "slow persisted restart chain"
+        );
+        let guard = RestartLoopGuard::new(&path);
+        assert!(
+            guard.is_tripped_at(600.0),
+            "the 300s boundary remains linked"
+        );
+        assert!(!guard.is_tripped_at(601.0), "a quiet 301s gap resets");
+        assert!(!guard.check_and_record_at(601.0));
+        assert_eq!(guard.load_boots(), [601.0]);
+
+        let disabled = RestartLoopGuard::with_config(temp.path().join("off.json"), 0, 60);
+        for now in 0..100 {
+            assert!(!disabled.check_and_record_at(f64::from(now)));
+        }
+        assert!(!disabled.is_tripped_at(100.0));
+        assert!(
+            disabled.load_boots().len() <= 50,
+            "bounded persisted history"
+        );
+    }
+
+    #[test]
     fn test_sliding_window_trip_logic() {
         let temp = tempfile::tempdir().unwrap();
         let guard_file = temp.path().join("restart_loop.json");
@@ -165,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sliding_window_prunes_expired_boots() {
+    fn test_quiet_gap_prunes_expired_boots() {
         let temp = tempfile::tempdir().unwrap();
         let guard_file = temp.path().join("restart_loop.json");
         let guard = RestartLoopGuard::with_config(&guard_file, 3, 60);
@@ -175,14 +215,14 @@ mod tests {
         // Boot 2 at t=30.0
         assert!(!guard.check_and_record_at(30.0));
 
-        // Boot 3 arrives at t=70.0 (t=0.0 is now outside 60s window: cutoff 10.0)
-        // Window now contains: [30.0, 70.0] -> count=2 -> not tripped!
-        assert!(!guard.check_and_record_at(70.0));
-        assert!(!guard.is_tripped_at(70.0));
+        // A 301s quiet gap ends the old chain despite the persisted history.
+        assert!(!guard.check_and_record_at(331.0));
+        assert!(!guard.is_tripped_at(331.0));
+        assert_eq!(guard.load_boots(), [331.0]);
 
-        // Boot 4 at t=80.0 (cutoff 20.0: 30.0, 70.0 are within window) -> Window: [30.0, 70.0, 80.0] -> count=3 -> tripped!
-        assert!(guard.check_and_record_at(80.0));
-        assert!(guard.is_tripped_at(80.0));
+        assert!(!guard.check_and_record_at(400.0));
+        assert!(guard.check_and_record_at(550.0));
+        assert!(guard.is_tripped_at(550.0));
     }
 
     #[test]

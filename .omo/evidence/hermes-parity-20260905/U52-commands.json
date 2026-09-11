@@ -1,0 +1,6 @@
+[
+  "cargo test --test test_cron_authority_upgrade -- --exact --nocapture",
+  "cargo test --test test_migrate cutover_survives_startup_sync -- --exact --nocapture",
+  "cargo test --lib cron",
+  "git diff --check -- migrations/0022_cron_authority.sql tests/test_cron_authority_upgrade.rs"
+]

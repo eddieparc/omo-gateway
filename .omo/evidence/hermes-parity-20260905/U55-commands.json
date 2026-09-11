@@ -1,0 +1,7 @@
+[
+  "cargo test --lib migrate::config_import::tests::dotenv_round_trip_special_values -- --exact --nocapture",
+  "cargo test --lib migrate::config_import::tests:: -- --nocapture",
+  "cargo build",
+  "cargo test --lib migrate::config_import::tests::dotenv_raw_documents_round_trip -- --exact --nocapture",
+  "cargo test --lib migrate::config_import::tests::dotenv_existing_assignments_reload_special_values -- --exact --nocapture"
+]

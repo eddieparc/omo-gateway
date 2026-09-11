@@ -1,0 +1,8 @@
+[
+  "cargo test --lib security::tirith::tests::scanner_warning_and_invalid_payload_never_silently_pass -- --exact --nocapture",
+  "cargo test --lib security::tirith::tests::scanner_caps_precede_persistence -- --exact --nocapture",
+  "cargo test --lib tools::tests::tool_approval_scopes_do_not_cross_rules -- --exact --nocapture",
+  "cargo test --lib security::tirith::tests -- --nocapture",
+  "cargo test --lib tools::terminal::approval_tests -- --nocapture",
+  "cargo build"
+]

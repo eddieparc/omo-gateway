@@ -39,25 +39,54 @@ pub struct MarkdownTable {
 }
 
 pub fn extract_markdown_tables(text: &str) -> Vec<MarkdownTable> {
+    extract_markdown_table_spans(text)
+        .into_iter()
+        .map(|(_, table)| table)
+        .collect()
+}
+
+fn extract_markdown_table_spans(text: &str) -> Vec<(std::ops::Range<usize>, MarkdownTable)> {
     let mut tables = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
+    let mut offset = 0;
+    let mut starts = Vec::new();
+    let lines: Vec<&str> = text
+        .split_inclusive('\n')
+        .map(|line| {
+            starts.push(offset);
+            offset += line.len();
+            line.trim_end_matches(['\r', '\n'])
+        })
+        .collect();
     let mut i = 0;
+    let mut fence: Option<(char, usize)> = None;
 
     while i < lines.len() {
         let line = lines[i].trim();
+        let marker = line.chars().next().unwrap_or(' ');
+        let marker_len = line.chars().take_while(|&c| c == marker).count();
+        if let Some((open, length)) = fence {
+            if marker == open && marker_len >= length && line[marker_len..].trim().is_empty() {
+                fence = None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(marker, '`' | '~') && marker_len >= 3 {
+            fence = Some((marker, marker_len));
+            i += 1;
+            continue;
+        }
         if line.starts_with('|') && line.ends_with('|') && i + 1 < lines.len() {
             let next_line = lines[i + 1].trim();
             if is_table_separator(next_line) {
                 let headers = parse_table_row(line);
                 let mut rows = Vec::new();
-                let mut raw_lines = vec![lines[i], lines[i + 1]];
                 let mut j = i + 2;
 
                 while j < lines.len() {
                     let row_line = lines[j].trim();
                     if row_line.starts_with('|') && row_line.ends_with('|') {
                         rows.push(parse_table_row(row_line));
-                        raw_lines.push(lines[j]);
                         j += 1;
                     } else {
                         break;
@@ -65,11 +94,15 @@ pub fn extract_markdown_tables(text: &str) -> Vec<MarkdownTable> {
                 }
 
                 if !rows.is_empty() {
-                    tables.push(MarkdownTable {
-                        headers,
-                        rows,
-                        raw: raw_lines.join("\n"),
-                    });
+                    let span = starts[i]..starts[j - 1] + lines[j - 1].len();
+                    tables.push((
+                        span.clone(),
+                        MarkdownTable {
+                            headers,
+                            rows,
+                            raw: text[span].to_string(),
+                        },
+                    ));
                     i = j;
                     continue;
                 }
@@ -125,19 +158,25 @@ pub fn render_table_to_svg(table: &MarkdownTable) -> String {
             if paragraph.is_empty() {
                 continue;
             }
-            let max_line_chars = ((width - cell_padding_x * 2.0) / 9.0).max(10.0) as usize;
+            // A full em accommodates wide CJK glyphs as well as Latin text.
+            let max_line_chars = ((width - cell_padding_x * 2.0) / font_size).max(1.0) as usize;
             let mut current = String::new();
             for word in paragraph.split_whitespace() {
-                if current.chars().count() + word.chars().count() + 1 > max_line_chars {
-                    if !current.is_empty() {
-                        wrapped.push(current.clone());
-                        current.clear();
-                    }
+                if current.chars().count() + word.chars().count() + 1 > max_line_chars
+                    && !current.is_empty()
+                {
+                    wrapped.push(current.clone());
+                    current.clear();
                 }
                 if !current.is_empty() {
                     current.push(' ');
                 }
-                current.push_str(word);
+                for ch in word.chars() {
+                    if current.chars().count() == max_line_chars {
+                        wrapped.push(std::mem::take(&mut current));
+                    }
+                    current.push(ch);
+                }
             }
             if !current.is_empty() {
                 wrapped.push(current);
@@ -258,8 +297,10 @@ fn html_escape(text: &str) -> String {
 }
 
 pub fn svg_to_png(svg_str: &str, scale: f32) -> Result<Vec<u8>, String> {
-    let mut opt = usvg::Options::default();
-    opt.font_family = "sans-serif".to_string();
+    let mut opt = usvg::Options {
+        font_family: "sans-serif".to_string(),
+        ..Default::default()
+    };
     opt.fontdb_mut().load_system_fonts();
 
     let tree = usvg::Tree::from_str(svg_str, &opt).map_err(|e| e.to_string())?;
@@ -279,21 +320,24 @@ pub fn svg_to_png(svg_str: &str, scale: f32) -> Result<Vec<u8>, String> {
 }
 
 pub fn transform_markdown_tables_to_images(content: &str) -> (String, Vec<RenderedTable>) {
-    let tables = extract_markdown_tables(content);
+    let tables = extract_markdown_table_spans(content);
     if tables.is_empty() {
         return (content.to_string(), Vec::new());
     }
 
     let mut rendered = Vec::new();
-    let mut modified = content.to_string();
+    let mut modified = String::new();
+    let mut cursor = 0;
 
-    for (idx, table) in tables.into_iter().enumerate() {
+    for (idx, (span, table)) in tables.into_iter().enumerate() {
         let svg = render_table_to_svg(&table);
         match svg_to_png(&svg, 2.0) {
             Ok(png_bytes) => {
                 let filename = format!("table_{}.png", idx + 1);
                 let placeholder = format!("\n*(📊 아래 첨부된 표 [{filename}] 참조)*\n");
-                modified = modified.replace(&table.raw, &placeholder);
+                modified.push_str(&content[cursor..span.start]);
+                modified.push_str(&placeholder);
+                cursor = span.end;
 
                 rendered.push(RenderedTable {
                     original_text: table.raw,
@@ -307,12 +351,92 @@ pub fn transform_markdown_tables_to_images(content: &str) -> (String, Vec<Render
         }
     }
 
+    modified.push_str(&content[cursor..]);
     (modified, rendered)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fences_and_unbroken_cells_preserve_content() {
+        let cell = "한".repeat(100);
+        let raw = format!("| Value |\n|---|\n| {cell} |");
+        let fenced = format!("```markdown\n{raw}\n```\n");
+        let payload = format!("{fenced}\n{raw}\nEND");
+        let (modified, images) = transform_markdown_tables_to_images(&payload);
+        let preserved = modified.starts_with(&fenced) && images.len() == 1;
+        let svg = render_table_to_svg(&extract_markdown_tables(&raw)[0]);
+        assert_eq!(svg.matches('한').count(), 100);
+        let mut options = usvg::Options::default();
+        options.fontdb_mut().load_system_fonts();
+        let tree = usvg::Tree::from_str(&svg, &options).unwrap();
+        let mut text_nodes = 0;
+        let mut inside = true;
+        for node in tree.root().children() {
+            if let usvg::Node::Text(_) = node {
+                text_nodes += 1;
+                let bounds = node.abs_bounding_box();
+                inside &= bounds.left() >= 16.0
+                    && bounds.right() <= tree.size().width() - 16.0
+                    && bounds.top() >= 0.0
+                    && bounds.bottom() <= tree.size().height();
+                println!("text bounds: {bounds:?}; canvas: {:?}", tree.size());
+            }
+        }
+        assert!(text_nodes >= 2, "must measure actual shaped text");
+        println!(
+            "fence_preserved={preserved}; glyphs_inside={inside}; images={}",
+            images.len()
+        );
+        assert!(
+            preserved && inside,
+            "fenced example changed or cell glyphs clipped"
+        );
+        assert!(modified.ends_with("\nEND"));
+        assert_eq!(images[0].original_text, raw);
+        let png = resvg::tiny_skia::Pixmap::decode_png(&images[0].png_bytes).unwrap();
+        assert_eq!(png.width(), tree.size().width() as u32 * 2);
+        assert_eq!(png.height(), tree.size().height() as u32 * 2);
+        if let Some(path) = std::env::var_os("U34_PNG") {
+            std::fs::write(path, &images[0].png_bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn table_source_span_and_fence_controls() {
+        let raw = "| A |\r\n|---|\r\n| B |";
+        for (open, close) in [("```md", "```"), ("~~~~", "~~~~~"), ("   ```", "   ```")] {
+            let example = format!("{open}\r\n{raw}\r\n{close}\r\n");
+            let payload = format!("{example}{raw}\r\n\r\n{raw}\r\nTAIL");
+            let (output, images) = transform_markdown_tables_to_images(&payload);
+            assert!(output.starts_with(&example));
+            assert!(output.ends_with("\r\nTAIL"));
+            assert_eq!(images.len(), 2);
+            assert!(images.iter().all(|image| image.original_text == raw));
+            assert_eq!(output.matches("table_1.png").count(), 1);
+            assert_eq!(output.matches("table_2.png").count(), 1);
+        }
+        for payload in [
+            format!("````\n```\n{raw}"),
+            format!("~~~\n```\n{raw}"),
+            format!("```\n``` not a close\n{raw}"),
+            "plain text without tables".to_string(),
+            "| header |\n|---|".to_string(),
+        ] {
+            let (output, images) = transform_markdown_tables_to_images(&payload);
+            assert_eq!(output, payload);
+            assert!(images.is_empty());
+        }
+        let raw = format!(
+            "| Wide | Small |\n|---|---|\n| {} | ok<br>end |",
+            "W".repeat(100)
+        );
+        let svg = render_table_to_svg(&extract_markdown_tables(&raw)[0]);
+        assert_eq!(svg.matches('W').count(), 101);
+        assert!(svg.contains(">ok</text>") && svg.contains(">end</text>"));
+    }
 
     #[test]
     fn test_extract_markdown_tables() {

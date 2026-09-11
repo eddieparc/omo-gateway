@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use super::router::SessionMultiplexer;
 use crate::{
     render_user_prompt, strip_leading_message_timestamps, DeliveryLedgerService, InboundEvent,
     OmonError, OutboundAction, ProfileRouter, Result, SessionContext, SessionKey, SessionState,
@@ -28,6 +29,12 @@ pub trait OutboundDispatcher: Send + Sync + 'static {
 
 pub(crate) enum ActorCommand {
     Event(Box<InboundEvent>),
+    /// An event whose turn outcome is reported back once the turn reaches a terminal state.
+    /// Startup backfill uses this to advance its durability cursor only after real success.
+    EventWithAck {
+        event: Box<InboundEvent>,
+        ack: oneshot::Sender<Result<()>>,
+    },
     Stop {
         reply: oneshot::Sender<Result<bool>>,
     },
@@ -36,6 +43,16 @@ pub(crate) enum ActorCommand {
         reply: oneshot::Sender<Result<bool>>,
     },
     TouchActivity,
+    SetModel {
+        model: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Reset {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    GetContext {
+        reply: oneshot::Sender<SessionContext>,
+    },
 }
 
 enum TurnOutcome {
@@ -52,9 +69,103 @@ pub struct SessionActor {
     pool: SqlitePool,
     last_active_at: tokio::time::Instant,
     dirty: bool,
+    /// Outcome channel for the turn currently being executed, when the sender asked for one.
+    pending_ack: Option<oneshot::Sender<Result<()>>>,
 }
 
 impl SessionActor {
+    /// Recovers sessions marked `resume_pending` from previous runs or failed flushes,
+    /// re-dispatching unfinished user turns or marking completed deliveries.
+    pub async fn recover_resume_pending_sessions(
+        pool: &SqlitePool,
+        multiplexer: &SessionMultiplexer,
+    ) -> Result<usize> {
+        let pending_keys = crate::storage::fetch_resume_pending_session_keys(pool).await?;
+        let mut resumed_count = 0;
+        for session_key in pending_keys {
+            let storage_key = session_key.storage_key();
+            let is_suspended = crate::storage::is_session_suspended(pool, &storage_key).await?;
+            let cleared = crate::storage::clear_session_resume_pending(pool, &storage_key).await?;
+            if !cleared {
+                continue;
+            }
+            if is_suspended {
+                tracing::info!(
+                    session = %session_key,
+                    "skipping restart recovery for suspended session"
+                );
+                continue;
+            }
+
+            if let Some(unfinished) =
+                crate::storage::find_last_unfinished_user_turn(pool, &storage_key).await?
+            {
+                let delivery_id: Option<String> = if let Some(ref pid) =
+                    unfinished.platform_message_id
+                {
+                    sqlx::query_scalar(
+                        "SELECT message_id FROM delivery_ledger WHERE session_key = ? AND (platform_message_id = ? OR message_id = ?) ORDER BY created_at DESC LIMIT 1",
+                    )
+                    .bind(&storage_key)
+                    .bind(pid)
+                    .bind(pid)
+                    .fetch_optional(pool)
+                    .await
+                    .unwrap_or(None)
+                } else {
+                    sqlx::query_scalar(
+                        "SELECT message_id FROM delivery_ledger WHERE session_key = ? ORDER BY created_at DESC LIMIT 1",
+                    )
+                    .bind(&storage_key)
+                    .fetch_optional(pool)
+                    .await
+                    .unwrap_or(None)
+                };
+
+                let attachments: Vec<crate::MessageAttachment> =
+                    serde_json::from_str(&unfinished.metadata_json).unwrap_or_default();
+                let event = InboundEvent {
+                    id: uuid::Uuid::parse_str(&unfinished.message_id)
+                        .unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                    session: session_key.clone(),
+                    platform_message_id: String::new(),
+                    delivery_id,
+                    content: unfinished.content,
+                    attachments,
+                    received_at: unfinished.created_at,
+                };
+                tracing::info!(
+                    session = %session_key,
+                    "re-dispatching unfinished user turn on restart recovery"
+                );
+                if let Err(error) = multiplexer.route(event).await {
+                    tracing::error!(
+                        session = %session_key,
+                        %error,
+                        "failed to route resumed session event"
+                    );
+                } else {
+                    resumed_count += 1;
+                }
+            } else {
+                let delivery_id: Option<String> = sqlx::query_scalar(
+                    "SELECT message_id FROM delivery_ledger WHERE session_key = ? ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(&storage_key)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+
+                if let Some(del_id) = delivery_id {
+                    let ledger = DeliveryLedgerService::new(pool.clone());
+                    let _ = ledger.mark_delivered(&del_id).await;
+                }
+                resumed_count += 1;
+            }
+        }
+        Ok(resumed_count)
+    }
+
     pub(crate) async fn load(
         key: SessionKey,
         receiver: mpsc::Receiver<ActorCommand>,
@@ -72,19 +183,33 @@ impl SessionActor {
             pool,
             last_active_at: tokio::time::Instant::now(),
             dirty: false,
+            pending_ack: None,
         })
     }
 
     pub(crate) async fn run(mut self) {
-        let mut pending_events: VecDeque<Box<InboundEvent>> = VecDeque::new();
+        let mut pending_events: VecDeque<ActorCommand> = VecDeque::new();
         loop {
-            let command = if let Some(event) = pending_events.pop_front() {
-                ActorCommand::Event(event)
+            let command = if let Some(cmd) = pending_events.pop_front() {
+                cmd
             } else {
                 match self.receiver.recv().await {
                     Some(command) => command,
                     None => break,
                 }
+            };
+
+            // An acked event is handled exactly like a plain event; the ack rides along on the
+            // actor so every terminal outcome below can report the turn result to the sender.
+            let command = match command {
+                ActorCommand::EventWithAck { event, ack } => {
+                    self.resolve_pending_ack(Err(OmonError::Multiplexer(
+                        "superseded by a newer acked turn".into(),
+                    )));
+                    self.pending_ack = Some(ack);
+                    ActorCommand::Event(event)
+                }
+                other => other,
             };
 
             match command {
@@ -110,6 +235,7 @@ impl SessionActor {
                                 );
                                 self.complete_delivery(event.delivery_id.as_deref(), &Ok(()))
                                     .await;
+                                self.resolve_pending_ack(Ok(()));
                                 continue;
                             }
                             Ok(false) => {}
@@ -125,11 +251,28 @@ impl SessionActor {
                     }
 
                     if let Err(error) = self.persist_inbound(&event).await {
-                        tracing::error!(session = %self.context.key, %error, "failed to persist inbound event");
+                        tracing::error!(
+                            session = %self.context.key,
+                            %error,
+                            "failed to persist inbound event; aborting turn before side effects"
+                        );
+                        self.dirty = false;
+                        self.complete_delivery(
+                            event.delivery_id.as_deref(),
+                            &Err(OmonError::Database(format!(
+                                "failed to persist inbound event: {error}"
+                            ))),
+                        )
+                        .await;
+                        self.resolve_pending_ack(Err(OmonError::Database(format!(
+                            "failed to persist inbound event: {error}"
+                        ))));
+                        continue;
                     }
 
                     let event_id = event.id;
                     let reply_to = event.platform_message_id.clone();
+                    let platform_message_id = reply_to.clone();
                     let delivery_id = event.delivery_id.clone();
                     let cancellation = CancellationToken::new();
                     let mut turn_context = self.context.clone();
@@ -159,7 +302,7 @@ impl SessionActor {
                                 match command {
                                     Some(ActorCommand::Event(next)) => {
                                         if pending_events.len() < MAX_PENDING_EVENTS {
-                                            pending_events.push_back(next);
+                                            pending_events.push_back(ActorCommand::Event(next));
                                         } else {
                                             tracing::warn!(
                                                 session = %self.context.key,
@@ -173,14 +316,44 @@ impl SessionActor {
                                             .await;
                                         }
                                     }
+                                    Some(ActorCommand::EventWithAck { event: next, ack }) => {
+                                        if pending_events.len() < MAX_PENDING_EVENTS {
+                                            pending_events.push_back(ActorCommand::EventWithAck { event: next, ack });
+                                        } else {
+                                            tracing::warn!(
+                                                session = %self.context.key,
+                                                "pending turn queue full (max {}); dropping new event",
+                                                MAX_PENDING_EVENTS
+                                            );
+                                            self.complete_delivery(
+                                                next.delivery_id.as_deref(),
+                                                &Err(OmonError::Multiplexer("pending turn queue full".into())),
+                                            )
+                                            .await;
+                                            let _ = ack.send(Err(OmonError::Multiplexer("pending turn queue full".into())));
+                                        }
+                                    }
                                     Some(ActorCommand::Stop { reply }) => {
                                         cancellation.cancel();
                                         while let Some(pending) = pending_events.pop_front() {
-                                            self.complete_delivery(
-                                                pending.delivery_id.as_deref(),
-                                                &Err(OmonError::Multiplexer("stopped by user".into())),
-                                            )
-                                            .await;
+                                            match pending {
+                                                ActorCommand::Event(p) => {
+                                                    self.complete_delivery(
+                                                        p.delivery_id.as_deref(),
+                                                        &Err(OmonError::Multiplexer("stopped by user".into())),
+                                                    )
+                                                    .await;
+                                                }
+                                                ActorCommand::EventWithAck { event: p, ack } => {
+                                                    self.complete_delivery(
+                                                        p.delivery_id.as_deref(),
+                                                        &Err(OmonError::Multiplexer("stopped by user".into())),
+                                                    )
+                                                    .await;
+                                                    let _ = ack.send(Err(OmonError::Multiplexer("stopped by user".into())));
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                         break TurnOutcome::Stopped(reply);
                                     }
@@ -190,14 +363,43 @@ impl SessionActor {
                                     Some(ActorCommand::TouchActivity) => {
                                         self.last_active_at = tokio::time::Instant::now();
                                     }
+                                    Some(ActorCommand::SetModel { model, reply }) => {
+                                        self.context.state.active_model = Some(model);
+                                        self.dirty = true;
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                    Some(ActorCommand::Reset { reply }) => {
+                                        cancellation.cancel();
+                                        self.context.state.metadata.remove("omo_thread_id");
+                                        self.context.state = crate::SessionState::default();
+                                        self.dirty = true;
+                                        let _ = reply.send(Ok(()));
+                                        break TurnOutcome::Shutdown;
+                                    }
+                                    Some(ActorCommand::GetContext { reply }) => {
+                                        let _ = reply.send(self.context.clone());
+                                    }
                                     None => {
                                         cancellation.cancel();
                                         while let Some(pending) = pending_events.pop_front() {
-                                            self.complete_delivery(
-                                                pending.delivery_id.as_deref(),
-                                                &Err(OmonError::Multiplexer("session actor shutting down".into())),
-                                            )
-                                            .await;
+                                            match pending {
+                                                ActorCommand::Event(p) => {
+                                                    self.complete_delivery(
+                                                        p.delivery_id.as_deref(),
+                                                        &Err(OmonError::Multiplexer("session actor shutting down".into())),
+                                                    )
+                                                    .await;
+                                                }
+                                                ActorCommand::EventWithAck { event: p, ack } => {
+                                                    self.complete_delivery(
+                                                        p.delivery_id.as_deref(),
+                                                        &Err(OmonError::Multiplexer("session actor shutting down".into())),
+                                                    )
+                                                    .await;
+                                                    let _ = ack.send(Err(OmonError::Multiplexer("session actor shutting down".into())));
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                         break TurnOutcome::Shutdown;
                                     }
@@ -208,22 +410,69 @@ impl SessionActor {
                     };
                     drop(run);
 
+                    // Durable remote binding must never be lost on failure or overwritten by a stale actor copy.
+                    if let Some(thread_id) = turn_context.state.metadata.get("omo_thread_id") {
+                        self.context
+                            .state
+                            .metadata
+                            .insert("omo_thread_id".into(), thread_id.clone());
+                    }
+
                     match outcome {
-                        TurnOutcome::Completed(result) => {
+                        TurnOutcome::Completed(mut result) => {
                             if result.is_ok() {
                                 self.context = turn_context;
-                                let _ = crate::storage::clear_session_resume_pending(
-                                    &self.pool,
-                                    &self.context.key.storage_key(),
-                                )
-                                .await;
                                 if let Err(error) = self.flush_if_dirty().await {
-                                    tracing::error!(session = %self.context.key, %error, "failed to flush session actor on turn completion");
+                                    tracing::error!(
+                                        session = %self.context.key,
+                                        %error,
+                                        "failed to flush session actor on turn completion"
+                                    );
+                                    let _ = crate::storage::mark_session_resume_pending(
+                                        &self.pool,
+                                        &self.context.key.storage_key(),
+                                    )
+                                    .await;
+                                    result = Err(OmonError::Database(format!(
+                                        "failed to flush session actor on turn completion: {error}"
+                                    )));
+                                } else {
+                                    let _ = crate::storage::clear_session_resume_pending(
+                                        &self.pool,
+                                        &self.context.key.storage_key(),
+                                    )
+                                    .await;
                                 }
+                            } else {
+                                self.dirty = false;
                             }
                             self.complete_delivery(delivery_id.as_deref(), &result)
                                 .await;
-                            if let Err(error) = result {
+                            self.resolve_pending_ack(match &result {
+                                Ok(()) => Ok(()),
+                                Err(error) => {
+                                    Err(OmonError::Multiplexer(format!("turn failed: {error}")))
+                                }
+                            });
+                            if let Some(dispatcher) = &self.dispatcher {
+                                let reaction_msg_id = (!platform_message_id.is_empty())
+                                    .then(|| platform_message_id.clone());
+                                if let Some(msg_id) = reaction_msg_id {
+                                    let emoji = match &result {
+                                        Ok(()) => crate::models::PROCESSING_SUCCESS_EMOJI,
+                                        Err(_) => crate::models::PROCESSING_FAILURE_EMOJI,
+                                    };
+                                    let _ = dispatcher
+                                        .dispatch(OutboundAction::React {
+                                            session: self.context.key.clone(),
+                                            message_id: msg_id,
+                                            emoji: emoji.to_string(),
+                                            remove_others: true,
+                                        })
+                                        .await;
+                                }
+                            }
+                            if let Err(error) = &result {
                                 tracing::error!(session = %self.context.key, %error, "agent runner failed");
                                 if let Some(dispatcher) = &self.dispatcher {
                                     let _ = dispatcher
@@ -235,26 +484,45 @@ impl SessionActor {
                                         .await;
                                 }
                             }
+                            self.release_typing().await;
                         }
                         TurnOutcome::Stopped(reply) => {
                             self.context.state.suspended = true;
                             self.dirty = true;
-                            self.interrupt_turn(
-                                event_id,
-                                delivery_id.as_deref(),
-                                "stopped by user",
-                            )
-                            .await;
+                            let cancel_res = self
+                                .interrupt_turn(event_id, delivery_id.as_deref(), "stopped by user")
+                                .await;
+                            self.release_typing().await;
                             let _ = self.flush_if_dirty().await;
-                            let _ = reply.send(Ok(true));
+                            if let Some(dispatcher) = &self.dispatcher {
+                                let reaction_msg_id = (!platform_message_id.is_empty())
+                                    .then(|| platform_message_id.clone());
+                                if let Some(msg_id) = reaction_msg_id {
+                                    let _ = dispatcher
+                                        .dispatch(OutboundAction::React {
+                                            session: self.context.key.clone(),
+                                            message_id: msg_id,
+                                            emoji: crate::models::PROCESSING_FAILURE_EMOJI
+                                                .to_string(),
+                                            remove_others: true,
+                                        })
+                                        .await;
+                                }
+                            }
+                            self.resolve_pending_ack(Err(OmonError::Multiplexer(
+                                "stopped by user".into(),
+                            )));
+                            let _ = reply.send(cancel_res.map(|_| true));
                         }
                         TurnOutcome::Shutdown => {
-                            self.interrupt_turn(
-                                event_id,
-                                delivery_id.as_deref(),
-                                "session actor shutting down",
-                            )
-                            .await;
+                            let _ = self
+                                .interrupt_turn(
+                                    event_id,
+                                    delivery_id.as_deref(),
+                                    "session actor shutting down",
+                                )
+                                .await;
+                            self.release_typing().await;
                             if let Err(error) = crate::storage::mark_session_resume_pending(
                                 &self.pool,
                                 &self.context.key.storage_key(),
@@ -263,6 +531,9 @@ impl SessionActor {
                             {
                                 tracing::error!(session = %self.context.key, %error, "failed to mark resume_pending on shutdown");
                             }
+                            self.resolve_pending_ack(Err(OmonError::Multiplexer(
+                                "session actor shutting down".into(),
+                            )));
                         }
                     }
                     self.context.updated_at = Utc::now();
@@ -272,17 +543,50 @@ impl SessionActor {
                     self.context.state.suspended = true;
                     self.dirty = true;
                     while let Some(pending) = pending_events.pop_front() {
-                        self.complete_delivery(
-                            pending.delivery_id.as_deref(),
-                            &Err(OmonError::Multiplexer("stopped by user".into())),
-                        )
-                        .await;
+                        match pending {
+                            ActorCommand::Event(p) => {
+                                self.complete_delivery(
+                                    p.delivery_id.as_deref(),
+                                    &Err(OmonError::Multiplexer("stopped by user".into())),
+                                )
+                                .await;
+                            }
+                            ActorCommand::EventWithAck { event: p, ack } => {
+                                self.complete_delivery(
+                                    p.delivery_id.as_deref(),
+                                    &Err(OmonError::Multiplexer("stopped by user".into())),
+                                )
+                                .await;
+                                let _ =
+                                    ack.send(Err(OmonError::Multiplexer("stopped by user".into())));
+                            }
+                            _ => {}
+                        }
                     }
+                    self.release_typing().await;
                     let _ = self.flush_if_dirty().await;
                     let _ = reply.send(Ok(false));
                 }
                 ActorCommand::TouchActivity => {
                     self.last_active_at = tokio::time::Instant::now();
+                }
+                ActorCommand::SetModel { model, reply } => {
+                    self.last_active_at = tokio::time::Instant::now();
+                    self.context.state.active_model = Some(model);
+                    self.dirty = true;
+                    let flush_res = self.flush_if_dirty().await;
+                    let _ = reply.send(flush_res);
+                }
+                ActorCommand::Reset { reply } => {
+                    self.last_active_at = tokio::time::Instant::now();
+                    self.context.state.metadata.remove("omo_thread_id");
+                    self.context.state = crate::SessionState::default();
+                    self.dirty = true;
+                    let flush_res = self.flush_if_dirty().await;
+                    let _ = reply.send(flush_res);
+                }
+                ActorCommand::GetContext { reply } => {
+                    let _ = reply.send(self.context.clone());
                 }
                 ActorCommand::EvictIfIdle {
                     idle_timeout,
@@ -302,6 +606,18 @@ impl SessionActor {
                         let _ = reply.send(Ok(false));
                     }
                 }
+                ActorCommand::EventWithAck { event, ack } => {
+                    // The loop head rewrites acked events into plain events, so reaching this
+                    // arm means the invariant changed. Report it instead of panicking the lane.
+                    tracing::error!(
+                        session = %self.context.key,
+                        platform_message_id = %event.platform_message_id,
+                        "acked event reached the terminal command match; reporting failure without executing"
+                    );
+                    let _ = ack.send(Err(OmonError::Multiplexer(
+                        "acked event was not dispatched".into(),
+                    )));
+                }
             }
         }
 
@@ -320,11 +636,22 @@ impl SessionActor {
         }
         if let Err(error) = self.flush_if_dirty().await {
             tracing::error!(session = %self.context.key, %error, "failed to flush session actor during shutdown");
+            let _ = crate::storage::mark_session_resume_pending(
+                &self.pool,
+                &self.context.key.storage_key(),
+            )
+            .await;
         }
     }
 
-    async fn interrupt_turn(&self, event_id: uuid::Uuid, delivery_id: Option<&str>, reason: &str) {
-        if let Err(error) = self.runner.cancel(&self.context).await {
+    async fn interrupt_turn(
+        &self,
+        event_id: uuid::Uuid,
+        delivery_id: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        let cancel_res = self.runner.cancel(&self.context).await;
+        if let Err(ref error) = cancel_res {
             tracing::warn!(session = %self.context.key, %error, "runner cancellation cleanup failed");
         }
         if let Err(error) = self.rollback_partial_history(event_id).await {
@@ -337,6 +664,20 @@ impl SessionActor {
             }
         }
         tracing::info!(session = %self.context.key, %reason, "agent turn interrupted");
+        cancel_res
+    }
+
+    async fn release_typing(&self) {
+        if !self.context.key.user_id.starts_with("cron:") {
+            if let Some(dispatcher) = &self.dispatcher {
+                let _ = dispatcher
+                    .dispatch(crate::OutboundAction::Typing {
+                        session: self.context.key.clone(),
+                        active: false,
+                    })
+                    .await;
+            }
+        }
     }
 
     async fn rollback_partial_history(&self, event_id: uuid::Uuid) -> Result<()> {
@@ -352,6 +693,13 @@ impl SessionActor {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Reports the turn outcome to a waiting sender, if one asked for an ack.
+    fn resolve_pending_ack(&mut self, outcome: Result<()>) {
+        if let Some(ack) = self.pending_ack.take() {
+            let _ = ack.send(outcome);
+        }
     }
 
     async fn complete_delivery(&self, delivery_id: Option<&str>, result: &Result<()>) {
@@ -402,12 +750,24 @@ impl SessionActor {
     async fn flush(&self) -> Result<()> {
         ensure_session(&self.pool, &self.context).await?;
         let state = serde_json::to_string(&self.context.state).map_err(serialization_error)?;
-        sqlx::query("UPDATE sessions SET state_json = ?, updated_at = ? WHERE session_key = ?")
-            .bind(state)
-            .bind(self.context.updated_at)
-            .bind(self.context.key.storage_key())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE sessions
+             SET state_json = CASE
+                 WHEN json_extract(state_json, '$.metadata.omo_thread_id') IS NOT NULL
+                      AND json_extract(?, '$.metadata.omo_thread_id') IS NULL
+                 THEN json_set(?, '$.metadata.omo_thread_id', json_extract(state_json, '$.metadata.omo_thread_id'))
+                 ELSE ?
+             END,
+             updated_at = ?
+             WHERE session_key = ?",
+        )
+        .bind(&state)
+        .bind(&state)
+        .bind(&state)
+        .bind(self.context.updated_at)
+        .bind(self.context.key.storage_key())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }
@@ -682,6 +1042,7 @@ mod tests {
             model: Some("profile-model".into()),
             system_prompt: Some("profile-prompt".into()),
             enabled_toolsets: Some(vec!["terminal".into(), "web".into()]),
+            ..Default::default()
         };
         let router = Arc::new(ProfileRouter::new(vec![route]));
 
@@ -809,6 +1170,7 @@ mod tests {
                             sequence: seq as u64,
                             content: chunk_text.clone(),
                             is_final,
+                            reply_to: None,
                         },
                     })
                     .await?;
@@ -937,5 +1299,385 @@ mod tests {
             entry.status, "delivered",
             "Delivery ledger claim must be marked delivered"
         );
+    }
+
+    #[tokio::test]
+    async fn turn_terminal_paths_release_typing() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+
+        // 1. Success path: normal completion releases typing
+        {
+            let key = test_session("typing-success");
+            let dispatcher = Arc::new(CapturingDispatcher::default());
+            let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+            let backend = Arc::new(ScriptedFakeBackend {
+                pool: db.pool().clone(),
+                dispatcher: dispatcher.clone(),
+                chunks_to_emit: vec!["done".to_string()],
+                final_assistant_message: "done".to_string(),
+                completed: completed_tx,
+            });
+
+            let (cmd_tx, cmd_rx) = mpsc::channel(32);
+            let actor = SessionActor::load(
+                key.clone(),
+                cmd_rx,
+                backend,
+                Some(dispatcher.clone()),
+                db.pool().clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let handle = tokio::spawn(actor.run());
+            cmd_tx
+                .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                    key.clone(),
+                    "msg-success",
+                    "hello",
+                ))))
+                .await
+                .unwrap();
+
+            completed_rx.recv().await.unwrap();
+            drop(cmd_tx);
+            handle.await.unwrap();
+
+            let actions = dispatcher.actions.lock().await;
+            let typing_events: Vec<bool> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    OutboundAction::Typing { session, active } if session == &key => Some(*active),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                typing_events,
+                vec![true, false],
+                "success path must start and release typing"
+            );
+        }
+
+        // 2. Error path: runner error releases typing
+        {
+            struct FailingRunner;
+            #[async_trait]
+            impl AgentRunner for FailingRunner {
+                async fn run(
+                    &self,
+                    _session: &mut SessionContext,
+                    _event: InboundEvent,
+                ) -> Result<()> {
+                    Err(OmonError::Llm("runner exploded".into()))
+                }
+            }
+
+            let key = test_session("typing-error");
+            let dispatcher = Arc::new(CapturingDispatcher::default());
+            let (cmd_tx, cmd_rx) = mpsc::channel(32);
+            let actor = SessionActor::load(
+                key.clone(),
+                cmd_rx,
+                Arc::new(FailingRunner),
+                Some(dispatcher.clone()),
+                db.pool().clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let handle = tokio::spawn(actor.run());
+            cmd_tx
+                .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                    key.clone(),
+                    "msg-error",
+                    "explode",
+                ))))
+                .await
+                .unwrap();
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            cmd_tx
+                .send(ActorCommand::Stop { reply: reply_tx })
+                .await
+                .unwrap();
+            let _ = reply_rx.await.unwrap();
+            drop(cmd_tx);
+            handle.await.unwrap();
+
+            let actions = dispatcher.actions.lock().await;
+            let typing_events: Vec<bool> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    OutboundAction::Typing { session, active } if session == &key => Some(*active),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                typing_events,
+                vec![true, false],
+                "error path must start and release typing"
+            );
+        }
+
+        // 3. Stop path: user stop cancels turn and releases typing
+        {
+            let key = test_session("typing-stop");
+            let dispatcher = Arc::new(CapturingDispatcher::default());
+            let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+            let barrier = Arc::new(Barrier::new(2));
+            let runner = Arc::new(TurnRecordingRunner {
+                started: started_tx,
+                barrier: barrier.clone(),
+                completed: mpsc::unbounded_channel().0,
+            });
+
+            let (cmd_tx, cmd_rx) = mpsc::channel(32);
+            let actor = SessionActor::load(
+                key.clone(),
+                cmd_rx,
+                runner,
+                Some(dispatcher.clone()),
+                db.pool().clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let handle = tokio::spawn(actor.run());
+            cmd_tx
+                .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                    key.clone(),
+                    "msg-stop",
+                    "blocking",
+                ))))
+                .await
+                .unwrap();
+
+            started_rx.recv().await.unwrap();
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            cmd_tx
+                .send(ActorCommand::Stop { reply: reply_tx })
+                .await
+                .unwrap();
+            assert!(reply_rx.await.unwrap().unwrap());
+
+            drop(cmd_tx);
+            handle.await.unwrap();
+
+            let actions = dispatcher.actions.lock().await;
+            let typing_events: Vec<bool> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    OutboundAction::Typing { session, active } if session == &key => Some(*active),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                typing_events,
+                vec![true, false],
+                "stop path must start and release typing"
+            );
+        }
+
+        // 4. Shutdown path: dropping cmd channel while turn is running releases typing
+        {
+            let key = test_session("typing-shutdown");
+            let dispatcher = Arc::new(CapturingDispatcher::default());
+            let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+            let barrier = Arc::new(Barrier::new(2));
+            let runner = Arc::new(TurnRecordingRunner {
+                started: started_tx,
+                barrier: barrier.clone(),
+                completed: mpsc::unbounded_channel().0,
+            });
+
+            let (cmd_tx, cmd_rx) = mpsc::channel(32);
+            let actor = SessionActor::load(
+                key.clone(),
+                cmd_rx,
+                runner,
+                Some(dispatcher.clone()),
+                db.pool().clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let handle = tokio::spawn(actor.run());
+            cmd_tx
+                .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                    key.clone(),
+                    "msg-shutdown",
+                    "blocking",
+                ))))
+                .await
+                .unwrap();
+
+            started_rx.recv().await.unwrap();
+            drop(cmd_tx);
+            handle.await.unwrap();
+
+            let actions = dispatcher.actions.lock().await;
+            let typing_events: Vec<bool> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    OutboundAction::Typing { session, active } if session == &key => Some(*active),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                typing_events,
+                vec![true, false],
+                "shutdown path must start and release typing"
+            );
+        }
+
+        // 5. Lane isolation: stopping lane A does not release typing for active lane B
+        {
+            let key_a = SessionKey::new(
+                "discord",
+                Some("guild"),
+                "channel-a",
+                None::<String>,
+                "user-a",
+            );
+            let key_b = SessionKey::new(
+                "discord",
+                Some("guild"),
+                "channel-b",
+                None::<String>,
+                "user-b",
+            );
+            let dispatcher = Arc::new(CapturingDispatcher::default());
+
+            let (started_a_tx, mut started_a_rx) = mpsc::unbounded_channel();
+            let (started_b_tx, mut started_b_rx) = mpsc::unbounded_channel();
+            let barrier_a = Arc::new(Barrier::new(2));
+            let barrier_b = Arc::new(Barrier::new(2));
+
+            let runner_a = Arc::new(TurnRecordingRunner {
+                started: started_a_tx,
+                barrier: barrier_a.clone(),
+                completed: mpsc::unbounded_channel().0,
+            });
+            let runner_b = Arc::new(TurnRecordingRunner {
+                started: started_b_tx,
+                barrier: barrier_b.clone(),
+                completed: mpsc::unbounded_channel().0,
+            });
+
+            let (cmd_a_tx, cmd_a_rx) = mpsc::channel(32);
+            let (cmd_b_tx, cmd_b_rx) = mpsc::channel(32);
+
+            let actor_a = SessionActor::load(
+                key_a.clone(),
+                cmd_a_rx,
+                runner_a,
+                Some(dispatcher.clone()),
+                db.pool().clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let actor_b = SessionActor::load(
+                key_b.clone(),
+                cmd_b_rx,
+                runner_b,
+                Some(dispatcher.clone()),
+                db.pool().clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let handle_a = tokio::spawn(actor_a.run());
+            let handle_b = tokio::spawn(actor_b.run());
+
+            cmd_a_tx
+                .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                    key_a.clone(),
+                    "msg-a",
+                    "blocking",
+                ))))
+                .await
+                .unwrap();
+            cmd_b_tx
+                .send(ActorCommand::Event(Box::new(InboundEvent::message(
+                    key_b.clone(),
+                    "msg-b",
+                    "blocking",
+                ))))
+                .await
+                .unwrap();
+
+            started_a_rx.recv().await.unwrap();
+            started_b_rx.recv().await.unwrap();
+
+            let (reply_a_tx, reply_a_rx) = oneshot::channel();
+            cmd_a_tx
+                .send(ActorCommand::Stop { reply: reply_a_tx })
+                .await
+                .unwrap();
+            assert!(reply_a_rx.await.unwrap().unwrap());
+
+            {
+                let actions = dispatcher.actions.lock().await;
+                let typing_a: Vec<bool> = actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        OutboundAction::Typing { session, active } if session == &key_a => {
+                            Some(*active)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let typing_b: Vec<bool> = actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        OutboundAction::Typing { session, active } if session == &key_b => {
+                            Some(*active)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+                assert_eq!(
+                    typing_a,
+                    vec![true, false],
+                    "lane A stopped and released typing"
+                );
+                assert_eq!(
+                    typing_b,
+                    vec![true],
+                    "lane B typing must remain active while lane A stopped"
+                );
+            }
+
+            barrier_b.wait().await;
+            drop(cmd_a_tx);
+            drop(cmd_b_tx);
+            handle_a.await.unwrap();
+            handle_b.await.unwrap();
+
+            let actions = dispatcher.actions.lock().await;
+            let typing_b: Vec<bool> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    OutboundAction::Typing { session, active } if session == &key_b => {
+                        Some(*active)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                typing_b,
+                vec![true, false],
+                "lane B completed and released typing"
+            );
+        }
     }
 }

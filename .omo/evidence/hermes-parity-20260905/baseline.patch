@@ -1,0 +1,794 @@
+diff --git a/src/agent/omo_backend.rs b/src/agent/omo_backend.rs
+index 533616e..ec5bb8a 100644
+--- a/src/agent/omo_backend.rs
++++ b/src/agent/omo_backend.rs
+@@ -395,8 +395,20 @@ impl OmoBackend {
+         } else {
+             self.config.total_timeout.min(Duration::from_secs(300))
+         };
++        // Silence budget for the streaming loop: doubles as the frame-wait
++        // backstop and the text-inactivity threshold. Pings wake the loop but
++        // never reset the text clock, so a pinging-but-wedged daemon fails
++        // here instead of riding the whole total deadline (the 1800s hang).
++        let silence_limit = if is_cron_session {
++            self.config.request_timeout.min(Duration::from_secs(300))
++        } else {
++            self.config.request_timeout.min(Duration::from_secs(120))
++        };
++        // An empty terminal inside this window is treated as the premature
++        // completion race and ignored; past it, empty means failed.
++        let no_content_grace = self.config.no_content_grace;
+ 
+-        while let Some(msg) = tokio::time::timeout(self.config.request_timeout, ws.next())
++        while let Some(msg) = tokio::time::timeout(silence_limit, ws.next())
+             .await
+             .map_err(|_| OmonError::Llm("timeout during turn streaming".into()))?
+         {
+@@ -405,265 +417,288 @@ impl OmoBackend {
+                     "timeout waiting for turn/start acknowledgement from omo app-server".into(),
+                 ));
+             }
+-            if last_activity_at.elapsed() > self.config.request_timeout {
++            if last_activity_at.elapsed() > silence_limit {
+                 return Err(OmonError::Llm("timeout during turn streaming".into()));
+             }
+ 
+             let msg = msg.map_err(|e| OmonError::Llm(format!("ws streaming error: {e}")))?;
+-            if let Message::Text(text) = msg {
+-                last_activity_at = std::time::Instant::now();
+-                let val: Value = serde_json::from_str(text.as_str())
+-                    .map_err(|e| OmonError::Llm(format!("invalid json: {e}")))?;
+-                let method = val.get("method").and_then(Value::as_str).unwrap_or("");
+-
+-                if method != "turn/completed" && started_at.elapsed() > effective_total_timeout {
+-                    if let Some(turn_id) = &turn_id {
+-                        let interrupt = json!({
+-                            "jsonrpc": "2.0",
+-                            "id": 9_001,
+-                            "method": "turn/interrupt",
+-                            "params": { "threadId": thread_id, "turnId": turn_id }
+-                        });
+-                        let _ = ws.send(Message::text(interrupt.to_string())).await;
+-                        // Give the frame a moment to reach the daemon before the
+-                        // connection drops.
+-                        tokio::time::sleep(Duration::from_millis(100)).await;
+-                    }
+-                    return Err(OmonError::Llm(format!(
+-                        "turn exceeded total deadline of {:?}; turn/interrupt sent",
+-                        effective_total_timeout
+-                    )));
++            let val = match &msg {
++                Message::Text(text) => {
++                    last_activity_at = std::time::Instant::now();
++                    Some(
++                        serde_json::from_str::<Value>(text.as_str())
++                            .map_err(|e| OmonError::Llm(format!("invalid json: {e}")))?,
++                    )
+                 }
++                _ => None,
++            };
++            // Deadline checks run on EVERY frame — ping/pong included — so a
++            // keepalive stream cannot mask a wedged turn past the cap.
++            let method = val
++                .as_ref()
++                .and_then(|v| v.get("method"))
++                .and_then(Value::as_str)
++                .unwrap_or("")
++                .to_owned();
++            if method != "turn/completed" && started_at.elapsed() > effective_total_timeout {
++                if let Some(turn_id) = &turn_id {
++                    let interrupt = json!({
++                        "jsonrpc": "2.0",
++                        "id": 9_001,
++                        "method": "turn/interrupt",
++                        "params": { "threadId": thread_id, "turnId": turn_id }
++                    });
++                    let _ = ws.send(Message::text(interrupt.to_string())).await;
++                    // Give the frame a moment to reach the daemon before the
++                    // connection drops.
++                    tokio::time::sleep(Duration::from_millis(100)).await;
++                }
++                return Err(OmonError::Llm(format!(
++                    "turn exceeded total deadline of {:?}; turn/interrupt sent",
++                    effective_total_timeout
++                )));
++            }
+ 
+-                if val.get("id").and_then(Value::as_u64) == Some(3) {
+-                    if let Some(error) = val.get("error") {
+-                        return Err(OmonError::Llm(format!("turn/start error: {error}")));
+-                    }
+-                    turn_started_ack = true;
+-                    if let Some(id) = val.pointer("/result/turn/id").and_then(Value::as_str) {
+-                        turn_id = Some(id.to_string());
+-                    }
+-                    continue;
++            let Some(val) = val else {
++                continue;
++            };
++
++            if val.get("id").and_then(Value::as_u64) == Some(3) {
++                if let Some(error) = val.get("error") {
++                    return Err(OmonError::Llm(format!("turn/start error: {error}")));
++                }
++                turn_started_ack = true;
++                if let Some(id) = val.pointer("/result/turn/id").and_then(Value::as_str) {
++                    turn_id = Some(id.to_string());
+                 }
++                continue;
++            }
+ 
+-                if let (Some(req_id), Some(method)) =
+-                    (val.get("id"), val.get("method").and_then(Value::as_str))
+-                {
+-                    if is_approval_request(method) {
+-                        approval_denials += 1;
+-                        if approval_denials >= APPROVAL_DENIAL_TURN_LIMIT {
+-                            tracing::error!(
++            if let (Some(req_id), Some(method)) =
++                (val.get("id"), val.get("method").and_then(Value::as_str))
++            {
++                if is_approval_request(method) {
++                    approval_denials += 1;
++                    if approval_denials >= APPROVAL_DENIAL_TURN_LIMIT {
++                        tracing::error!(
+                                 denials = approval_denials,
+                                 "approval denial loop: aborting turn instead of flailing until the deadline"
+                             );
+-                            if let Some(turn_id) = &turn_id {
+-                                let interrupt = json!({
+-                                    "jsonrpc": "2.0",
+-                                    "id": 9_002,
+-                                    "method": "turn/interrupt",
+-                                    "params": { "threadId": thread_id, "turnId": turn_id }
+-                                });
+-                                let _ = ws.send(Message::text(interrupt.to_string())).await;
+-                            }
+-                            return Err(OmonError::Llm(format!(
++                        if let Some(turn_id) = &turn_id {
++                            let interrupt = json!({
++                                "jsonrpc": "2.0",
++                                "id": 9_002,
++                                "method": "turn/interrupt",
++                                "params": { "threadId": thread_id, "turnId": turn_id }
++                            });
++                            let _ = ws.send(Message::text(interrupt.to_string())).await;
++                        }
++                        return Err(OmonError::Llm(format!(
+                                 "tool approval denied {approval_denials} times by gateway policy; turn aborted"
+                             )));
+-                        }
+-                        let _ = ws.send(approval_denial_response(req_id)).await;
+-                        continue;
+                     }
++                    let _ = ws.send(approval_denial_response(req_id)).await;
++                    continue;
+                 }
++            }
+ 
+-                match method {
+-                    "turn/started" => {
+-                        approval_denials = 0;
+-                        if let Some(tid) = val.pointer("/params/turnId").and_then(Value::as_str) {
+-                            turn_id = Some(tid.to_string());
+-                        }
++            match method.as_str() {
++                "turn/started" => {
++                    approval_denials = 0;
++                    if let Some(tid) = val.pointer("/params/turnId").and_then(Value::as_str) {
++                        turn_id = Some(tid.to_string());
+                     }
+-                    "item/started" | "item/completed" => {
+-                        approval_denials = 0;
+-                        let is_started =
+-                            val.get("method").and_then(Value::as_str) == Some("item/started");
+-                        let Some(item) = val.pointer("/params/item") else {
+-                            continue;
+-                        };
+-                        let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+-
+-                        if is_started && !item_id.is_empty() && started_ids.insert(item_id.to_string()) {
+-                            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+-                            if !matches!(item_type, "agentMessage" | "userMessage" | "reasoning" | "") {
+-                                total_tool_calls += 1;
+-                                let tool_name = item
+-                                    .get("command")
+-                                    .or_else(|| item.get("tool"))
+-                                    .or_else(|| item.get("name"))
+-                                    .or_else(|| item.get("path"))
+-                                    .and_then(Value::as_str)
+-                                    .unwrap_or(item_type);
+-                                let short_name = tool_name
+-                                    .split_whitespace()
+-                                    .next()
+-                                    .unwrap_or(tool_name);
+-                                *tool_call_counts.entry(short_name.to_string()).or_insert(0) += 1;
+-                            }
++                }
++                "item/started" | "item/completed" => {
++                    approval_denials = 0;
++                    let is_started =
++                        val.get("method").and_then(Value::as_str) == Some("item/started");
++                    let Some(item) = val.pointer("/params/item") else {
++                        continue;
++                    };
++                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
++
++                    if is_started && !item_id.is_empty() && started_ids.insert(item_id.to_string())
++                    {
++                        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
++                        if !matches!(item_type, "agentMessage" | "userMessage" | "reasoning" | "") {
++                            total_tool_calls += 1;
++                            let tool_name = item
++                                .get("command")
++                                .or_else(|| item.get("tool"))
++                                .or_else(|| item.get("name"))
++                                .or_else(|| item.get("path"))
++                                .and_then(Value::as_str)
++                                .unwrap_or(item_type);
++                            let short_name =
++                                tool_name.split_whitespace().next().unwrap_or(tool_name);
++                            *tool_call_counts.entry(short_name.to_string()).or_insert(0) += 1;
+                         }
++                    }
+ 
+-                        if !is_started {
+-                            match item.get("type").and_then(Value::as_str) {
+-                                Some("agentMessage") => {
+-                                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+-                                        full_content.clear();
+-                                        full_content.push_str(text);
+-                                    }
++                    if !is_started {
++                        match item.get("type").and_then(Value::as_str) {
++                            Some("agentMessage") => {
++                                if let Some(text) = item.get("text").and_then(Value::as_str) {
++                                    full_content.clear();
++                                    full_content.push_str(text);
+                                 }
+-                                _ => {}
+                             }
++                            _ => {}
+                         }
+                     }
+-                    "item/agentMessage/delta" => {
+-                        if let Some(delta) = val.pointer("/params/delta").and_then(Value::as_str) {
+-                            if !delta.is_empty() {
+-                                full_content.push_str(delta);
+-                                let _ = self
+-                                    .emit_chunk(
+-                                        session,
+-                                        stream_id,
+-                                        sequence,
+-                                        full_content.clone(),
+-                                        false,
+-                                    )
+-                                    .await;
+-                                sequence = sequence.saturating_add(1);
+-                            }
++                }
++                "item/agentMessage/delta" => {
++                    if let Some(delta) = val.pointer("/params/delta").and_then(Value::as_str) {
++                        if !delta.is_empty() {
++                            full_content.push_str(delta);
++                            let _ = self
++                                .emit_chunk(
++                                    session,
++                                    stream_id,
++                                    sequence,
++                                    full_content.clone(),
++                                    false,
++                                )
++                                .await;
++                            sequence = sequence.saturating_add(1);
+                         }
+                     }
+-                    "turn/completed" | "thread/status/changed" => {
+-                        let is_terminal = if method == "turn/completed" {
+-                            let is_for_current_thread = val
+-                                .pointer("/params/threadId")
+-                                .and_then(Value::as_str)
+-                                .map(|id| id == thread_id)
+-                                .unwrap_or(true);
+-                            if !is_for_current_thread {
+-                                continue;
+-                            }
+-                            if val.pointer("/params/turn/status").and_then(Value::as_str) == Some("failed") {
+-                                let err_msg = val
+-                                    .pointer("/params/turn/error")
+-                                    .and_then(Value::as_str)
+-                                    .or_else(|| val.pointer("/params/turn/error/message").and_then(Value::as_str))
+-                                    .unwrap_or("turn failed");
+-                                return Err(OmonError::Llm(format!("omo turn failed: {err_msg}")));
+-                            }
+-                            true
+-                        } else if method == "thread/status/changed" {
+-                            let is_for_current_thread = val
+-                                .pointer("/params/threadId")
+-                                .and_then(Value::as_str)
+-                                .map(|id| id == thread_id)
+-                                .unwrap_or(false);
+-                            let is_idle = val.pointer("/params/status/type").and_then(Value::as_str) == Some("idle");
+-                            is_for_current_thread && is_idle
+-                        } else {
+-                            false
+-                        };
+-
+-                        if !is_terminal {
++                }
++                "turn/completed" | "thread/status/changed" => {
++                    let is_terminal = if method == "turn/completed" {
++                        let is_for_current_thread = val
++                            .pointer("/params/threadId")
++                            .and_then(Value::as_str)
++                            .map(|id| id == thread_id)
++                            .unwrap_or(true);
++                        if !is_for_current_thread {
+                             continue;
+                         }
++                        if val.pointer("/params/turn/status").and_then(Value::as_str)
++                            == Some("failed")
++                        {
++                            let err_msg = val
++                                .pointer("/params/turn/error")
++                                .and_then(Value::as_str)
++                                .or_else(|| {
++                                    val.pointer("/params/turn/error/message")
++                                        .and_then(Value::as_str)
++                                })
++                                .unwrap_or("turn failed");
++                            return Err(OmonError::Llm(format!("omo turn failed: {err_msg}")));
++                        }
++                        true
++                    } else if method == "thread/status/changed" {
++                        let is_for_current_thread = val
++                            .pointer("/params/threadId")
++                            .and_then(Value::as_str)
++                            .map(|id| id == thread_id)
++                            .unwrap_or(false);
++                        let is_idle = val.pointer("/params/status/type").and_then(Value::as_str)
++                            == Some("idle");
++                        is_for_current_thread && is_idle
++                    } else {
++                        false
++                    };
++
++                    if !is_terminal {
++                        continue;
++                    }
+ 
+-                        let has_content = !full_content.is_empty() || total_tool_calls > 0;
+-                        if !has_content {
+-                            // A terminal frame with no streamed content (observed:
+-                            // the daemon raced a premature turn/completed at +6s
+-                            // while the real turn was still running) must not end
+-                            // the turn — ignore premature completion and keep streaming.
++                    let has_content = !full_content.is_empty() || total_tool_calls > 0;
++                    if !has_content {
++                        // A terminal frame with no streamed content is only
++                        // ignored during the startup race window (observed:
++                        // the daemon raced a premature turn/completed at +6s
++                        // while the real turn was still running). Past that
++                        // window an empty terminal is a real empty turn —
++                        // e.g. an upstream LLM failure the daemon recorded
++                        // as a successful empty completion — and must fail
++                        // the turn instead of stalling until the deadline.
++                        if started_at.elapsed() < no_content_grace {
+                             continue;
+                         }
++                        return Err(OmonError::Llm(
++                            "omo turn ended with no content (likely upstream LLM failure)".into(),
++                        ));
++                    }
+ 
+-                        let rendered = if is_cron_session || total_tool_calls == 0 {
+-                            if full_content.trim().is_empty() {
+-                                "✅ Done.".to_string()
+-                            } else {
+-                                full_content.clone()
+-                            }
++                    let rendered = if is_cron_session || total_tool_calls == 0 {
++                        if full_content.trim().is_empty() {
++                            "✅ Done.".to_string()
+                         } else {
+-                            let breakdown: Vec<String> = tool_call_counts
+-                                .iter()
+-                                .map(|(tool, count)| {
+-                                    if *count > 1 {
+-                                        format!("`{tool}` ×{count}")
+-                                    } else {
+-                                        format!("`{tool}`")
+-                                    }
+-                                })
+-                                .collect();
+-                            let summary_badge = if breakdown.is_empty() {
+-                                format!("-# 🛠️ 도구 {total_tool_calls}회 실행됨")
+-                            } else {
+-                                format!(
+-                                    "-# 🛠️ 도구 {total_tool_calls}회 실행 ({})",
+-                                    breakdown.join(", ")
+-                                )
+-                            };
+-
+-                            if full_content.trim().is_empty() {
+-                                format!("✅ Done.\n\n{summary_badge}")
+-                            } else {
+-                                format!("{}\n\n{}", full_content, summary_badge)
+-                            }
+-                        };
+-                        // A terminal frame with no streamed content (observed:
+-                        // the daemon raced a premature turn/completed at +6s
+-                        // while the real turn was still running) must not end
+-                        // the turn — record a success whose delivery is empty
+-                        // or fail it outright. Ignore the frame and keep
+-                        // streaming until real completion or the deadlines.
+-                        let delivered = self
+-                            .emit_chunk(session, stream_id, sequence, rendered.clone(), true)
+-                            .await;
+-                        if let Some(pool) = &self.pool {
+-                            ensure_session_row(pool, session).await?;
+-                            persist_message(pool, session, &rendered).await?;
++                            full_content.clone()
+                         }
+-                        if delivered.is_ok() {
+-                            if let Some(ack_command) = session
+-                                .state
+-                                .metadata
+-                                .get("cron_ack_command")
+-                                .and_then(Value::as_str)
+-                                .filter(|command| !command.trim().is_empty())
+-                            {
+-                                crate::cron::ack::run_ack_logged(ack_command).await;
+-                            }
++                    } else {
++                        let breakdown: Vec<String> = tool_call_counts
++                            .iter()
++                            .map(|(tool, count)| {
++                                if *count > 1 {
++                                    format!("`{tool}` ×{count}")
++                                } else {
++                                    format!("`{tool}`")
++                                }
++                            })
++                            .collect();
++                        let summary_badge = if breakdown.is_empty() {
++                            format!("-# 🛠️ 도구 {total_tool_calls}회 실행됨")
++                        } else {
++                            format!(
++                                "-# 🛠️ 도구 {total_tool_calls}회 실행 ({})",
++                                breakdown.join(", ")
++                            )
++                        };
++
++                        if full_content.trim().is_empty() {
++                            format!("✅ Done.\n\n{summary_badge}")
++                        } else {
++                            format!("{}\n\n{}", full_content, summary_badge)
+                         }
+-                        return Ok(());
++                    };
++                    let delivered = self
++                        .emit_chunk(session, stream_id, sequence, rendered.clone(), true)
++                        .await;
++                    if let Some(pool) = &self.pool {
++                        ensure_session_row(pool, session).await?;
++                        persist_message(pool, session, &rendered).await?;
+                     }
+-                    "error" | "turn/error" => {
+-                        let is_turn_error = val.pointer("/params/turnId").is_some()
+-                            || val.pointer("/params/turn").is_some()
+-                            || method == "turn/error";
+-                        if !is_turn_error {
+-                            tracing::warn!(
+-                                %thread_id,
+-                                ?val,
+-                                "non-fatal notification error from omo app-server; continuing turn"
+-                            );
+-                            continue;
+-                        }
+-                        let err_msg = val
+-                            .pointer("/params/message")
+-                            .or_else(|| val.pointer("/params/error"))
+-                            .or_else(|| val.pointer("/params/error/message"))
++                    if delivered.is_ok() {
++                        if let Some(ack_command) = session
++                            .state
++                            .metadata
++                            .get("cron_ack_command")
+                             .and_then(Value::as_str)
+-                            .unwrap_or("unknown error from omo app-server");
+-                        return Err(OmonError::Llm(format!(
+-                            "omo app-server turn error: {err_msg}"
+-                        )));
++                            .filter(|command| !command.trim().is_empty())
++                        {
++                            crate::cron::ack::run_ack_logged(ack_command).await;
++                        }
++                    }
++                    return Ok(());
++                }
++                "error" | "turn/error" => {
++                    let is_turn_error = val.pointer("/params/turnId").is_some()
++                        || val.pointer("/params/turn").is_some()
++                        || method == "turn/error";
++                    if !is_turn_error {
++                        tracing::warn!(
++                            %thread_id,
++                            ?val,
++                            "non-fatal notification error from omo app-server; continuing turn"
++                        );
++                        continue;
+                     }
+-                    _ => {}
++                    let err_msg = val
++                        .pointer("/params/message")
++                        .or_else(|| val.pointer("/params/error"))
++                        .or_else(|| val.pointer("/params/error/message"))
++                        .and_then(Value::as_str)
++                        .unwrap_or("unknown error from omo app-server");
++                    return Err(OmonError::Llm(format!(
++                        "omo app-server turn error: {err_msg}"
++                    )));
+                 }
++                _ => {}
+             }
+         }
+         // Reaching the end of the stream without a terminal frame means the
+@@ -696,7 +731,9 @@ impl AgentBackend for OmoBackend {
+                     || msg.contains("failed to connect to omo app-server")
+         );
+         if retryable {
+-            tracing::warn!("omo daemon connection reset or refused mid-turn; retrying once after cooldown");
++            tracing::warn!(
++                "omo daemon connection reset or refused mid-turn; retrying once after cooldown"
++            );
+             tokio::time::sleep(Duration::from_millis(500)).await;
+             return self.run_once(session, event).await;
+         }
+diff --git a/src/agent/omo_config.rs b/src/agent/omo_config.rs
+index 866ff92..3ce74dc 100644
+--- a/src/agent/omo_config.rs
++++ b/src/agent/omo_config.rs
+@@ -42,6 +42,10 @@ pub struct OmoBackendConfig {
+     pub connect_timeout: Duration,
+     pub request_timeout: Duration,
+     pub total_timeout: Duration,
++    /// Grace window during which a content-less terminal frame is treated as
++    /// the premature-completion race and ignored. Past it, an empty terminal
++    /// fails the turn (an upstream LLM failure recorded as an empty success).
++    pub no_content_grace: Duration,
+     pub default_model: Option<String>,
+     pub per_agent_workspace: bool,
+     pub workspace_root: Option<PathBuf>,
+@@ -58,6 +62,7 @@ impl Default for OmoBackendConfig {
+             connect_timeout: Duration::from_secs(5),
+             request_timeout: Duration::from_secs(600),
+             total_timeout: Duration::from_secs(1800),
++            no_content_grace: Duration::from_secs(15),
+             default_model: None,
+             per_agent_workspace: true,
+             workspace_root: None,
+@@ -93,6 +98,11 @@ impl OmoBackendConfig {
+         self
+     }
+ 
++    pub fn with_no_content_grace(mut self, grace: Duration) -> Self {
++        self.no_content_grace = grace;
++        self
++    }
++
+     pub fn with_default_model(mut self, default_model: Option<impl Into<String>>) -> Self {
+         self.default_model = default_model.map(Into::into);
+         self
+@@ -196,6 +206,7 @@ impl OmoBackendConfig {
+             connect_timeout: Duration::from_secs(15),
+             request_timeout,
+             total_timeout,
++            no_content_grace: Duration::from_secs(15),
+             default_model,
+             per_agent_workspace,
+             workspace_root,
+diff --git a/tests/test_omo_backend.rs b/tests/test_omo_backend.rs
+index 9fff28d..2052722 100644
+--- a/tests/test_omo_backend.rs
++++ b/tests/test_omo_backend.rs
+@@ -724,6 +724,131 @@ async fn spawn_empty_turn_completed_server() -> u16 {
+     port
+ }
+ 
++/// Like [`spawn_empty_turn_completed_server`], but the content-less terminal
++/// arrives only after `delay_ms`, so the configured empty-terminal grace
++/// window has already elapsed when it lands.
++async fn spawn_delayed_empty_turn_completed_server(delay_ms: u64) -> u16 {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind free port");
++    let port = listener.local_addr().expect("local addr").port();
++    tokio::spawn(async move {
++        let Ok((stream, _)) = listener.accept().await else {
++            return;
++        };
++        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
++            return;
++        };
++        while let Some(Ok(Message::Text(text))) = ws.next().await {
++            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
++                continue;
++            };
++            let id = request
++                .get("id")
++                .and_then(Value::as_u64)
++                .unwrap_or_default();
++            match request.get("method").and_then(Value::as_str) {
++                Some("initialize") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
++                        ))
++                        .await;
++                }
++                Some("thread/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-1"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                }
++                Some("turn/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
++                    let done = json!({
++                        "jsonrpc":"2.0","method":"turn/completed",
++                        "params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}
++                    });
++                    let _ = ws.send(Message::text(done.to_string())).await;
++                }
++                _ => continue,
++            }
++        }
++    });
++    port
++}
++
++/// Completes the handshake and then emits only WebSocket ping frames: this
++/// is the keepalive-alive-but-wedged daemon shape that must still hit the
++/// whole-turn deadline.
++async fn spawn_pinging_idle_server() -> u16 {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind free port");
++    let port = listener.local_addr().expect("local addr").port();
++    tokio::spawn(async move {
++        let Ok((stream, _)) = listener.accept().await else {
++            return;
++        };
++        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
++            return;
++        };
++        while let Some(Ok(Message::Text(text))) = ws.next().await {
++            let Ok(request) = serde_json::from_str::<Value>(text.as_str()) else {
++                continue;
++            };
++            let id = request
++                .get("id")
++                .and_then(Value::as_u64)
++                .unwrap_or_default();
++            match request.get("method").and_then(Value::as_str) {
++                Some("initialize") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
++                        ))
++                        .await;
++                }
++                Some("thread/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-1"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                }
++                Some("turn/start") => {
++                    let _ = ws
++                        .send(Message::text(
++                            json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}})
++                                .to_string(),
++                        ))
++                        .await;
++                    // Keepalive pings forever; zero turn events ever arrive.
++                    loop {
++                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++                        if ws
++                            .send(Message::Ping(b"keepalive".to_vec().into()))
++                            .await
++                            .is_err()
++                        {
++                            break;
++                        }
++                    }
++                }
++                _ => continue,
++            }
++        }
++    });
++    port
++}
++
+ async fn spawn_tool_after_agent_message_server() -> u16 {
+     let listener = TcpListener::bind("127.0.0.1:0")
+         .await
+@@ -1522,6 +1647,67 @@ async fn test_omo_backend_ignores_turn_completed_without_content() {
+     );
+ }
+ 
++#[tokio::test]
++async fn test_omo_backend_deadline_fires_on_ping_only_stream() {
++    // Regression for the 1800s no-response hang: keepalive pings kept the
++    // read loop awake while the daemon produced zero turn events, so the
++    // whole-turn deadline only fired on text frames and never happened. The
++    // deadline check must fire on non-text frames too.
++    let port = spawn_pinging_idle_server().await;
++    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
++        .with_request_timeout(std::time::Duration::from_secs(1))
++        .with_total_timeout(std::time::Duration::from_millis(150));
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    let backend = OmoBackend::new(config, dispatcher.clone());
++    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "user");
++    let mut session = SessionContext::new(session_key.clone());
++
++    let result = backend
++        .run(
++            &mut session,
++            InboundEvent::message(session_key, "msg", "hello"),
++        )
++        .await;
++
++    let err = result.expect_err("ping-only stream must hit the total deadline");
++    assert!(
++        err.to_string().contains("turn exceeded total deadline"),
++        "unexpected error: {err}"
++    );
++}
++
++#[tokio::test]
++async fn test_omo_backend_empty_terminal_past_grace_fails_fast() {
++    // Regression for the 53-minute silence: a daemon that records an upstream
++    // LLM failure as an empty successful completion must surface right after
++    // the grace window instead of stalling until the silence deadline.
++    let port = spawn_delayed_empty_turn_completed_server(400).await;
++    let config = OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
++        .with_request_timeout(std::time::Duration::from_secs(5))
++        .with_no_content_grace(std::time::Duration::from_millis(100));
++    let dispatcher = Arc::new(CapturingDispatcher::new());
++    let backend = OmoBackend::new(config, dispatcher.clone());
++    let session_key = SessionKey::new("discord", None::<String>, "chan", None::<String>, "user");
++    let mut session = SessionContext::new(session_key.clone());
++
++    let result = backend
++        .run(
++            &mut session,
++            InboundEvent::message(session_key, "msg", "hello"),
++        )
++        .await;
++
++    let err = result.expect_err("empty terminal past grace must fail the turn");
++    assert!(
++        err.to_string().contains("no content"),
++        "unexpected error: {err}"
++    );
++    assert!(
++        dispatcher.stream_chunks().is_empty(),
++        "no final chunk may be emitted for an empty turn"
++    );
++}
++
+ #[tokio::test]
+ async fn test_omo_backend_runs_ack_command_after_cron_delivery() {
+     // Given: a cron session carrying an ack command, and a daemon whose turn

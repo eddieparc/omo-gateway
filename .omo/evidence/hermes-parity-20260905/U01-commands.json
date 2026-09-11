@@ -1,0 +1,7 @@
+[
+  "cargo test --lib tools::terminal::approval_tests::approval_detector_preserves_executable_semantics -- --exact --nocapture",
+  "cargo test --lib security::tests::",
+  "cargo test --lib tools::terminal::approval_tests::",
+  "cargo build",
+  "git diff --check -- src/security/normalize.rs src/security/hardline.rs src/tools/terminal.rs"
+]

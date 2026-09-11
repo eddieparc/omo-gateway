@@ -1,0 +1,12 @@
+[
+  "cargo test --test test_omo_backend stop_interrupts_remote_turn_before_ack -- --exact --nocapture",
+  "cargo test --lib turn_terminal_paths_release_typing -- --nocapture",
+  "cargo test --test test_omo_backend stop_interrupts_remote_turn -- --exact --nocapture",
+  "cargo test --test test_omo_backend -- --nocapture",
+  "cargo test --test test_multiplexer -- --nocapture",
+  "cargo test --lib multiplexer::actor -- --nocapture",
+  "cargo clippy --lib -- -D warnings",
+  "cargo build",
+  "git diff --check src/agent/backend.rs src/agent/omo_backend.rs src/multiplexer/actor.rs tests/test_omo_backend.rs",
+  "rustfmt --check --edition 2021 src/agent/backend.rs src/agent/omo_backend.rs src/multiplexer/actor.rs tests/test_omo_backend.rs"
+]

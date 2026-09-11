@@ -1,0 +1,6 @@
+[
+  "cargo test --lib tools::tests::tool_approval_scopes_do_not_cross_rules -- --exact --nocapture",
+  "cargo test --lib tools::tests::test_tool_approval_hook_dispatch -- --nocapture",
+  "cargo test --lib discord::approval::tests::test_permanent_allowlist_persistence_roundtrip_and_auto_approval -- --exact --nocapture",
+  "cargo build"
+]

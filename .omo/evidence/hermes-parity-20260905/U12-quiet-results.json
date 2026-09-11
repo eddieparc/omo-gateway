@@ -1,0 +1,36 @@
+[
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--test",
+      "test_omo_backend",
+      "--",
+      "--nocapture"
+    ],
+    "exit": 0,
+    "elapsed_seconds": 171.677
+  },
+  {
+    "command": [
+      "rustfmt",
+      "--check",
+      "--edition",
+      "2021",
+      "tests/test_omo_backend.rs"
+    ],
+    "exit": 0,
+    "elapsed_seconds": 0.043
+  },
+  {
+    "command": [
+      "git",
+      "diff",
+      "--check",
+      "--",
+      "tests/test_omo_backend.rs"
+    ],
+    "exit": 0,
+    "elapsed_seconds": 0.074
+  }
+]

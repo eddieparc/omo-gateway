@@ -1,0 +1,6 @@
+[
+  "cargo test --test test_discord_adapter authorization_surface_matrix -- --exact --nocapture",
+  "cargo test --test test_discord_adapter",
+  "cargo test --lib discord::commands",
+  "cargo build"
+]

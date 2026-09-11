@@ -1,0 +1,24 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 44s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+text bounds: Rect { left: 16.0, top: 13.4, right: 50.3, bottom: 30.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(89.0)) }
+text bounds: Rect { left: 16.0, top: 57.4, right: 1226.9989, bottom: 74.2 }; canvas: Size { width: NonZeroPositiveF32(FiniteF32(480.0)), height: NonZeroPositiveF32(FiniteF32(89.0)) }
+fence_preserved=false; glyphs_inside=false; images=2
+
+thread 'discord::table_render::tests::fences_and_unbroken_cells_preserve_content' (13069477) panicked at src/discord/table_render/mod.rs:345:9:
+fenced example changed or cell glyphs clipped
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test discord::table_render::tests::fences_and_unbroken_cells_preserve_content ... FAILED
+
+failures:
+
+failures:
+    discord::table_render::tests::fences_and_unbroken_cells_preserve_content
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 286 filtered out; finished in 0.57s
+
+error: test failed, to rerun pass `--lib`
+
+EXIT_CODE=101

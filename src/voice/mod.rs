@@ -1,7 +1,7 @@
 mod pipeline;
 
 pub use pipeline::{
-    AudioDirection, AudioFrame, AudioFrameBuffer, AudioPayload, SpeechPipeline,
+    AudioDirection, AudioFrame, AudioFrameBuffer, AudioPayload, OpenAiSpeechToText, SpeechPipeline,
     SpeechPipelineOutput, SpeechToText, TextToSpeech, VoiceAudioPipeline, VoiceLanguageModel,
 };
 

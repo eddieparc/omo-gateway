@@ -1,0 +1,8 @@
+[
+  "cargo test --test test_omo_backend interactive_deadline_bounds_all_protocol_phases -- --nocapture",
+  "cargo test --test test_omo_backend -- --nocapture",
+  "cargo clippy --lib -- -D warnings",
+  "cargo build",
+  "git diff --check src/agent/omo_backend.rs tests/test_omo_backend.rs",
+  "rustfmt --check --edition 2021 src/agent/omo_backend.rs tests/test_omo_backend.rs"
+]

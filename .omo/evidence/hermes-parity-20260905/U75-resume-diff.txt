@@ -1,0 +1,3 @@
+$ git diff --check -- src/drain_control.rs
+
+EXIT_CODE=0

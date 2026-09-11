@@ -1,0 +1,8 @@
+[
+  "cargo test --test test_migrate changed_payload_blocks_cutover -- --exact --nocapture",
+  "cargo test --test test_migrate cutover_second_store_failure_preserves_bytes_and_receipt -- --exact --nocapture",
+  "cargo test --test test_migrate",
+  "cargo test --lib cron_cutover",
+  "cargo test --lib migrate",
+  "cargo test --lib cron::scheduler"
+]

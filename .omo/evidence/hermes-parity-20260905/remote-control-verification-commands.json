@@ -1,0 +1,157 @@
+{
+  "phase": "hermes-parity-remote-control-20260906",
+  "verification_role": "independent-verifier",
+  "tool_limitations": {
+    "apply_patch": "not exposed in tool schema; file read/write used for evidence artifacts; no source edits made",
+    "tool_monitor": "not exposed in tool schema; bounded bash commands used directly"
+  },
+  "overall_verdicts": {
+    "U13": "PASS",
+    "U14": "PASS",
+    "U15": "PASS"
+  },
+  "units": {
+    "U13": {
+      "id": "U13",
+      "title": "Interrupt actual remote work",
+      "findings": ["S.F04", "R.R11"],
+      "verdict": "PASS",
+      "files_inspected": [
+        "src/agent/backend.rs",
+        "src/agent/omo_backend.rs",
+        "src/multiplexer/actor.rs",
+        "tests/test_omo_backend.rs"
+      ],
+      "commands": [
+        {
+          "command": "cargo test --test test_omo_backend stop_interrupts_remote_turn_before_ack -- --exact --nocapture",
+          "constituent": "S.F04 (Remote Interrupt before Stop ACK)",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-control-verification-u13.log"
+        },
+        {
+          "command": "cargo test --lib turn_terminal_paths_release_typing -- --nocapture",
+          "constituent": "R.R11 (Typing release all terminal paths)",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-control-verification-u13.log"
+        },
+        {
+          "command": "cargo test --test test_omo_backend stop_interrupts_remote_turn -- --exact --nocapture",
+          "constituent": "S.F04 / R.R11 (Multi-lane remote interruption & typing isolation)",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-control-verification-u13.log"
+        }
+      ]
+    },
+    "U14": {
+      "id": "U14",
+      "title": "Absolute interactive deadline",
+      "findings": ["S.F05"],
+      "verdict": "PASS",
+      "files_inspected": [
+        "src/agent/omo_backend.rs",
+        "tests/test_omo_backend.rs"
+      ],
+      "commands": [
+        {
+          "command": "cargo test --test test_omo_backend interactive_deadline_bounds_all_protocol_phases -- --nocapture",
+          "constituent": "S.F05 (Absolute 300s deadline bounding all protocol phases and retry budget)",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "phases_passed": [
+            "Connect",
+            "Initialize",
+            "ThreadStart",
+            "ThreadResume",
+            "TurnStartAck",
+            "Streaming",
+            "RetryInitialize",
+            "SmallerConfiguredCap"
+          ],
+          "log": "remote-control-verification-u14.log"
+        }
+      ]
+    },
+    "U15": {
+      "id": "U15",
+      "title": "No accepted-turn resubmission",
+      "findings": ["S.F07"],
+      "verdict": "PASS",
+      "files_inspected": [
+        "src/agent/omo_backend.rs",
+        "tests/test_omo_backend.rs"
+      ],
+      "commands": [
+        {
+          "command": "cargo test --test test_omo_backend accepted_disconnect_does_not_resubmit_turn -- --exact --nocapture",
+          "constituent": "S.F07 (Accepted turn disconnect does not resubmit)",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-control-verification-u15.log"
+        },
+        {
+          "command": "cargo test --test test_omo_backend pre_ack_disconnect_does_not_resubmit_turn -- --exact --nocapture",
+          "constituent": "S.F07 (Ambiguous pre-ACK disconnect does not resubmit)",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-control-verification-u15.log"
+        },
+        {
+          "command": "cargo test --test test_omo_backend pre_submit_disconnect_retries_and_succeeds -- --exact --nocapture",
+          "constituent": "S.F07 (Pre-submit transport drop retries once and succeeds)",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-control-verification-u15.log"
+        }
+      ]
+    },
+    "targets_and_checks": {
+      "backend_target": {
+        "command": "cargo test --test test_omo_backend -- --nocapture",
+        "exit_code": 0,
+        "passed": 31,
+        "failed": 0,
+        "log": "remote-control-verification-backend-target.log"
+      },
+      "multiplexer_target": {
+        "command": "cargo test --test test_multiplexer -- --nocapture",
+        "exit_code": 0,
+        "passed": 11,
+        "failed": 0,
+        "log": "remote-control-verification-actor-target.log"
+      },
+      "actor_lib_target": {
+        "command": "cargo test --lib multiplexer::actor -- --nocapture",
+        "exit_code": 0,
+        "passed": 5,
+        "failed": 0,
+        "log": "remote-control-verification-actor-target.log"
+      },
+      "cargo_build": {
+        "command": "cargo build",
+        "exit_code": 0,
+        "log": "remote-control-verification-build.log"
+      },
+      "git_diff_check": {
+        "command": "git diff --check src/agent/backend.rs src/agent/omo_backend.rs src/multiplexer/actor.rs tests/test_omo_backend.rs",
+        "exit_code": 0,
+        "log": "remote-control-verification-fmt.log"
+      },
+      "rustfmt_check": {
+        "command": "rustfmt --check --edition 2021 src/agent/backend.rs src/agent/omo_backend.rs src/multiplexer/actor.rs tests/test_omo_backend.rs",
+        "exit_code": 0,
+        "log": "remote-control-verification-fmt.log"
+      }
+    }
+  }
+}

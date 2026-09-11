@@ -1,0 +1,210 @@
+{
+  "verification_role": "independent-verifier",
+  "phase": "hermes-parity-remote-durable-20260907",
+  "overall_verdicts": {
+    "U16": "PASS",
+    "U17": "PASS",
+    "U18": "PASS"
+  },
+  "units": {
+    "U16": {
+      "id": "U16",
+      "title": "Durable remote conversation binding",
+      "findings": ["S.F08"],
+      "verdict": "PASS",
+      "files_inspected": [
+        "src/agent/omo_backend.rs",
+        "src/multiplexer/actor.rs",
+        "src/storage/db.rs",
+        "tests/test_omo_backend.rs"
+      ],
+      "commands": [
+        {
+          "command": "cargo test --test test_omo_backend failed_first_turn_keeps_durable_binding -- --exact --nocapture",
+          "constituent": "Failed first turn keeps durable binding across process recreation BEFORE turn submission",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u16.log"
+        },
+        {
+          "command": "cargo test --test test_omo_backend missing_rollout_fails_with_continuity_error -- --exact --nocapture",
+          "constituent": "Missing rollout fails with explicit continuity error",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u16.log"
+        },
+        {
+          "command": "cargo test --test test_omo_backend persistence_failure_prevents_turn_submission -- --exact --nocapture",
+          "constituent": "Persistence failure prevents turn submission BEFORE socket write",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u16.log"
+        },
+        {
+          "command": "cargo test --test test_omo_backend test_omo_backend_replaces_stale_cached_thread -- --exact --nocapture",
+          "constituent": "Stale cached thread fails with continuity error rather than silent replacement",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u16.log"
+        },
+        {
+          "command": "cargo test --lib test_persist_session_binding -- --nocapture",
+          "constituent": "persist_session_binding SQLite helper checkpoint",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u16.log"
+        }
+      ]
+    },
+    "U17": {
+      "id": "U17",
+      "title": "Canonical recovery bot identity",
+      "findings": [
+        "Canonical recovery bot identity",
+        "Outbound ledger owner identity"
+      ],
+      "verdict": "PASS",
+      "files_inspected": [
+        "src/models/session.rs",
+        "src/storage/db.rs",
+        "src/main.rs"
+      ],
+      "commands": [
+        {
+          "command": "cargo test --lib storage::db::tests::resume_pending_preserves_bot_identity -- --exact --nocapture",
+          "constituent": "Twin-bot DM recovery preserves exact bot identity and ledger owner without blanket reset",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u17.log"
+        },
+        {
+          "command": "cargo test --bin omo-gateway test_recover_pending_delivery_obligations_preserves_bot_identity -- --nocapture",
+          "constituent": "Outbox delivery recovery preserves bot identity across dead process sweep",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u17.log"
+        },
+        {
+          "command": "cargo test --bin omo-gateway test_recover_resume_pending_sessions_preserves_bot_identity -- --nocapture",
+          "constituent": "Startup resume_pending recovery preserves bot identity for twin bots",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u17.log"
+        },
+        {
+          "command": "cargo test --lib models::session::tests::storage_key_strict_inverse_round_trip -- --exact --nocapture",
+          "constituent": "Strict inverse parser roundtrip on legacy 5-dim and identity-aware 6-dim keys",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u17.log"
+        },
+        {
+          "command": "cargo test --lib models::session::tests::storage_key_parser_rejects_malformed_inputs -- --exact --nocapture",
+          "constituent": "Storage key parser rejects empty, malformed, and truncated inputs",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u17.log"
+        },
+        {
+          "command": "cargo test --lib models::session -- --nocapture",
+          "constituent": "Session model unit test suite",
+          "exit_code": 0,
+          "passed": 8,
+          "failed": 0,
+          "log": "remote-durable-verification-u17.log"
+        },
+        {
+          "command": "cargo test --lib storage::db -- --nocapture",
+          "constituent": "Storage DB unit test suite",
+          "exit_code": 0,
+          "passed": 25,
+          "failed": 0,
+          "log": "remote-durable-verification-u17.log"
+        }
+      ]
+    },
+    "U18": {
+      "id": "U18",
+      "title": "Fail before undurable side effects",
+      "findings": ["S.F15"],
+      "verdict": "PASS",
+      "files_inspected": [
+        "src/multiplexer/actor.rs",
+        "src/storage/db.rs",
+        "tests/test_multiplexer.rs"
+      ],
+      "commands": [
+        {
+          "command": "cargo test --test test_multiplexer persistence_failure_never_acknowledges_turn_on_user_insert -- --exact --nocapture",
+          "constituent": "Real SQLite RAISE(ABORT) trigger on messages insert blocks engine execution and delivery acknowledgement",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u18.log"
+        },
+        {
+          "command": "cargo test --test test_multiplexer persistence_failure_never_acknowledges_turn_on_session_update -- --exact --nocapture",
+          "constituent": "Real SQLite RAISE(ABORT) trigger on sessions update converts turn result to error and blocks delivery acknowledgement",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u18.log"
+        },
+        {
+          "command": "cargo test --test test_multiplexer persistence_failure_never_acknowledges_turn -- --exact --nocapture",
+          "constituent": "End-to-end registered binding scenario covering both trigger abort variants",
+          "exit_code": 0,
+          "passed": 1,
+          "failed": 0,
+          "log": "remote-durable-verification-u18.log"
+        }
+      ]
+    }
+  },
+  "targets_and_checks": {
+    "backend_target": {
+      "command": "cargo test --test test_omo_backend -- --nocapture",
+      "exit_code": 0,
+      "passed": 34,
+      "failed": 0,
+      "log": "remote-durable-verification-backend.log"
+    },
+    "multiplexer_target": {
+      "command": "cargo test --test test_multiplexer -- --nocapture",
+      "exit_code": 0,
+      "passed": 18,
+      "failed": 0,
+      "log": "remote-durable-verification-multiplexer.log"
+    },
+    "cargo_build": {
+      "command": "cargo build",
+      "exit_code": 0,
+      "log": "remote-durable-verification-build.log"
+    },
+    "rustfmt_check": {
+      "command": "rustfmt --check --edition 2021 src/agent/omo_backend.rs src/multiplexer/actor.rs src/storage/db.rs src/models/session.rs src/main.rs tests/test_omo_backend.rs tests/test_multiplexer.rs",
+      "exit_code": 0,
+      "log": "remote-durable-verification-fmt.log"
+    },
+    "git_diff_check": {
+      "command": "git diff --check src/agent/omo_backend.rs src/multiplexer/actor.rs src/storage/db.rs src/models/session.rs src/main.rs tests/test_omo_backend.rs tests/test_multiplexer.rs",
+      "exit_code": 0,
+      "log": "remote-durable-verification-fmt.log"
+    },
+    "clippy_check": {
+      "command": "cargo clippy --tests",
+      "exit_code": 0,
+      "log": "remote-durable-verification-clippy.log"
+    }
+  }
+}

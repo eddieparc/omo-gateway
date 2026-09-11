@@ -1,0 +1,60 @@
+{
+  "unit": "U46",
+  "scope": ["CR.C15", "CFG.C09"],
+  "handoff": "At resume inspection the prior worker had registered and captured both RED runs (U46-resume-red-c15.log, U46-resume-red-c09.log) and authored the integration test tests/test_cron_schedule_parity.rs plus the src/cron/store.rs unit test, but no production change existed. This resume added the production behavior and captured GREEN. Unrelated dirty handoff changes across the workspace are preserved.",
+  "resume_session": "01a070bb-40f8-7c3e-a02e-e802d250b826",
+  "registered_before_behavior_change": [
+    "cargo test --test test_cron_schedule_parity imported_cron_retains_timezone -- --exact --nocapture",
+    "cargo test --lib cron::store::tests::imports_timezone_and_rejects_invalid_schedule -- --exact --nocapture"
+  ],
+  "execution_note": "Only functions.bash/read and LSP tools are exposed in this child. tool_schema/tool.monitor/eval APIs are unavailable. Bounded bash was used for cargo; all artifacts written via file tools, never shell redirection.",
+  "results": [
+    {
+      "constituent": "CR.C15",
+      "command": "cargo test --test test_cron_schedule_parity imported_cron_retains_timezone -- --exact --nocapture",
+      "red_log": "U46-resume-red-c15.log",
+      "red": "FAILED (1 failed): next=Some(2026-09-05T09:00:00Z), expected Some(2026-09-06T00:00:00Z)",
+      "green_log": "U46-resume-green-c15.log",
+      "green": "ok (1 passed): next=Some(2026-09-06T00:00:00Z); payload schedule.timezone=Asia/Seoul; reopen/resync stable twice",
+      "exit_red": 101,
+      "exit_green": 0
+    },
+    {
+      "constituent": "CFG.C09",
+      "command": "cargo test --lib cron::store::tests::imports_timezone_and_rejects_invalid_schedule -- --exact --nocapture",
+      "red_log": "U46-resume-red-c09.log",
+      "red": "FAILED (1 failed): garbage expr imported as enabled row with next=null (result=Ok(1), rows=[(true, None)])",
+      "green_log": "U46-resume-green-c09.log",
+      "green": "ok (1 passed): garbage rejected before any insert (result=Err, rows=[]) for both null and stored-next payloads; valid 0 9 * * * Asia/Seoul -> next 2026-09-06T00:00:00Z with schedule.timezone persisted",
+      "exit_red": 101,
+      "exit_green": 0
+    }
+  ],
+  "supplementary": [
+    {
+      "name": "DST zone evaluation (new next_run_tz function)",
+      "command": "cargo test --lib cron::scheduler::tests::next_run_tz_evaluates_wall_clock_and_tracks_dst_offset -- --exact --nocapture",
+      "green_log": "U46-resume-green-dst.log",
+      "green": "ok (1 passed): America/New_York noon -> 17:00Z (EST) vs 16:00Z (EDT); Asia/Seoul no-DST; None/interval fall back to UTC; garbage rejected",
+      "note": "Additive coverage for the new timezone-aware function; no prior behavior existed so no RED phase applies."
+    }
+  ],
+  "adjacent_regression": {
+    "command": "cargo test --lib cron::",
+    "log": "U46-resume-adjacent-cron.log",
+    "result": "ok: 39 passed; 0 failed (cron ack/store/scheduler/tools::cron)"
+  },
+  "verification": {
+    "diagnostics": "lsp_diagnostics error severity on src/cron/store.rs and src/cron/scheduler.rs: none",
+    "build": "cargo build -> Finished (exit 0), U46-resume-build.log",
+    "full_parity_test_file": "cargo test --test test_cron_schedule_parity -> 1 passed",
+    "rustfmt": "cargo fmt --check: production regions in scheduler.rs (0 diffs) and store.rs changed region clean; residual store.rs diffs (517/531/539) are the preserved handoff RED test body; other whole-crate diffs are unrelated pre-existing dirty files"
+  },
+  "changed_files": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "src/cron/store.rs",
+    "src/cron/scheduler.rs",
+    "tests/test_cron_schedule_parity.rs"
+  ]
+}

@@ -240,9 +240,11 @@ impl Tool for McpTool {
         let client = self.clients.iter().find(|client| client.name == tool_name);
         if let Some(client) = client {
             if client.requires_approval {
+                // The registry hashes this reason; bind it to the registered client.
+                // JSON keeps the client/method pair unambiguous.
                 return Some(format!(
-                    "MCP external tool execution: '{}'",
-                    client.remote_tool
+                    "MCP external tool execution: {}",
+                    json!([client.name, client.remote_tool])
                 ));
             }
         }

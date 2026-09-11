@@ -1,0 +1,43 @@
+{
+  "unit": "U47",
+  "scope": [
+    "CR.C16"
+  ],
+  "registered_before_behavior_change": [
+    "cargo test --test test_cron_boundary_parity sync_isolates_bad_jobs_and_rearms_changed_once -- --exact --nocapture"
+  ],
+  "results": [
+    {
+      "constituent": "CR.C16",
+      "command": "cargo test --test test_cron_boundary_parity sync_isolates_bad_jobs_and_rearms_changed_once -- --exact --nocapture",
+      "exit_red": 101,
+      "exit_green": 0,
+      "red_log": "U47-resume-red.log",
+      "red_validation_log": "U47-resume-red-once-validation.log",
+      "green_log": "U47-resume-green.log",
+      "red": "FAILED (1 failed): panicked at tests/test_cron_boundary_parity.rs:132:10: sync must isolate bad jobs and bad profiles without aborting healthy import: Config(\"invalid cron expression `garbage`: garbage ...\")",
+      "red_validation_note": "FAILED (1 failed): panicked at tests/test_cron_boundary_parity.rs:186:5: assertion `left == right` failed: must import all valid jobs from healthy stores while isolating bad jobs and profiles; left: 7, right: 5 (both malformed once:not-a-date jobs with and without next_run_at were imported instead of isolated)",
+      "green": "ok (1 passed): isolated corrupt profile, malformed cron expression, and malformed once timestamps (with/without next_run_at) without aborting sync; 5 valid jobs imported; per-job schedule.timezone takes precedence over profile timezone; overdue once policy preserved; completed once job disabled and rearmed on future run_at; exhausted finite repeat job disabled and rearmed on increased limit; runtime status/error/delivery error populated in payload"
+    }
+  ],
+  "adjacent_regression": {
+    "command": "cargo test --lib cron::",
+    "result": "ok: 39 passed; 0 failed (cron store/scheduler/ack/guard/tools::cron)",
+    "log": "U47-resume-adjacent-cron.log"
+  },
+  "verification": {
+    "build": "cargo build -> Finished (exit 0), U47-resume-build.log",
+    "diagnostics": "lsp_diagnostics/cargo check on src/cron/store.rs, src/cron/scheduler.rs, tests/test_cron_boundary_parity.rs: 0 errors",
+    "full_parity_test_file": "cargo test --test test_cron_boundary_parity -> 1 passed",
+    "schedule_parity_test_file": "cargo test --test test_cron_schedule_parity -> 1 passed (U46 preserved)",
+    "voice_cron_test_file": "cargo test --test test_voice_cron -> 9 passed",
+    "rustfmt": "rustfmt --edition 2024 --check tests/test_cron_boundary_parity.rs: 0 diffs; changed regions in src/cron/store.rs and src/cron/scheduler.rs formatted"
+  },
+  "changed_files": [
+    "src/cron/store.rs",
+    "src/cron/scheduler.rs",
+    "tests/test_cron_boundary_parity.rs"
+  ],
+  "execution_note": "Core file and bash tools were used to register RED, make scoped edits, and verify GREEN. No dependencies changed; all pre-existing handoff changes across the workspace were preserved.",
+  "handoff": "Resumed from session 01a070bb-40f8-7c3e-a02e-e802d250b826 following U46 completion. Plugged full-validation hole in sync_at by rejecting malformed once timestamps (parse_timestamp validation) before evaluating recurrence, prioritized per-job schedule.timezone over profile timezone, implemented bad-job and bad-profile isolation, explicit once and finite rearming, and execution/delivery runtime status updates. Driven to verified GREEN."
+}

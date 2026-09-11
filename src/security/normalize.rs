@@ -887,8 +887,15 @@ pub fn execution_flag_findings(command: &str) -> Vec<(String, Option<String>)> {
                     "python" => {
                         let mut i = 0;
                         while i < args.len() {
-                            if args[i] == "-c" {
-                                let payload = args.get(i + 1).cloned();
+                            if args[i] == "--" || !args[i].starts_with('-') {
+                                break;
+                            }
+                            if args[i].starts_with("-c") {
+                                let payload = if args[i] == "-c" {
+                                    args.get(i + 1).cloned()
+                                } else {
+                                    Some(args[i][2..].to_string())
+                                };
                                 findings.push(("script execution via -e/-c flag".into(), payload));
                                 break;
                             }
@@ -898,6 +905,19 @@ pub fn execution_flag_findings(command: &str) -> Vec<(String, Option<String>)> {
                     "node" => {
                         let mut i = 0;
                         while i < args.len() {
+                            if args[i] == "--" || !args[i].starts_with('-') {
+                                break;
+                            }
+                            if let Some(payload) = args[i]
+                                .strip_prefix("--eval=")
+                                .or_else(|| args[i].strip_prefix("--print="))
+                            {
+                                findings.push((
+                                    "script execution via -e/-c flag".into(),
+                                    Some(payload.to_string()),
+                                ));
+                                break;
+                            }
                             if matches!(args[i].as_str(), "-e" | "--eval" | "-p" | "--print") {
                                 let payload = args.get(i + 1).cloned();
                                 findings.push(("script execution via -e/-c flag".into(), payload));
@@ -950,11 +970,23 @@ pub fn execution_flag_findings(command: &str) -> Vec<(String, Option<String>)> {
                 }
             }
 
+            if base_name == "rg" {
+                for arg in args.iter().take_while(|arg| arg.as_str() != "--") {
+                    if arg == "--pre" || arg.starts_with("--pre=") {
+                        findings.push(("ripgrep preprocessor execution".into(), None));
+                        break;
+                    }
+                }
+            }
+
             if matches!(base_name.as_str(), "bash" | "sh" | "zsh" | "ksh") {
                 let mut i = 0;
                 while i < args.len() {
                     let arg = &args[i];
-                    if arg.starts_with('-') && arg.contains('c') {
+                    if arg == "--" || !arg.starts_with('-') {
+                        break;
+                    }
+                    if !arg.starts_with("--") && arg.contains('c') {
                         let payload = args.get(i + 1).cloned();
                         findings.push(("shell command via -c/-lc flag".into(), payload));
                         break;

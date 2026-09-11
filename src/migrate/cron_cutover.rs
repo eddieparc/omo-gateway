@@ -1,7 +1,10 @@
 use crate::migrate::sys::MigrationEnv;
 use crate::{OmonError, Result};
 use serde::Deserialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,20 +24,248 @@ pub struct CronCutoverSummary {
 #[derive(Debug, Deserialize)]
 struct StoreDocument {
     #[serde(default)]
-    jobs: Vec<StoreJob>,
+    jobs: Vec<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct StoreJob {
-    id: String,
+pub struct PreparedStore {
+    pub profile: String,
+    pub path: PathBuf,
+    pub original: Vec<u8>,
+    pub job_ids: Vec<String>,
+    pub unverified_jobs: Vec<String>,
 }
 
-struct PreparedStore {
+struct PreparedCutoverStore {
     profile: String,
     path: PathBuf,
-    original: Vec<u8>,
+    original_bytes: Vec<u8>,
+    original_hash: String,
+    backup_candidate: PathBuf,
+    backup_path: Option<PathBuf>,
+    replacement_bytes: Vec<u8>,
+    replacement_hash: String,
     job_ids: Vec<String>,
     unverified_jobs: Vec<String>,
+    job_digests: Vec<(String, String)>,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        use std::fmt::Write;
+        let _ = write!(hex, "{:02x}", b);
+    }
+    hex
+}
+
+pub fn normalize_job_payload(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut cleaned = serde_json::Map::new();
+            for (key, val) in map {
+                // Ignore runtime state and internal provenance metadata
+                if key == "_omon_hermes_source"
+                    || key == "_omon_hermes_profile"
+                    || key == "_omon_hermes_home"
+                    || key == "last_status"
+                    || key == "last_run_at"
+                    || key == "last_error"
+                    || key == "last_delivery_error"
+                    || key == "created_at"
+                    || key == "updated_at"
+                    || key == "next_run_at"
+                    || key == "id"
+                {
+                    continue;
+                }
+                if key == "repeat" {
+                    if let Value::Object(repeat_map) = val {
+                        let mut cleaned_repeat = serde_json::Map::new();
+                        for (rk, rv) in repeat_map {
+                            if rk != "completed" {
+                                cleaned_repeat.insert(rk.clone(), rv.clone());
+                            }
+                        }
+                        cleaned.insert(key.clone(), Value::Object(cleaned_repeat));
+                        continue;
+                    }
+                }
+                cleaned.insert(key.clone(), normalize_job_payload(val));
+            }
+            Value::Object(cleaned)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(normalize_job_payload).collect()),
+        other => other.clone(),
+    }
+}
+
+pub fn canonical_job_payload_matches(source: &Value, db_payload: &Value) -> bool {
+    let source_norm =
+        if let Ok(hermes_job) = serde_json::from_value::<crate::cron::HermesJob>(source.clone()) {
+            if let Ok(serialized) = serde_json::to_value(&hermes_job) {
+                normalize_job_payload(&serialized)
+            } else {
+                normalize_job_payload(source)
+            }
+        } else {
+            normalize_job_payload(source)
+        };
+
+    let db_norm = if let Ok(hermes_job) =
+        serde_json::from_value::<crate::cron::HermesJob>(db_payload.clone())
+    {
+        if let Ok(serialized) = serde_json::to_value(&hermes_job) {
+            normalize_job_payload(&serialized)
+        } else {
+            normalize_job_payload(db_payload)
+        }
+    } else {
+        normalize_job_payload(db_payload)
+    };
+
+    source_norm == db_norm
+}
+
+pub async fn reconcile_pending_cutover(
+    env: &dyn MigrationEnv,
+    pool: &SqlitePool,
+) -> Result<Option<String>> {
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_cutover_receipts')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !table_exists {
+        return Ok(None);
+    }
+
+    let pending_op: Option<(String,)> = sqlx::query_as(
+        "SELECT operation_id FROM cron_cutover_receipts WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((operation_id,)) = pending_op else {
+        return Ok(None);
+    };
+
+    type CutoverStoreRow = (String, String, String, String, Option<Vec<u8>>);
+    let stores: Vec<CutoverStoreRow> = sqlx::query_as(
+        "SELECT store_path, original_hash, replacement_hash, backup_path, replacement_bytes
+         FROM cron_cutover_receipt_stores
+         WHERE operation_id = ?
+         ORDER BY store_path",
+    )
+    .bind(&operation_id)
+    .fetch_all(pool)
+    .await?;
+
+    // Validate every payload before advancing any store. Legacy receipts lack
+    // exact bytes; neither receipt times nor backup names can reconstruct them.
+    let stores = stores
+        .into_iter()
+        .map(|(path, original_hash, replacement_hash, backup, bytes)| {
+            let bytes = bytes.ok_or_else(|| {
+                OmonError::Config(format!(
+                    "Hermes cron store {path} has no journaled replacement bytes; automatic cutover recovery unavailable; original backup preserved at {backup}"
+                ))
+            })?;
+            if sha256_hex(&bytes) != replacement_hash {
+                return Err(OmonError::Config(format!(
+                    "Hermes cron store {path} journaled replacement bytes do not match replacement hash; original backup preserved at {backup}"
+                )));
+            }
+            Ok((path, original_hash, backup, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Acquire locks on all stores in canonical order
+    let mut lock_paths = BTreeSet::new();
+    for (store_path_str, _, _, _) in &stores {
+        let p = PathBuf::from(store_path_str);
+        if let Some(parent) = p.parent() {
+            if env.exists(parent) {
+                let lock_path = env.canonicalize(&parent.join(".jobs.lock"))?;
+                lock_paths.insert(lock_path);
+            }
+        }
+    }
+    let mut locks = Vec::new();
+    for lock_path in &lock_paths {
+        locks.push(env.acquire_jobs_lock(lock_path)?);
+    }
+
+    let now = env.now();
+    for (store_path_str, orig_hash, backup_path, replacement_bytes) in &stores {
+        let path = PathBuf::from(store_path_str);
+        let current_bytes = if env.exists(&path) {
+            env.read(&path)?
+        } else {
+            Vec::new()
+        };
+        let current_hash = sha256_hex(&current_bytes);
+
+        if current_bytes == *replacement_bytes {
+            sqlx::query(
+                "UPDATE cron_cutover_receipt_stores SET phase = 'replaced', updated_at = ? WHERE operation_id = ? AND store_path = ?",
+            )
+            .bind(now)
+            .bind(&operation_id)
+            .bind(store_path_str)
+            .execute(pool)
+            .await?;
+        } else if current_hash == *orig_hash {
+            env.write_atomic(&path, replacement_bytes)?;
+            sqlx::query(
+                "UPDATE cron_cutover_receipt_stores SET phase = 'replaced', updated_at = ? WHERE operation_id = ? AND store_path = ?",
+            )
+            .bind(now)
+            .bind(&operation_id)
+            .bind(store_path_str)
+            .execute(pool)
+            .await?;
+        } else {
+            return Err(OmonError::Config(format!(
+                "Hermes cron store {} has unknown content during cutover recovery (hash does not match original or replacement); backups preserved at {}",
+                path.display(),
+                backup_path
+            )));
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+    let now = env.now();
+    sqlx::query(
+        "UPDATE cron_cutover_receipts SET status = 'committed', updated_at = ? WHERE operation_id = ?",
+    )
+    .bind(now)
+    .bind(&operation_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE cron_cutover_receipt_stores SET phase = 'committed', updated_at = ? WHERE operation_id = ?",
+    )
+    .bind(now)
+    .bind(&operation_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE cron_jobs SET authority = 'omon_owned', updated_at = ?
+         WHERE authority = 'cutover_pending'",
+    )
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    drop(locks);
+
+    Ok(Some(operation_id))
 }
 
 pub async fn cutover_cron_stores(
@@ -43,44 +274,122 @@ pub async fn cutover_cron_stores(
     pool: &SqlitePool,
     dry_run: bool,
 ) -> Result<CronCutoverSummary> {
+    if !dry_run {
+        reconcile_pending_cutover(env, pool).await?;
+    }
+
     let stores = discover_stores(env, hermes_root)?;
+
+    // Lock all selected stores in canonical order (deduplicating aliases safely)
+    let mut lock_paths = BTreeSet::new();
+    for (_profile, path) in &stores {
+        if let Some(parent) = path.parent() {
+            if env.exists(parent) {
+                let lock_path = env.canonicalize(&parent.join(".jobs.lock"))?;
+                lock_paths.insert(lock_path);
+            }
+        }
+    }
+
+    let mut locks = Vec::new();
+    if !dry_run {
+        for lock_path in &lock_paths {
+            locks.push(env.acquire_jobs_lock(lock_path)?);
+        }
+    }
+
+    // Under locks take final snapshot and validate whole import receipt and source set
     let mut prepared = Vec::with_capacity(stores.len());
 
-    for (profile, path) in stores {
-        let original = if env.exists(&path) {
-            if !env.is_file(&path) {
+    for (profile, path) in &stores {
+        let original = if env.exists(path) {
+            if !env.is_file(path) {
                 return Err(OmonError::Config(format!(
                     "Hermes cron store is not a file: {}",
                     path.display()
                 )));
             }
-            env.read(&path)?
+            env.read(path)?
         } else {
             Vec::new()
         };
-        let job_ids = if original.is_empty() && !env.exists(&path) {
+        let original_hash = sha256_hex(&original);
+        let store_jobs = if original.is_empty() && !env.exists(path) {
             Vec::new()
         } else {
-            parse_job_ids(&path, &original)?
+            parse_store_jobs(path, &original)?
         };
+        let mut job_ids = Vec::with_capacity(store_jobs.len());
         let mut unverified_jobs = Vec::new();
-        for job_id in &job_ids {
+        let mut job_digests = Vec::with_capacity(store_jobs.len());
+
+        for job_val in &store_jobs {
+            let job_id = job_val.get("id").and_then(Value::as_str).unwrap_or("");
+            job_ids.push(job_id.to_owned());
             let imported_id = format!("hermes:{profile}:{job_id}");
-            let imported: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cron_jobs WHERE id = ?)")
+            let db_row: Option<(String,)> =
+                sqlx::query_as("SELECT payload_json FROM cron_jobs WHERE id = ?")
                     .bind(&imported_id)
-                    .fetch_one(pool)
+                    .fetch_optional(pool)
                     .await?;
-            if !imported {
-                unverified_jobs.push(job_id.clone());
+
+            match db_row {
+                None => {
+                    unverified_jobs.push(job_id.to_owned());
+                }
+                Some((db_payload_str,)) => {
+                    let db_payload: Value =
+                        serde_json::from_str(&db_payload_str).unwrap_or(Value::Null);
+                    if !canonical_job_payload_matches(job_val, &db_payload) {
+                        unverified_jobs.push(job_id.to_owned());
+                    } else {
+                        let digest = sha256_hex(
+                            serde_json::to_string(&normalize_job_payload(job_val))
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        );
+                        job_digests.push((job_id.to_owned(), digest));
+                    }
+                }
             }
         }
-        prepared.push(PreparedStore {
-            profile,
-            path,
-            original,
+
+        let parent = path.parent().ok_or_else(|| {
+            OmonError::Config(format!(
+                "invalid Hermes cron store path: {}",
+                path.display()
+            ))
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            OmonError::Config(format!(
+                "invalid Hermes cron store path: {}",
+                path.display()
+            ))
+        })?;
+        let timestamp = env.now().format("%Y%m%dT%H%M%S%.fZ").to_string();
+        let backup_candidate = parent.join(format!(
+            "{}.bak-omon-migration-{timestamp}",
+            file_name.to_string_lossy()
+        ));
+        let emptied = serde_json::to_vec(&serde_json::json!({
+            "jobs": [],
+            "updated_at": env.now().to_rfc3339(),
+        }))
+        .map_err(|e| OmonError::Config(format!("failed to serialize empty cron store: {e}")))?;
+        let replacement_hash = sha256_hex(&emptied);
+
+        prepared.push(PreparedCutoverStore {
+            profile: profile.clone(),
+            path: path.clone(),
+            original_bytes: original,
+            original_hash,
+            backup_candidate,
+            backup_path: None,
+            replacement_bytes: emptied,
+            replacement_hash,
             job_ids,
             unverified_jobs,
+            job_digests,
         });
     }
 
@@ -106,19 +415,144 @@ pub async fn cutover_cron_stores(
         .find(|store| !store.unverified_jobs.is_empty())
     {
         return Err(OmonError::Config(format!(
-            "Hermes cron job hermes:{}:{} has not been imported into cron_jobs; refusing to empty {}",
+            "Hermes cron job hermes:{}:{} payload does not match imported cron_jobs or has not been imported; refusing to empty {}",
             store.profile,
             store.unverified_jobs[0],
             store.path.display()
         )));
     }
 
-    for store in prepared {
-        if store.job_ids.is_empty() {
-            continue;
-        }
-        cutover_store(env, &store)?;
+    let stores_with_jobs: Vec<_> = prepared
+        .into_iter()
+        .filter(|s| !s.job_ids.is_empty())
+        .collect();
+
+    if stores_with_jobs.is_empty() {
+        return Ok(summary);
     }
+
+    // Prepare private unique backups for ALL stores before first source rewrite
+    let mut backed_up_stores = Vec::with_capacity(stores_with_jobs.len());
+    for mut store in stores_with_jobs {
+        let backup_path = env.write_unique(&store.backup_candidate, &store.original_bytes)?;
+        store.backup_path = Some(backup_path);
+        backed_up_stores.push(store);
+    }
+
+    // Record durable pending receipt with exact store set/hashes/provenance in SQLite
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let now = env.now();
+    let all_job_ids: Vec<String> = backed_up_stores
+        .iter()
+        .flat_map(|store| {
+            store
+                .job_ids
+                .iter()
+                .map(|job_id| format!("hermes:{}:{}", store.profile, job_id))
+        })
+        .collect();
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO cron_cutover_receipts (operation_id, status, store_count, policy_digest, created_at, updated_at)
+         VALUES (?, 'pending', ?, ?, ?, ?)",
+    )
+    .bind(&operation_id)
+    .bind(backed_up_stores.len() as i64)
+    .bind("hermes_cutover")
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    for store in &backed_up_stores {
+        let digests_json =
+            serde_json::to_string(&store.job_digests).unwrap_or_else(|_| "[]".into());
+        let backup_str = store
+            .backup_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO cron_cutover_receipt_stores
+             (operation_id, profile, store_path, original_hash, replacement_hash, backup_path, job_digests_json, replacement_bytes, phase, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'backed_up', ?)",
+        )
+        .bind(&operation_id)
+        .bind(&store.profile)
+        .bind(store.path.to_string_lossy())
+        .bind(&store.original_hash)
+        .bind(&store.replacement_hash)
+        .bind(backup_str)
+        .bind(digests_json)
+        .bind(&store.replacement_bytes)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    for id in &all_job_ids {
+        sqlx::query(
+            "UPDATE cron_jobs SET authority = 'cutover_pending', updated_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    // Rewrite each source store and record progress
+    for store in &backed_up_stores {
+        let current = env.read(&store.path)?;
+        if current != store.original_bytes {
+            return Err(OmonError::Config(format!(
+                "Hermes cron store changed during migration: {}; refusing to empty stale state",
+                store.path.display()
+            )));
+        }
+        env.write_atomic(&store.path, &store.replacement_bytes)?;
+        sqlx::query(
+            "UPDATE cron_cutover_receipt_stores
+             SET phase = 'replaced', updated_at = ?
+             WHERE operation_id = ? AND store_path = ?",
+        )
+        .bind(env.now())
+        .bind(&operation_id)
+        .bind(store.path.to_string_lossy())
+        .execute(pool)
+        .await?;
+    }
+
+    // Final ownership commit in SQLite
+    let mut tx = pool.begin().await?;
+    let now = env.now();
+    sqlx::query(
+        "UPDATE cron_cutover_receipts SET status = 'committed', updated_at = ? WHERE operation_id = ?",
+    )
+    .bind(now)
+    .bind(&operation_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE cron_cutover_receipt_stores SET phase = 'committed', updated_at = ? WHERE operation_id = ?",
+    )
+    .bind(now)
+    .bind(&operation_id)
+    .execute(&mut *tx)
+    .await?;
+
+    for id in &all_job_ids {
+        sqlx::query("UPDATE cron_jobs SET authority = 'omon_owned', updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+
+    drop(locks);
 
     Ok(summary)
 }
@@ -157,7 +591,7 @@ fn discover_stores(env: &dyn MigrationEnv, hermes_root: &Path) -> Result<Vec<(St
     Ok(stores)
 }
 
-fn parse_job_ids(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
+fn parse_store_jobs(path: &Path, bytes: &[u8]) -> Result<Vec<Value>> {
     let document: StoreDocument = serde_json::from_slice(bytes).map_err(|error| {
         OmonError::Config(format!(
             "invalid Hermes cron store {}: {error}",
@@ -165,17 +599,18 @@ fn parse_job_ids(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
         ))
     })?;
     for job in &document.jobs {
-        if job.id.trim().is_empty() {
+        let id = job.get("id").and_then(Value::as_str).unwrap_or("");
+        if id.trim().is_empty() {
             return Err(OmonError::Config(format!(
                 "Hermes cron store {} contains a job without an id",
                 path.display()
             )));
         }
     }
-    Ok(document.jobs.into_iter().map(|job| job.id).collect())
+    Ok(document.jobs)
 }
 
-fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
+pub fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
     let directory = store.path.parent().ok_or_else(|| {
         OmonError::Config(format!(
             "invalid Hermes cron store path: {}",
@@ -203,10 +638,7 @@ fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
         "{}.bak-omon-migration-{timestamp}",
         file_name.to_string_lossy()
     ));
-    let temporary = directory.join(format!(
-        ".{}.tmp-omon-migration-{timestamp}",
-        file_name.to_string_lossy()
-    ));
+
     let emptied = serde_json::json!({
         "jobs": [],
         "updated_at": now.to_rfc3339(),
@@ -215,9 +647,8 @@ fn cutover_store(env: &dyn MigrationEnv, store: &PreparedStore) -> Result<()> {
         OmonError::Config(format!("failed to serialize empty cron store: {error}"))
     })?;
 
-    env.write(&backup, &store.original)?;
-    env.write(&temporary, &emptied)?;
-    env.rename(&temporary, &store.path)?;
+    env.write_unique(&backup, &store.original)?;
+    env.write_atomic(&store.path, &emptied)?;
     Ok(())
 }
 
@@ -456,5 +887,69 @@ mod tests {
         assert_eq!(env.write_calls().len(), writes_before);
         assert!(env.rename_calls().is_empty());
         println!("malformed-input error={error}");
+    }
+
+    #[tokio::test]
+    async fn alias_store_locks_deduplicate_safely() {
+        let (env, database) = fixture().await;
+        let profile_store = Path::new("/fixtures/.hermes/profiles/work/cron/jobs.json");
+        env.write(
+            profile_store,
+            br#"{"jobs":[{"id":"standup"}],"updated_at":"old"}"#,
+        )
+        .unwrap();
+        import_job(&database, "hermes:default:daily").await;
+        import_job(&database, "hermes:default:weekly").await;
+        import_job(&database, "hermes:work:standup").await;
+
+        // Add alias: make work store's lock point to default store's lock directory
+        let default_lock = PathBuf::from("/fixtures/.hermes/cron/.jobs.lock");
+        let work_lock = PathBuf::from("/fixtures/.hermes/profiles/work/cron/.jobs.lock");
+        env.add_alias(work_lock.clone(), default_lock.clone());
+
+        let summary = cutover_cron_stores(&env, Path::new(ROOT), database.pool(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.stores.len(), 2);
+        let lock_ops: Vec<_> = env
+            .operations()
+            .into_iter()
+            .filter(|op| matches!(op, MigrationOperation::LockAcquired(_)))
+            .collect();
+        assert_eq!(
+            lock_ops,
+            vec![MigrationOperation::LockAcquired(default_lock)]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_unknown_store_state_without_destroying_source() {
+        use super::reconcile_pending_cutover;
+        let (env, database) = fixture().await;
+        import_job(&database, "hermes:default:daily").await;
+        import_job(&database, "hermes:default:weekly").await;
+
+        // Make store read-only to inject failure on rewrite
+        env.set_read_only(Path::new(STORE), true);
+        let error = cutover_cron_stores(&env, Path::new(ROOT), database.pool(), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("read-only"));
+
+        // Now mutate the store externally so it matches NEITHER original NOR replacement
+        env.set_read_only(Path::new(STORE), false);
+        env.write(Path::new(STORE), b"external-unrecognized-corruption")
+            .unwrap();
+
+        // Recovery must refuse without destroying the store
+        let reconcile_err = reconcile_pending_cutover(&env, database.pool())
+            .await
+            .unwrap_err();
+        assert!(reconcile_err.to_string().contains("unknown content"));
+        assert_eq!(
+            env.read(Path::new(STORE)).unwrap(),
+            b"external-unrecognized-corruption"
+        );
     }
 }

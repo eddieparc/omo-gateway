@@ -1,0 +1,14 @@
+[
+  "cargo test --lib pairing_throttles_notifications_and_preserves_lockout",
+  "cargo test --lib discord::pairing::tests::pairing_throttles_notifications_and_preserves_lockout -- --exact --nocapture",
+  "cargo test --lib discord::pairing::tests::pairing_throttles_notifications_on_repeated_rejected_dm -- --exact --nocapture",
+  "cargo test --lib discord::pairing::tests::pairing_preserves_lockout_across_fresh_requests -- --exact --nocapture",
+  "cargo test --lib discord::adapter::tests::test_unauthorized_dm_allowlist_default_matrix -- --exact --nocapture",
+  "cargo test --lib discord::adapter::tests::test_decide_unauthorized_dm_throttling -- --exact --nocapture",
+  "cargo test --lib discord::pairing::tests::pairing_bounded_pending_count_and_expiry_cleanup -- --exact --nocapture",
+  "cargo test --lib discord::pairing",
+  "cargo test --lib discord::adapter",
+  "cargo build",
+  "rustfmt --edition 2021 --check src/discord/pairing.rs src/discord/adapter.rs",
+  "git --no-pager diff --check src/discord/pairing.rs src/discord/adapter.rs migrations/0024_pairing_state.sql"
+]

@@ -42,22 +42,27 @@ pub struct OmoBackendConfig {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub total_timeout: Duration,
+    /// Grace window during which a content-less terminal frame is treated as
+    /// the premature-completion race and ignored. Past it, an empty terminal
+    /// fails the turn (an upstream LLM failure recorded as an empty success).
+    pub no_content_grace: Duration,
     pub default_model: Option<String>,
     pub per_agent_workspace: bool,
     pub workspace_root: Option<PathBuf>,
 }
 
-/// Default daemon URL for the isolated cron lane (see [`OmoBackendConfig::cron_from_env`]).
-pub const CRON_APPSERVER_URL_DEFAULT: &str = "ws://127.0.0.1:19743";
+/// Default local daemon URL when neither lane configures an endpoint.
+pub const CRON_APPSERVER_URL_DEFAULT: &str = "ws://127.0.0.1:19742";
 
 impl Default for OmoBackendConfig {
     fn default() -> Self {
         Self {
-            appserver_url: "ws://127.0.0.1:19742".to_string(),
+            appserver_url: CRON_APPSERVER_URL_DEFAULT.to_string(),
             auth_token: None,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(600),
             total_timeout: Duration::from_secs(1800),
+            no_content_grace: Duration::from_secs(15),
             default_model: None,
             per_agent_workspace: true,
             workspace_root: None,
@@ -90,6 +95,11 @@ impl OmoBackendConfig {
 
     pub fn with_total_timeout(mut self, timeout: Duration) -> Self {
         self.total_timeout = timeout;
+        self
+    }
+
+    pub fn with_no_content_grace(mut self, grace: Duration) -> Self {
+        self.no_content_grace = grace;
         self
     }
 
@@ -196,6 +206,7 @@ impl OmoBackendConfig {
             connect_timeout: Duration::from_secs(15),
             request_timeout,
             total_timeout,
+            no_content_grace: Duration::from_secs(15),
             default_model,
             per_agent_workspace,
             workspace_root,
@@ -204,19 +215,19 @@ impl OmoBackendConfig {
 
     /// Configuration for the **cron lane**.
     ///
-    /// An app-server thread runs one turn at a time, so a multi-minute cron
-    /// turn (digests, syncs) would otherwise queue every Discord message
-    /// behind it until the total deadline fires. Cron therefore targets its
-    /// own daemon instance on a separate port, with a tighter ceiling, while
-    /// inheriting the credentials and model of the interactive lane.
+    /// Cron shares the configured interactive daemon through distinct agent
+    /// threads unless an explicit cron endpoint is supplied. It inherits the
+    /// interactive credentials and model, with a tighter turn ceiling.
     pub fn cron_from_env() -> Result<Self> {
         let mut config = Self::from_env()?;
 
-        config.appserver_url = std::env::var("OMON_OMO_CRON_APPSERVER_URL")
+        if let Some(appserver_url) = std::env::var("OMON_OMO_CRON_APPSERVER_URL")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| CRON_APPSERVER_URL_DEFAULT.to_string());
+        {
+            config.appserver_url = appserver_url;
+        }
         Self::validate_url(&config.appserver_url)?;
 
         config.total_timeout = match std::env::var("OMON_OMO_CRON_TURN_TOTAL_TIMEOUT_SECS") {
@@ -315,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cron_from_env_uses_isolated_daemon_lane() {
+    fn test_cron_from_env_shares_multiplexed_daemon() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("OMON_OMO_APPSERVER_URL");
         std::env::remove_var("OMON_OMO_CRON_APPSERVER_URL");
@@ -324,11 +335,10 @@ mod tests {
         let interactive = OmoBackendConfig::from_env().unwrap();
         let cron = OmoBackendConfig::cron_from_env().unwrap();
 
-        // A long cron turn must never occupy the interactive daemon: the two
-        // lanes target different app-server instances.
+        // Cron and interactive share one multiplexed daemon instance by default.
         assert_eq!(interactive.appserver_url, "ws://127.0.0.1:19742");
-        assert_eq!(cron.appserver_url, "ws://127.0.0.1:19743");
-        assert_ne!(cron.appserver_url, interactive.appserver_url);
+        assert_eq!(cron.appserver_url, "ws://127.0.0.1:19742");
+        assert_eq!(cron.appserver_url, interactive.appserver_url);
 
         // Cron turns get a tighter ceiling than interactive turns.
         assert_eq!(cron.total_timeout, Duration::from_secs(600));

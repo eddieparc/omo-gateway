@@ -1,0 +1,7 @@
+[
+  "cargo test --bin omo-gateway bot_profile_delete_stays_deleted -- --nocapture",
+  "cargo test --bin omo-gateway dashboard -- --nocapture",
+  "cargo build --bin omo-gateway",
+  "rustfmt --edition 2021 --check src/dashboard.rs",
+  "git diff --check src/dashboard.rs"
+]

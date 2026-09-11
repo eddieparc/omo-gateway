@@ -253,6 +253,7 @@ impl LlmClient {
                             sequence,
                             content,
                             is_final: false,
+                            reply_to: None,
                         };
                         sequence += 1;
                         if sender.send(Ok(chunk)).await.is_err() {
@@ -270,6 +271,7 @@ impl LlmClient {
                             sequence,
                             content,
                             is_final: false,
+                            reply_to: None,
                         }))
                         .await;
                     sequence += 1;
@@ -282,6 +284,7 @@ impl LlmClient {
                     sequence,
                     content: String::new(),
                     is_final: true,
+                    reply_to: None,
                 }))
                 .await;
         });

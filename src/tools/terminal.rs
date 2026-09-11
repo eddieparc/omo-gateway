@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use super::Tool;
+use crate::discord::approval::ApprovalScope;
 use crate::{ApprovalDecision, ApprovalRequester, OmonError, SessionKey};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -166,6 +167,21 @@ impl TerminalTool {
             || path.is_absolute()
             || program.contains(std::path::MAIN_SEPARATOR);
         if !has_path_syntax {
+            #[cfg(windows)]
+            {
+                for ext in ["", ".exe", ".cmd", ".bat"] {
+                    let cand_name = format!("{program}{ext}");
+                    for dir in [
+                        "C:\\Program Files\\Git\\usr\\bin",
+                        "C:\\Program Files\\Git\\bin",
+                    ] {
+                        let cand = Path::new(dir).join(&cand_name);
+                        if cand.is_file() {
+                            return Ok(PathBufOrName::Path(cand));
+                        }
+                    }
+                }
+            }
             return Ok(PathBufOrName::Name(program.to_owned()));
         }
 
@@ -188,17 +204,6 @@ impl TerminalTool {
         session: Option<&SessionKey>,
         command: &str,
     ) -> Result<(), OmonError> {
-        if let Some(scanner) = &self.external_scanner {
-            match scanner.scan_command(command).await {
-                crate::security::ScannerVerdict::Allow => {}
-                crate::security::ScannerVerdict::Deny { reason } => {
-                    return Err(OmonError::Approval(format!(
-                        "BLOCKED (external security scanner): {reason}"
-                    )));
-                }
-            }
-        }
-
         if let Some(reason) = crate::security::detect_hardline_command(command) {
             return Err(OmonError::Approval(format!(
                 "BLOCKED (hardline): {reason}. This command is on the unconditional blocklist and cannot be executed."
@@ -211,8 +216,37 @@ impl TerminalTool {
             )));
         }
 
+        if self.approval_policy == ApprovalPolicy::Never {
+            return Ok(());
+        }
+        if let (Some(session), Some(requester)) = (session, &self.approval_requester) {
+            if requester.is_yolo(session).await {
+                return Ok(());
+            }
+        }
+        let mut max_scope = ApprovalScope::Always;
+        let scanner_reason = if let Some(scanner) = &self.external_scanner {
+            match scanner.scan_command(command).await {
+                crate::security::ScannerVerdict::Allow => None,
+                crate::security::ScannerVerdict::Warn { reason } => {
+                    max_scope = ApprovalScope::Session;
+                    Some(reason)
+                }
+                crate::security::ScannerVerdict::Block { reason } => {
+                    max_scope = ApprovalScope::Once;
+                    Some(reason)
+                }
+                crate::security::ScannerVerdict::Deny { reason } => {
+                    return Err(OmonError::Approval(format!(
+                        "BLOCKED (external security scanner): {reason}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
         let finding = crate::security::detect_dangerous_command(command);
-        let (gated, reason) = match self.approval_policy {
+        let (mut gated, mut reason) = match self.approval_policy {
             ApprovalPolicy::Never => (false, String::new()),
             ApprovalPolicy::Always => {
                 let reason = finding
@@ -225,6 +259,15 @@ impl TerminalTool {
                 None => (false, String::new()),
             },
         };
+        if let Some(scanner_reason) = scanner_reason {
+            gated = true;
+            if !reason.is_empty() {
+                reason.push_str("; ");
+            }
+            reason.push_str(&format!(
+                "External security scanner finding: {scanner_reason}"
+            ));
+        }
         if !gated {
             return Ok(());
         }
@@ -244,7 +287,7 @@ impl TerminalTool {
         }
         let decision = tokio::time::timeout(
             self.approval_timeout,
-            requester.request_approval(session, command, &reason),
+            requester.request_approval_with_max_scope(session, command, &reason, max_scope),
         )
         .await
         .map_err(|_| OmonError::Approval("approval request timed out".into()))?
@@ -282,6 +325,19 @@ impl TerminalTool {
             .collect::<Result<_, _>>()?;
         let command_text = std::iter::once(program)
             .chain(process_args.iter().copied())
+            // This is argv, not shell source. Only interpreter payload extraction
+            // may give an operand executable shell semantics.
+            .map(|word| {
+                if !word.is_empty()
+                    && word
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&b))
+                {
+                    word.to_string()
+                } else {
+                    format!("'{}'", word.replace('\'', "'\"'\"'"))
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ");
         self.require_approval(session, &command_text).await?;
@@ -332,7 +388,11 @@ impl TerminalTool {
     }
 }
 
-pub const DEFAULT_EXTRA_PATH: &str = "/opt/homebrew/bin:/usr/local/bin";
+pub const DEFAULT_EXTRA_PATH: &str = if cfg!(windows) {
+    "C:\\Program Files\\Git\\bin;C:\\Program Files\\Git\\usr\\bin"
+} else {
+    "/opt/homebrew/bin:/usr/local/bin"
+};
 
 /// Builds an isolated per-session environment variable map from a SessionKey,
 /// scoped to a subprocess execution rather than written process-globally.
@@ -393,14 +453,20 @@ pub fn build_augmented_path(extra: Option<&str>, current: Option<&str>) -> Strin
     let mut parts: Vec<&str> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    let extra_iter = extra
-        .unwrap_or("")
-        .split(':')
+    let extra_val = extra.unwrap_or("");
+    let current_val = current.unwrap_or("");
+    let sep = if extra_val.contains(';') || current_val.contains(';') {
+        ';'
+    } else {
+        ':'
+    };
+
+    let extra_iter = extra_val
+        .split(sep)
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let current_iter = current
-        .unwrap_or("")
-        .split(':')
+    let current_iter = current_val
+        .split(sep)
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
@@ -410,7 +476,7 @@ pub fn build_augmented_path(extra: Option<&str>, current: Option<&str>) -> Strin
         }
     }
 
-    parts.join(":")
+    parts.join(&sep.to_string())
 }
 
 /// Returns the augmented PATH string combining `OMON_EXTRA_PATH` / `EXTRA_PATH`
@@ -565,6 +631,152 @@ mod approval_tests {
 
     fn echo_args(text: &str) -> serde_json::Value {
         json!({"program": "echo", "args": [text]})
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn approval_detector_preserves_executable_semantics() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        let mut failures = Vec::new();
+        for payload in [
+            "rm -rf //*",
+            "echo \"$(reboot)\"",
+            "grep \"$(reboot)\" file",
+        ] {
+            let found = crate::security::detect_hardline_command(payload);
+            println!("detector hardline {payload:?}: {found:?}");
+            if found.is_none() {
+                failures.push(payload.to_string());
+            }
+        }
+        for (payload, expected) in [
+            ("python3 -cprint(1)", true),
+            ("node --eval=process.exit(0)", true),
+            ("rg --pre ./helper needle file", true),
+            ("python script.py -c", false),
+            ("bash --norc script.sh", false),
+            ("echo 'reboot'", false),
+        ] {
+            let actual = is_dangerous(payload);
+            println!("detector dangerous {payload:?}: {actual}, expected {expected}");
+            if actual != expected {
+                failures.push(payload.to_string());
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["reboot", "helper"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\nprintf ran > marker\nprintf needle\n").unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.path().join("file"), "needle\n").unwrap();
+        let reject = Arc::new(StubApprover::new(Ok(ApprovalDecision::Deny {
+            reason: None,
+        })));
+        let tool = TerminalTool::new(dir.path()).with_approval(
+            ApprovalPolicy::Smart,
+            reject.clone(),
+            Duration::from_secs(5),
+        );
+        let target = dir.path().join("a'b");
+        std::fs::create_dir(&target).unwrap();
+        let result = tool
+            .execute_with_context(
+                json!({"program":"rm", "args":["-rf", target]}),
+                Some(&session()),
+            )
+            .await;
+        let requests = reject.requests.load(Ordering::SeqCst);
+        println!(
+            "argv rm: result={result:?}, exists={}, requests={requests}",
+            target.exists()
+        );
+        if !target.exists() || requests != 1 || !matches!(result, Err(OmonError::Approval(_))) {
+            failures.push("argv rm".into());
+        }
+        let result = tool
+            .execute_with_context(
+                json!({"program":"printf", "args":["%s", "a'b"]}),
+                Some(&session()),
+            )
+            .await;
+        println!("argv printf: {result:?}");
+        if !matches!(result, Ok(ref value) if value["stdout"] == "a'b") {
+            failures.push("argv printf".into());
+        }
+        let never = TerminalTool::new(dir.path()).with_approval_policy(ApprovalPolicy::Never);
+        for payload in ["echo \"$(reboot)\"", "grep \"$(reboot)\" file"] {
+            let result = never
+                .execute(json!({"program":"sh", "args":["-c", payload], "env":{"PATH":dir.path()}}))
+                .await;
+            let marker = dir.path().join("marker");
+            println!("shell {payload:?}: {result:?}, marker={}", marker.exists());
+            if marker.exists() || !matches!(result, Err(OmonError::Approval(_))) {
+                failures.push(payload.into());
+            }
+            if marker.exists() {
+                std::fs::remove_file(marker).unwrap();
+            }
+        }
+        let before = reject.requests.load(Ordering::SeqCst);
+        let result = tool
+            .execute_with_context(
+                json!({"program":"rg", "args":["--pre", "./helper", "needle", "file"]}),
+                Some(&session()),
+            )
+            .await;
+        println!(
+            "rg helper: {result:?}, marker={}, requests={}",
+            dir.path().join("marker").exists(),
+            reject.requests.load(Ordering::SeqCst) - before
+        );
+        if dir.path().join("marker").exists()
+            || reject.requests.load(Ordering::SeqCst) != before + 1
+            || !matches!(result, Err(OmonError::Approval(_)))
+        {
+            failures.push("rg helper".into());
+        }
+        for (program, args) in [
+            ("python3", vec!["-cprint(1)"]),
+            ("node", vec!["--eval=process.exit(0)"]),
+        ] {
+            let before = reject.requests.load(Ordering::SeqCst);
+            let result = tool
+                .execute_with_context(json!({"program":program, "args":args}), Some(&session()))
+                .await;
+            assert!(matches!(result, Err(OmonError::Approval(_))));
+            assert_eq!(reject.requests.load(Ordering::SeqCst), before + 1);
+        }
+        let literal = tool
+            .execute_with_context(echo_args("$(reboot)"), Some(&session()))
+            .await
+            .unwrap();
+        assert_eq!(literal["stdout"], "$(reboot)\n");
+        let allow = Arc::new(StubApprover::new(Ok(ApprovalDecision::Once)));
+        let approved = TerminalTool::new(dir.path()).with_approval(
+            ApprovalPolicy::Smart,
+            allow.clone(),
+            Duration::from_secs(5),
+        );
+        // The exact same real helper works after consent; the mock only supplies
+        // a decision and does not replace detection or process execution.
+        let result = approved
+            .execute_with_context(
+                json!({"program":"rg", "args":["--pre", "./helper", "needle", "file"]}),
+                Some(&session()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(allow.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("marker")).unwrap(),
+            "ran"
+        );
+        dir.close().unwrap();
+        assert!(failures.is_empty(), "semantic failures: {failures:?}");
     }
 
     #[test]
@@ -741,8 +953,15 @@ mod approval_tests {
     #[test]
     fn augmented_path_from_environment_includes_default_homebrew_path() {
         let path = super::augmented_path_from_environment();
-        assert!(path.contains("/opt/homebrew/bin"));
-        assert!(path.contains("/usr/local/bin"));
+        #[cfg(unix)]
+        {
+            assert!(path.contains("/opt/homebrew/bin"));
+            assert!(path.contains("/usr/local/bin"));
+        }
+        #[cfg(windows)]
+        {
+            assert!(path.contains("Git"));
+        }
     }
 
     #[tokio::test]
@@ -874,7 +1093,7 @@ mod approval_tests {
             env_full.get("OMON_SESSION_CHANNEL_ID").unwrap(),
             "channel-456"
         );
-        assert_eq!(env_full.get("OMON_SESSION_USER_ID").unwrap(), "user-999");
+        assert_eq!(env_full.get("OMON_SESSION_USER_ID").unwrap(), "");
         assert_eq!(env_full.get("OMON_SESSION_GUILD_ID").unwrap(), "guild-123");
         assert_eq!(
             env_full.get("OMON_SESSION_THREAD_ID").unwrap(),
@@ -891,7 +1110,7 @@ mod approval_tests {
             env_full.get("HERMES_SESSION_CHAT_ID").unwrap(),
             "channel-456"
         );
-        assert_eq!(env_full.get("HERMES_SESSION_USER_ID").unwrap(), "user-999");
+        assert_eq!(env_full.get("HERMES_SESSION_USER_ID").unwrap(), "");
         assert_eq!(
             env_full.get("HERMES_SESSION_GUILD_ID").unwrap(),
             "guild-123"
@@ -917,7 +1136,7 @@ mod approval_tests {
         let tool = TerminalTool::new(dir.path()).with_approval_policy(ApprovalPolicy::Never);
         let session = SessionKey::new(
             "discord",
-            Some("guild-abc"),
+            None::<String>,
             "channel-xyz",
             None::<String>,
             "user-42",
@@ -1022,7 +1241,7 @@ mod approval_tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("working directory escapes tool root") || msg.contains("No such file")),
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("working directory escapes tool root") || msg.contains("No such file") || msg.contains("os error 2")),
             "expected error for traversal outside, got {:?}",
             err
         );
@@ -1034,8 +1253,18 @@ mod approval_tests {
         let extra = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
 
-        let extra_script = extra.path().join("hello.sh");
-        std::fs::write(&extra_script, "#!/bin/sh\necho hello from extra\n").unwrap();
+        let script_name = if cfg!(windows) {
+            "hello.bat"
+        } else {
+            "hello.sh"
+        };
+        let script_content = if cfg!(windows) {
+            "@echo hello from extra\n"
+        } else {
+            "#!/bin/sh\necho hello from extra\n"
+        };
+        let extra_script = extra.path().join(script_name);
+        std::fs::write(&extra_script, script_content).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1043,8 +1272,18 @@ mod approval_tests {
                 .unwrap();
         }
 
-        let outside_script = outside.path().join("outside.sh");
-        std::fs::write(&outside_script, "#!/bin/sh\necho hello from outside\n").unwrap();
+        let outside_name = if cfg!(windows) {
+            "outside.bat"
+        } else {
+            "outside.sh"
+        };
+        let outside_content = if cfg!(windows) {
+            "@echo hello from outside\n"
+        } else {
+            "#!/bin/sh\necho hello from outside\n"
+        };
+        let outside_script = outside.path().join(outside_name);
+        std::fs::write(&outside_script, outside_content).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

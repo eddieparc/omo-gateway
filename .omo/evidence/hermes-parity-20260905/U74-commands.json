@@ -1,0 +1,5 @@
+[
+  "cargo test --lib multiplexer::restart_loop_guard::tests::restart_chain_trips_for_slow_cycles -- --exact --nocapture",
+  "cargo test --bin omo-gateway legacy::runner_tests::restart_chain_preserves_pending_until_explicit_input -- --exact --nocapture",
+  "cargo test --lib multiplexer::restart_loop_guard::tests -- --nocapture"
+]

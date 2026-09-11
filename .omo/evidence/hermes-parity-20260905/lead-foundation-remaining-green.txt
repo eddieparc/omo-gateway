@@ -1,0 +1,157 @@
+status: completed exit_code: 0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.72s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+CASE direct-parent exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("invalid skill name")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.05s
+
+
+CASE direct-absolute exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("invalid skill name")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+CASE direct-link exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("skill destination escapes root")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+CASE direct-file-link exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("invalid skill destination: No such file or directory (os error 2)")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+CASE replay-parent exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("invalid skill name")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+CASE replay-absolute exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("invalid skill name")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+CASE replay-link exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("skill destination escapes root")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+CASE replay-file-link exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("invalid skill destination: No such file or directory (os error 2)")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+CASE missing-store exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("write approval requires a pending-write store")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+CASE happy exit=exit status: 0
+
+running 1 test
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+CASE stage-link exit=exit status: 0
+
+running 1 test
+observable result=Err(ToolExecution("skill destination escapes root")) outside/SKILL.md=false inside/SKILL.md=false
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+test tools::skills::tests::skill_writes_cannot_escape_or_bypass_staging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.20s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+test tools::skills::tests::skill_write_destination_adjacent_controls ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+test storage::db::tests::test_pending_writes_store_round_trip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.88s                                             
+     Running tests/test_migrate.rs (target/debug/deps/test_migrate-05eff5be456e48b7)
+
+running 1 test
+C05 target_mode=600 backup_mode=600 atomic=true unique=true failed=true intact=true no_temps=true
+test secret_files_are_private_and_backup_unique ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.03s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.60s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+write: 
+running 1 test
+payload={"action":"drain","requested_at":"2026-09-05T09:59:00.558464+00:00","principal":"u63-external-writer","epoch":"","suppress_notification":true}
+test drain_control::tests::drain_marker_process_helper ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+read: 
+running 1 test
+detected=Some(DrainRequest { action: "drain", requested_at: Some("2026-09-05T09:59:00.558464+00:00"), principal: Some("u63-external-writer"), epoch: Some(""), suppress_notification: true })
+watcher_active=true
+test drain_control::tests::drain_marker_process_helper ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.01s
+
+
+test drain_control::tests::drain_marker_cross_process_epoch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 298 filtered out; finished in 0.05s

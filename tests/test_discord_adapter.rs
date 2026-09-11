@@ -7,18 +7,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use omon_gateway::discord::adapter::{
-    message_to_inbound, message_to_inbound_with_config, InboundFilterConfig,
+use omon_gateway::discord::adapter::{message_to_inbound_with_config, InboundFilterConfig};
+use omon_gateway::discord::commands::{
+    check_slash_admission, is_channel_authorized, is_user_allowed, is_user_authorized,
+    CommandAdmissionResult, CommandChannelScope,
 };
-use omon_gateway::discord::commands::{is_user_allowed, is_user_authorized};
 use omon_gateway::{
     approval_buttons, chunk_markdown, chunk_markdown_paginated, compose_reply_context,
     derive_auto_thread_name, is_authorized_clicker, parse_custom_id, render_user_prompt,
-    safe_allowed_mentions, AllowBotsMode, ApprovalDecision, ApprovalError, AttachmentDownloader,
-    ChatMessage, Database, DeliveryLedgerService, DiscordEgress, DiscordFileUploader,
-    DiscordMessageTransport, InboundEvent, LiveEditThrottler, LlmClient, LlmConfig, LlmProvider,
-    MessageAttachment, OutboundAction, OutboundDispatcher, Result, SessionKey, SmartApprovalGuard,
-    DISCORD_ATTACHMENT_MAX_BYTES,
+    safe_allowed_mentions, AgentRunner, AllowBotsMode, ApprovalDecision, ApprovalError,
+    AttachmentDownloader, ChatMessage, Database, DeliveryLedgerService, DiscordEgress,
+    DiscordFileUploader, DiscordMessageTransport, InboundEvent, LiveEditThrottler, LlmClient,
+    LlmConfig, LlmProvider, MessageAttachment, OutboundAction, OutboundDispatcher, Result,
+    SessionKey, SmartApprovalGuard, DISCORD_ATTACHMENT_MAX_BYTES,
 };
 use serenity::all::{ChannelId, ChannelType, Message, MessageId, UserId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -348,6 +349,11 @@ fn test_compose_reply_context() {
 #[test]
 fn test_inbound_hydrates_reply_context_and_attachments() {
     let bot_id = UserId::new(42);
+    let config = InboundFilterConfig {
+        allowed_users: &[10],
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
 
     // Reply with parent text and attachment in a DM
     let reply_msg = reply_message_fixture(
@@ -357,7 +363,9 @@ fn test_inbound_hydrates_reply_context_and_attachments() {
         "Error trace attached",
         vec![("trace.log", "text/plain")],
     );
-    let event = message_to_inbound(&reply_msg, bot_id, Some(ChannelType::Private)).unwrap();
+    let event =
+        message_to_inbound_with_config(&reply_msg, bot_id, Some(ChannelType::Private), &config)
+            .unwrap();
     assert_eq!(
         event.content,
         "> [Replying to @bob]: Error trace attached [Attachment: trace.log]\n\nwhat does this error mean?"
@@ -374,7 +382,13 @@ fn test_inbound_hydrates_reply_context_and_attachments() {
             ("doc2.pdf", "application/pdf"),
         ],
     );
-    let event2 = message_to_inbound(&att_only_reply, bot_id, Some(ChannelType::Private)).unwrap();
+    let event2 = message_to_inbound_with_config(
+        &att_only_reply,
+        bot_id,
+        Some(ChannelType::Private),
+        &config,
+    )
+    .unwrap();
     assert_eq!(
         event2.content,
         "> [Replying to @charlie]: [Attachments: doc1.pdf, doc2.pdf]\n\ncan you analyze these?"
@@ -512,8 +526,14 @@ async fn approval_guard_resolves_all_four_buttons_and_times_out() {
 #[test]
 fn converts_serenity_dm_mentions_threads_and_attachments() {
     let bot_id = UserId::new(42);
+    let config = InboundFilterConfig {
+        allowed_users: &[10],
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
     let dm = message_fixture(None, "hello", Vec::new());
-    let event = message_to_inbound(&dm, bot_id, Some(ChannelType::Private)).unwrap();
+    let event =
+        message_to_inbound_with_config(&dm, bot_id, Some(ChannelType::Private), &config).unwrap();
     assert_eq!(event.content, "hello");
     assert_eq!(event.session.guild_id, None);
     assert_eq!(event.attachments[0].filename, "main.rs");
@@ -524,15 +544,22 @@ fn converts_serenity_dm_mentions_threads_and_attachments() {
     assert_eq!(event.attachments[0].local_path, None);
 
     let ignored = message_fixture(Some(9), "ordinary channel message", Vec::new());
-    assert!(message_to_inbound(&ignored, bot_id, Some(ChannelType::Text)).is_none());
+    assert!(
+        message_to_inbound_with_config(&ignored, bot_id, Some(ChannelType::Text), &config)
+            .is_none()
+    );
 
     let mentioned = message_fixture(Some(9), "<@42> inspect this", vec![42]);
-    let event = message_to_inbound(&mentioned, bot_id, Some(ChannelType::Text)).unwrap();
+    let event =
+        message_to_inbound_with_config(&mentioned, bot_id, Some(ChannelType::Text), &config)
+            .unwrap();
     assert_eq!(event.content, "inspect this");
     assert_eq!(event.session.thread_id, None);
 
     let thread = message_fixture(Some(9), "<@42> thread continuation", vec![42]);
-    let event = message_to_inbound(&thread, bot_id, Some(ChannelType::PublicThread)).unwrap();
+    let event =
+        message_to_inbound_with_config(&thread, bot_id, Some(ChannelType::PublicThread), &config)
+            .unwrap();
     assert_eq!(event.session.thread_id.as_deref(), Some("7"));
 }
 
@@ -548,6 +575,7 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         primary,
         Some(ChannelType::PublicThread),
         &InboundFilterConfig {
+            allowed_users: &[10],
             active_threads: &[7],
             primary_bot_id: Some(primary.get()),
             ..Default::default()
@@ -560,6 +588,7 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         secondary,
         Some(ChannelType::PublicThread),
         &InboundFilterConfig {
+            allowed_users: &[10],
             active_threads: &[7],
             primary_bot_id: Some(primary.get()),
             ..Default::default()
@@ -572,6 +601,7 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         primary,
         Some(ChannelType::PublicThread),
         &InboundFilterConfig {
+            allowed_users: &[10],
             primary_bot_id: Some(primary.get()),
             ..Default::default()
         },
@@ -584,6 +614,7 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         primary,
         Some(ChannelType::Text),
         &InboundFilterConfig {
+            allowed_users: &[10],
             free_response_channels: &[7],
             primary_bot_id: Some(primary.get()),
             ..Default::default()
@@ -595,6 +626,7 @@ fn only_primary_bot_owns_unmentioned_threads_and_free_channels() {
         secondary,
         Some(ChannelType::Text),
         &InboundFilterConfig {
+            allowed_users: &[10],
             free_response_channels: &[7],
             primary_bot_id: Some(primary.get()),
             ..Default::default()
@@ -614,6 +646,7 @@ fn every_bot_answers_its_own_direct_messages_regardless_of_primary_bot() {
         secondary,
         Some(ChannelType::Private),
         &InboundFilterConfig {
+            allowed_users: &[10],
             primary_bot_id: Some(primary.get()),
             ..Default::default()
         },
@@ -634,6 +667,7 @@ fn every_bot_answers_its_own_direct_messages_regardless_of_primary_bot() {
         primary,
         Some(ChannelType::Private),
         &InboundFilterConfig {
+            allowed_users: &[10],
             primary_bot_id: Some(primary.get()),
             ..Default::default()
         },
@@ -654,6 +688,7 @@ fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
         UserId::new(42),
         Some(ChannelType::Text),
         &InboundFilterConfig {
+            allowed_users: &[10],
             primary_bot_id: Some(42),
             ..Default::default()
         },
@@ -664,6 +699,7 @@ fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
         UserId::new(84),
         Some(ChannelType::Text),
         &InboundFilterConfig {
+            allowed_users: &[10],
             primary_bot_id: Some(42),
             ..Default::default()
         },
@@ -674,6 +710,7 @@ fn every_explicitly_mentioned_bot_owns_exactly_its_target() {
         UserId::new(126),
         Some(ChannelType::Text),
         &InboundFilterConfig {
+            allowed_users: &[10],
             primary_bot_id: Some(42),
             ..Default::default()
         },
@@ -703,6 +740,7 @@ fn test_allow_bots_policy_modes() {
         bot_id,
         Some(ChannelType::Private),
         &InboundFilterConfig {
+            allowed_users: &[999],
             allow_bots: AllowBotsMode::None,
             primary_bot_id: Some(42),
             ..Default::default()
@@ -715,6 +753,7 @@ fn test_allow_bots_policy_modes() {
         bot_id,
         Some(ChannelType::Private),
         &InboundFilterConfig {
+            allowed_users: &[999],
             allow_bots: AllowBotsMode::None,
             primary_bot_id: Some(42),
             ..Default::default()
@@ -728,6 +767,7 @@ fn test_allow_bots_policy_modes() {
         bot_id,
         Some(ChannelType::Private),
         &InboundFilterConfig {
+            allowed_users: &[999],
             allow_bots: AllowBotsMode::Mentions,
             primary_bot_id: Some(42),
             ..Default::default()
@@ -740,6 +780,7 @@ fn test_allow_bots_policy_modes() {
         bot_id,
         Some(ChannelType::Private),
         &InboundFilterConfig {
+            allowed_users: &[999],
             allow_bots: AllowBotsMode::Mentions,
             primary_bot_id: Some(42),
             ..Default::default()
@@ -753,6 +794,7 @@ fn test_allow_bots_policy_modes() {
         bot_id,
         Some(ChannelType::Private),
         &InboundFilterConfig {
+            allowed_users: &[999],
             allow_bots: AllowBotsMode::All,
             primary_bot_id: Some(42),
             ..Default::default()
@@ -766,6 +808,7 @@ fn test_allow_bots_policy_modes() {
         bot_id,
         Some(ChannelType::Private),
         &InboundFilterConfig {
+            allowed_users: &[999, 42],
             allow_bots: AllowBotsMode::All,
             primary_bot_id: Some(42),
             ..Default::default()
@@ -787,6 +830,7 @@ fn test_thread_require_mention_option() {
         bot_id,
         Some(ChannelType::PublicThread),
         &InboundFilterConfig {
+            allowed_users: &[10],
             active_threads: &[7],
             primary_bot_id: Some(42),
             thread_require_mention: true,
@@ -801,6 +845,7 @@ fn test_thread_require_mention_option() {
         bot_id,
         Some(ChannelType::PublicThread),
         &InboundFilterConfig {
+            allowed_users: &[10],
             active_threads: &[7],
             primary_bot_id: Some(42),
             thread_require_mention: true,
@@ -815,6 +860,7 @@ fn test_thread_require_mention_option() {
         bot_id,
         Some(ChannelType::PublicThread),
         &InboundFilterConfig {
+            allowed_users: &[10],
             active_threads: &[7],
             primary_bot_id: Some(42),
             thread_require_mention: false,
@@ -837,6 +883,7 @@ fn scoped_thread_participation_gates_unmentioned_and_allows_mentioned() {
         bot_id,
         Some(ChannelType::PublicThread),
         &InboundFilterConfig {
+            allowed_users: &[10],
             primary_bot_id: Some(42),
             ..Default::default()
         },
@@ -849,6 +896,7 @@ fn scoped_thread_participation_gates_unmentioned_and_allows_mentioned() {
         bot_id,
         Some(ChannelType::PublicThread),
         &InboundFilterConfig {
+            allowed_users: &[10],
             primary_bot_id: Some(42),
             ..Default::default()
         },
@@ -861,6 +909,7 @@ fn scoped_thread_participation_gates_unmentioned_and_allows_mentioned() {
         bot_id,
         Some(ChannelType::PublicThread),
         &InboundFilterConfig {
+            allowed_users: &[10],
             active_threads: &[7],
             primary_bot_id: Some(42),
             ..Default::default()
@@ -881,6 +930,7 @@ fn channel_allow_and_ignore_lists() {
         bot_id,
         Some(ChannelType::Text),
         &InboundFilterConfig {
+            allowed_users: &[10],
             ignored_channels: &[7],
             primary_bot_id: Some(42),
             ..Default::default()
@@ -894,6 +944,7 @@ fn channel_allow_and_ignore_lists() {
         bot_id,
         Some(ChannelType::Text),
         &InboundFilterConfig {
+            allowed_users: &[10],
             allowed_channels: &[7],
             primary_bot_id: Some(42),
             ..Default::default()
@@ -907,6 +958,7 @@ fn channel_allow_and_ignore_lists() {
         bot_id,
         Some(ChannelType::Text),
         &InboundFilterConfig {
+            allowed_users: &[10],
             allowed_channels: &[99],
             primary_bot_id: Some(42),
             ..Default::default()
@@ -920,6 +972,7 @@ fn channel_allow_and_ignore_lists() {
         bot_id,
         Some(ChannelType::Private),
         &InboundFilterConfig {
+            allowed_users: &[10],
             allowed_channels: &[99],
             primary_bot_id: Some(42),
             ..Default::default()
@@ -935,6 +988,7 @@ fn test_dm_accepted_when_channel_type_private_regardless_of_guild_id_or_secondar
     let bot_id = UserId::new(42);
     let msg = message_fixture(Some(12345), "hello direct message", Vec::new());
     let config = InboundFilterConfig {
+        allowed_users: &[10],
         allowed_channels: &[9999],
         primary_bot_id: Some(999), // different from bot_id (42)
         ..Default::default()
@@ -952,8 +1006,8 @@ fn test_dm_accepted_when_channel_type_private_regardless_of_guild_id_or_secondar
 
 #[test]
 fn user_authorization_allow_all_and_roles() {
-    // 1. Default open when both allowed_users and allowed_roles are empty
-    assert!(is_user_authorized(10, &[], &[], &[], false));
+    // 1. Default closed when both allowed_users and allowed_roles are empty
+    assert!(!is_user_authorized(10, &[], &[], &[], false));
 
     // 2. Allow-all bypasses non-empty user and role allowlists
     assert!(is_user_authorized(10, &[], &[20, 30], &[100], true));
@@ -976,81 +1030,44 @@ fn test_shared_vs_per_user_thread_sessions() {
     let mut msg_bob = message_fixture(Some(9), "<@42> msg from bob", vec![42]);
     msg_bob.author.id = UserId::new(200);
 
-    // Mode 1: DISCORD_THREAD_SESSIONS_PER_USER = false -> shared session in threads
-    let shared_thread_config = InboundFilterConfig {
-        thread_sessions_per_user: false,
+    // U20: Guild channels and threads are permanent lanes per (bot, channel), independent of sender
+    let thread_config = InboundFilterConfig {
+        allowed_users: &[100, 200],
         primary_bot_id: Some(42),
         ..Default::default()
     };
-    let event_alice_shared = message_to_inbound_with_config(
+    let event_alice_thread = message_to_inbound_with_config(
         &msg_alice,
         bot_id,
         Some(ChannelType::PublicThread),
-        &shared_thread_config,
+        &thread_config,
     )
     .unwrap();
-    let event_bob_shared = message_to_inbound_with_config(
+    let event_bob_thread = message_to_inbound_with_config(
         &msg_bob,
         bot_id,
         Some(ChannelType::PublicThread),
-        &shared_thread_config,
+        &thread_config,
     )
     .unwrap();
-    assert_eq!(event_alice_shared.session.user_id, "shared");
-    assert_eq!(event_bob_shared.session.user_id, "shared");
     assert_eq!(
-        event_alice_shared.session.storage_key(),
-        event_bob_shared.session.storage_key()
+        event_alice_thread.session.storage_key(),
+        event_bob_thread.session.storage_key()
     );
+    assert_eq!(event_alice_thread.session, event_bob_thread.session);
 
-    // Mode 2: DISCORD_THREAD_SESSIONS_PER_USER = true (default) -> per-user session in threads
-    let per_user_thread_config = InboundFilterConfig {
-        thread_sessions_per_user: true,
-        primary_bot_id: Some(42),
-        ..Default::default()
-    };
-    let event_alice_isolated = message_to_inbound_with_config(
-        &msg_alice,
-        bot_id,
-        Some(ChannelType::PublicThread),
-        &per_user_thread_config,
-    )
-    .unwrap();
-    let event_bob_isolated = message_to_inbound_with_config(
-        &msg_bob,
-        bot_id,
-        Some(ChannelType::PublicThread),
-        &per_user_thread_config,
-    )
-    .unwrap();
-    assert_eq!(event_alice_isolated.session.user_id, "100");
-    assert_eq!(event_bob_isolated.session.user_id, "200");
-    assert_ne!(
-        event_alice_isolated.session.storage_key(),
-        event_bob_isolated.session.storage_key()
-    );
-
-    // Text channels remain per-user even when thread_sessions_per_user = false
-    let event_alice_text = message_to_inbound_with_config(
-        &msg_alice,
-        bot_id,
-        Some(ChannelType::Text),
-        &shared_thread_config,
-    )
-    .unwrap();
-    let event_bob_text = message_to_inbound_with_config(
-        &msg_bob,
-        bot_id,
-        Some(ChannelType::Text),
-        &shared_thread_config,
-    )
-    .unwrap();
-    assert_eq!(event_alice_text.session.user_id, "100");
-    assert_eq!(event_bob_text.session.user_id, "200");
-    assert_ne!(
+    // Text channels also share the canonical per-bot lane across senders
+    let event_alice_text =
+        message_to_inbound_with_config(&msg_alice, bot_id, Some(ChannelType::Text), &thread_config)
+            .unwrap();
+    let event_bob_text =
+        message_to_inbound_with_config(&msg_bob, bot_id, Some(ChannelType::Text), &thread_config)
+            .unwrap();
+    assert_eq!(
         event_alice_text.session.storage_key(),
         event_bob_text.session.storage_key()
     );
+    assert_eq!(event_alice_text.session, event_bob_text.session);
 }
 
 #[tokio::test]
@@ -1360,7 +1377,7 @@ async fn discord_egress_handles_typing_start_and_stop() {
 
 #[test]
 fn slash_authorization_defaults_open_and_enforces_allowlist() {
-    assert!(is_user_allowed(&[], 10));
+    assert!(!is_user_allowed(&[], 10));
     assert!(is_user_allowed(&[10, 11], 10));
     assert!(!is_user_allowed(&[10, 11], 12));
 }
@@ -1644,7 +1661,12 @@ fn test_forwarded_message_snapshots_routing() {
     }"#;
 
     let msg: Message = serde_json::from_str(raw_str).unwrap();
-    let event = message_to_inbound(&msg, bot_id, Some(ChannelType::Private));
+    let config = InboundFilterConfig {
+        allowed_users: &[100],
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+    let event = message_to_inbound_with_config(&msg, bot_id, Some(ChannelType::Private), &config);
     assert!(event.is_some(), "Forwarded message should not be dropped");
     let event = event.unwrap();
     assert_eq!(
@@ -1671,7 +1693,7 @@ async fn test_dead_target_short_circuit_in_egress() {
     let session = SessionKey::new("discord", None::<String>, "98765", None::<String>, "user-1");
 
     // Attempt to dispatch a message to the dead channel
-    // It should short-circuit and return Ok(()) without attempting network calls
+    // It should short-circuit and return Err without claiming delivered
     let result = egress
         .dispatch(OutboundAction::SendMessage {
             session: session.clone(),
@@ -1681,8 +1703,8 @@ async fn test_dead_target_short_circuit_in_egress() {
         .await;
 
     assert!(
-        result.is_ok(),
-        "Short-circuited dead target should return Ok"
+        result.is_err(),
+        "Short-circuited dead target should return Err"
     );
 
     // Also verify EditMessage short-circuits
@@ -1693,9 +1715,2743 @@ async fn test_dead_target_short_circuit_in_egress() {
             content: "edited content".into(),
         })
         .await;
-    assert!(edit_result.is_ok());
+    assert!(edit_result.is_err());
 
     // Once cleared (e.g. self-healed or user re-adds bot), is_dead returns false
     dead_targets.clear(98765);
     assert!(!dead_targets.is_dead(98765));
+}
+
+#[test]
+fn authorization_surface_matrix() {
+    let bot_id = UserId::new(42);
+
+    // 1. user10 / default-deny: user 10 with empty allowlists and allow_all=false must be rejected
+    assert!(
+        !is_user_authorized(10, &[], &[], &[], false),
+        "user 10 with empty lists and allow_all=false must fail-closed"
+    );
+    assert!(
+        !is_user_allowed(&[], 10),
+        "is_user_allowed must fail-closed for empty allowlist"
+    );
+    assert_eq!(
+        check_slash_admission(
+            10,
+            false,
+            CommandChannelScope::guild(8, Some(7)),
+            &InboundFilterConfig::default(),
+        ),
+        CommandAdmissionResult::UnauthorizedUser,
+        "Slash command must reject unlisted user when allow_all=false"
+    );
+
+    // 2. Explicit allow_all true positive
+    assert!(
+        is_user_authorized(10, &[], &[], &[], true),
+        "allow_all=true must authorize user"
+    );
+    assert_eq!(
+        check_slash_admission(
+            10,
+            false,
+            CommandChannelScope::guild(8, Some(7)),
+            &InboundFilterConfig {
+                allow_all_users: true,
+                ..Default::default()
+            },
+        ),
+        CommandAdmissionResult::Allowed,
+        "Slash command must admit user when allow_all=true"
+    );
+
+    // 3. User / role positive and negative
+    assert!(
+        is_user_authorized(10, &[], &[10], &[], false),
+        "matching user ID in allowed_users must be admitted"
+    );
+    assert!(
+        !is_user_authorized(10, &[], &[20], &[], false),
+        "non-matching user ID must be rejected"
+    );
+    assert!(
+        is_user_authorized(10, &[100], &[], &[100], false),
+        "user possessing matching allowed role must be admitted"
+    );
+    assert!(
+        !is_user_authorized(10, &[200], &[], &[100], false),
+        "user without matching allowed role must be rejected"
+    );
+
+    // Setup channel fixture: message in child thread 8 under parent channel 7
+    let mut thread_msg = message_fixture(Some(1), "<@42> steer guidance", vec![42]);
+    thread_msg.channel_id = ChannelId::new(8);
+    thread_msg.author.id = UserId::new(10);
+
+    // 4. Ignored parent 7 / child thread 8: both slash steer and message ingress rejected before runner
+    assert!(
+        !is_channel_authorized(8, Some(7), &[], &[7], false),
+        "is_channel_authorized must reject child thread 8 when parent 7 is ignored"
+    );
+    let ignored_parent_config = InboundFilterConfig {
+        allowed_users: &[10],
+        ignored_channels: &[7],
+        parent_channel_id: Some(7),
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+    assert_eq!(
+        check_slash_admission(
+            10,
+            false,
+            CommandChannelScope::guild(8, Some(7)),
+            &ignored_parent_config,
+        ),
+        CommandAdmissionResult::UnauthorizedChannel,
+        "Slash steer in thread 8 under ignored parent 7 must be rejected before runner"
+    );
+    assert!(
+        message_to_inbound_with_config(
+            &thread_msg,
+            bot_id,
+            Some(ChannelType::PublicThread),
+            &ignored_parent_config,
+        )
+        .is_none(),
+        "Message ingress in thread 8 under ignored parent 7 must be rejected before runner"
+    );
+
+    // 5. Allowed parent 7 admits its nonignored child thread 8
+    assert!(
+        is_channel_authorized(8, Some(7), &[7], &[], false),
+        "is_channel_authorized must admit child thread 8 when parent 7 is in allowed_channels"
+    );
+    let allowed_parent_config = InboundFilterConfig {
+        allowed_users: &[10],
+        allowed_channels: &[7],
+        parent_channel_id: Some(7),
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+    assert_eq!(
+        check_slash_admission(
+            10,
+            false,
+            CommandChannelScope::guild(8, Some(7)),
+            &allowed_parent_config,
+        ),
+        CommandAdmissionResult::Allowed,
+        "Slash steer in thread 8 must be admitted when parent 7 is in allowed_channels"
+    );
+    assert!(
+        message_to_inbound_with_config(
+            &thread_msg,
+            bot_id,
+            Some(ChannelType::PublicThread),
+            &allowed_parent_config,
+        )
+        .is_some(),
+        "Message ingress in thread 8 must be admitted when parent 7 is in allowed_channels"
+    );
+
+    // 6. Child ignore override: allowed parent 7, but child thread 8 is in ignored_channels
+    assert!(
+        !is_channel_authorized(8, Some(7), &[7], &[8], false),
+        "is_channel_authorized must reject when child thread 8 is explicitly ignored"
+    );
+    let child_ignored_config = InboundFilterConfig {
+        allowed_users: &[10],
+        allowed_channels: &[7],
+        ignored_channels: &[8],
+        parent_channel_id: Some(7),
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+    assert_eq!(
+        check_slash_admission(
+            10,
+            false,
+            CommandChannelScope::guild(8, Some(7)),
+            &child_ignored_config,
+        ),
+        CommandAdmissionResult::UnauthorizedChannel,
+        "Slash steer in thread 8 must be rejected when child thread 8 is in ignored_channels"
+    );
+    assert!(
+        message_to_inbound_with_config(
+            &thread_msg,
+            bot_id,
+            Some(ChannelType::PublicThread),
+            &child_ignored_config,
+        )
+        .is_none(),
+        "Message ingress in thread 8 must be rejected when child thread 8 is in ignored_channels"
+    );
+
+    // 7. Explicit allow_all only bypasses user policy, NOT ignored-channel policy
+    let allow_all_ignored_channel_config = InboundFilterConfig {
+        allow_all_users: true,
+        ignored_channels: &[7],
+        parent_channel_id: Some(7),
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+    assert_eq!(
+        check_slash_admission(
+            10,
+            false,
+            CommandChannelScope::guild(8, Some(7)),
+            &allow_all_ignored_channel_config,
+        ),
+        CommandAdmissionResult::UnauthorizedChannel,
+        "Explicit allow_all_users must not bypass ignored parent 7 in slash check"
+    );
+    assert!(
+        message_to_inbound_with_config(
+            &thread_msg,
+            bot_id,
+            Some(ChannelType::PublicThread),
+            &allow_all_ignored_channel_config,
+        )
+        .is_none(),
+        "Explicit allow_all_users must not bypass ignored parent 7 in message ingress"
+    );
+
+    // 8. Missing/failed required guild metadata must not silently authorize
+    assert_eq!(
+        check_slash_admission(
+            10,
+            false,
+            CommandChannelScope::missing_guild_metadata(8),
+            &allowed_parent_config,
+        ),
+        CommandAdmissionResult::MissingGuildMetadata,
+        "Slash check with failed guild metadata must fail closed"
+    );
+    assert!(
+        message_to_inbound_with_config(&thread_msg, bot_id, None, &allowed_parent_config,)
+            .is_none(),
+        "Message ingress with missing channel_type in guild must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn dedicated_thread_owner_and_channel_identity() {
+    let bot84 = UserId::new(84);
+    let bot42 = UserId::new(42);
+
+    // 1. Guild channel conversations are one permanent lane per (bot, channel), NOT per (bot, channel, user).
+    // Alice and Bob in the same guild text channel must share the exact same permanent lane key.
+    let mut msg_alice_text = message_fixture(Some(9), "<@84> text from alice", vec![84]);
+    msg_alice_text.channel_id = ChannelId::new(7);
+    msg_alice_text.author.id = UserId::new(100);
+
+    let mut msg_bob_text = message_fixture(Some(9), "<@84> text from bob", vec![84]);
+    msg_bob_text.channel_id = ChannelId::new(7);
+    msg_bob_text.author.id = UserId::new(200);
+
+    let config_text = InboundFilterConfig {
+        allowed_users: &[100, 200],
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+    let event_alice_text = message_to_inbound_with_config(
+        &msg_alice_text,
+        bot84,
+        Some(ChannelType::Text),
+        &config_text,
+    )
+    .expect("alice text message should be accepted");
+    let event_bob_text =
+        message_to_inbound_with_config(&msg_bob_text, bot84, Some(ChannelType::Text), &config_text)
+            .expect("bob text message should be accepted");
+
+    assert_eq!(
+        event_alice_text.session.storage_key(),
+        event_bob_text.session.storage_key(),
+        "Guild text channel lane must be shared per bot, NOT per author"
+    );
+    assert_eq!(
+        event_alice_text.session, event_bob_text.session,
+        "Guild text channel session keys must be canonical and independent of sender"
+    );
+
+    // 2. Thread ownership: bot84 engaged thread8; Alice/Bob unmentioned followups route to bot84
+    let mut msg_alice_thread = message_fixture(Some(9), "unmentioned followup from alice", vec![]);
+    msg_alice_thread.channel_id = ChannelId::new(8);
+    msg_alice_thread.author.id = UserId::new(100);
+
+    let mut msg_bob_thread = message_fixture(Some(9), "unmentioned followup from bob", vec![]);
+    msg_bob_thread.channel_id = ChannelId::new(8);
+    msg_bob_thread.author.id = UserId::new(200);
+
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let pool = database.pool().clone();
+
+    // Record engagement of thread8 by bot84 in persistent SQLite storage
+    Database::record_thread_owner(&pool, 8, 84).await.unwrap();
+
+    let owner_record = Database::get_thread_owner(&pool, 8).await.unwrap();
+    assert_eq!(
+        owner_record,
+        Some(84),
+        "Thread 8 ownership must be durably stored in SQLite"
+    );
+
+    let config_thread = InboundFilterConfig {
+        allowed_users: &[100, 200],
+        active_threads: &[8],
+        thread_owners: &[(8, 84)],
+        parent_channel_id: Some(7),
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+
+    // Bot 84 must receive unmentioned followup in its engaged thread
+    let event_alice_thread = message_to_inbound_with_config(
+        &msg_alice_thread,
+        bot84,
+        Some(ChannelType::PublicThread),
+        &config_thread,
+    );
+    assert!(
+        event_alice_thread.is_some(),
+        "bot84 engaged thread8 so it must receive unmentioned followup"
+    );
+
+    let event_bob_thread = message_to_inbound_with_config(
+        &msg_bob_thread,
+        bot84,
+        Some(ChannelType::PublicThread),
+        &config_thread,
+    );
+    assert!(
+        event_bob_thread.is_some(),
+        "bot84 engaged thread8 so it must receive bob's unmentioned followup"
+    );
+
+    assert_eq!(
+        event_alice_thread.as_ref().unwrap().session.storage_key(),
+        event_bob_thread.as_ref().unwrap().session.storage_key(),
+        "Thread lane storage keys must match across different senders"
+    );
+
+    // Bot 42 (primary) must NOT take over thread 8
+    let event_bot42_thread = message_to_inbound_with_config(
+        &msg_alice_thread,
+        bot42,
+        Some(ChannelType::PublicThread),
+        &config_thread,
+    );
+    assert!(
+        event_bot42_thread.is_none(),
+        "bot42 must NOT take over thread 8 engaged by bot 84"
+    );
+
+    // Simulated restart: re-read durable ownership from SQLite
+    let reloaded_owner = Database::get_thread_owner(&pool, 8).await.unwrap().unwrap();
+    let reloaded_owners = [(8, reloaded_owner)];
+    let config_restarted = InboundFilterConfig {
+        allowed_users: &[100, 200],
+        active_threads: &[8],
+        thread_owners: &reloaded_owners,
+        parent_channel_id: Some(7),
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+    assert!(
+        message_to_inbound_with_config(
+            &msg_alice_thread,
+            bot84,
+            Some(ChannelType::PublicThread),
+            &config_restarted,
+        )
+        .is_some(),
+        "bot84 must still receive unmentioned followup after restart"
+    );
+    assert!(
+        message_to_inbound_with_config(
+            &msg_alice_thread,
+            bot42,
+            Some(ChannelType::PublicThread),
+            &config_restarted,
+        )
+        .is_none(),
+        "bot42 must still not take over thread8 after restart"
+    );
+
+    // 3. Reply in parent 7 must NOT create a thread
+    let reply_msg = reply_message_fixture(
+        Some(9),
+        "<@84> inline reply in parent",
+        "charlie",
+        "original message in parent",
+        vec![],
+    );
+    let is_reply = reply_msg.kind == serenity::model::channel::MessageType::InlineReply
+        || reply_msg.referenced_message.is_some();
+    assert!(
+        !omon_gateway::discord::adapter::should_auto_create_thread(
+            true,  // auto_thread enabled
+            true,  // is_guild_text
+            true,  // is_explicit_mention
+            false, // is_free_channel
+            is_reply,
+        ),
+        "Reply in parent 7 must not create a thread"
+    );
+
+    // 4. Channels already free of thread-forcing must not create a thread
+    assert!(
+        !omon_gateway::discord::adapter::should_auto_create_thread(
+            true,  // auto_thread enabled
+            true,  // is_guild_text
+            true,  // is_explicit_mention
+            true,  // is_free_channel
+            false, // is_reply
+        ),
+        "Channels already free of thread-forcing must not trigger auto-thread"
+    );
+}
+
+#[tokio::test]
+async fn split_batch_replay_and_generation() {
+    use omon_gateway::{
+        AgentRunner, Database, DeliveryLedgerService, MultiplexerConfig, PoiseData, SessionContext,
+        SessionKey, SessionMultiplexer, SplitMessageDebouncer,
+    };
+
+    struct CollectingRunner {
+        events: Mutex<Vec<InboundEvent>>,
+        routed_tx: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for CollectingRunner {
+        async fn run(&self, _session: &mut SessionContext, event: InboundEvent) -> Result<()> {
+            self.events.lock().await.push(event);
+            let _ = self.routed_tx.send(());
+            Ok(())
+        }
+    }
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let (routed_tx, mut routed_rx) = mpsc::unbounded_channel();
+    let runner = Arc::new(CollectingRunner {
+        events: Mutex::new(Vec::new()),
+        routed_tx,
+    });
+    let multiplexer = SessionMultiplexer::new(
+        db.pool().clone(),
+        runner.clone(),
+        MultiplexerConfig::default(),
+    );
+    let data = PoiseData::new(multiplexer, db.pool().clone());
+    let debouncer = SplitMessageDebouncer::new(Duration::from_millis(600));
+
+    // --- Scenario Part 1: constituent IDs 8, 9, 9 in one batch ---
+    let session = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "channel-1",
+        None::<String>,
+        "user-1",
+    );
+    tokio::time::pause();
+    let msg8 = InboundEvent::message(session.clone(), "8", "chunk-8");
+    let msg9a = InboundEvent::message(session.clone(), "9", "chunk-9");
+    let msg9b = InboundEvent::message(session.clone(), "9", "chunk-9");
+
+    debouncer.enqueue(msg8, data.clone()).await;
+    debouncer.enqueue(msg9a, data.clone()).await;
+    debouncer.enqueue(msg9b, data.clone()).await;
+
+    // Advance simulated time past the debounce duration (600ms)
+    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::time::resume();
+
+    // Wait for the runner to complete the batch
+    routed_rx.recv().await.expect("turn 1 should be executed");
+
+    // Wait for delivery completion in the ledger
+    let ledger = DeliveryLedgerService::new(db.pool().clone());
+    for _ in 0..100 {
+        let entry_9 = ledger.get("discord:9").await.ok().flatten();
+        let entry_8 = ledger.get("discord:8").await.ok().flatten();
+        if entry_9.as_ref().map(|e| e.status.as_str()) == Some("delivered")
+            && entry_8.as_ref().map(|e| e.status.as_str()) == Some("delivered")
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    // Check completed runner outcome: constituent 9 must not duplicate its content in the merged body
+    {
+        let runs = runner.events.lock().await;
+        assert_eq!(runs.len(), 1, "batch should execute exactly one turn");
+        assert_eq!(
+            runs[0].content, "chunk-8\nchunk-9",
+            "constituent IDs 8, 9, 9 must be deduplicated before merge, producing chunk-8\\nchunk-9 without duplicating chunk-9"
+        );
+    }
+
+    // Check durable constituent claim rows:
+    // Constituent 8 must be durably recorded and marked delivered
+    let claim_8 = ledger.get("discord:8").await.unwrap();
+    assert!(
+        claim_8.is_some(),
+        "constituent ID 8 must be durably recorded in delivery_ledger"
+    );
+    assert_eq!(
+        claim_8.unwrap().status,
+        "delivered",
+        "constituent ID 8 claim row must be marked delivered upon batch completion"
+    );
+
+    let claim_9 = ledger.get("discord:9").await.unwrap();
+    assert!(
+        claim_9.is_some(),
+        "constituent ID 9 must be durably recorded in delivery_ledger"
+    );
+    assert_eq!(
+        claim_9.unwrap().status,
+        "delivered",
+        "constituent ID 9 claim row must be marked delivered upon batch completion"
+    );
+
+    // --- Scenario Part 2: replay of constituent ID 8 after batch completion ---
+    tokio::time::pause();
+    let msg8_replay = InboundEvent::message(session.clone(), "8", "chunk-8");
+    debouncer.enqueue(msg8_replay, data.clone()).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::time::resume();
+
+    // Must NOT re-run the turn
+    assert!(
+        routed_rx.try_recv().is_err(),
+        "replaying already-completed constituent ID 8 must NOT execute a new turn"
+    );
+    assert_eq!(
+        runner.events.lock().await.len(),
+        1,
+        "runner executions must remain 1 after replay of constituent ID 8"
+    );
+
+    // --- Scenario Part 3: cancelling old batch and re-enqueuing equal-size new batch must not cause early flush ---
+    let session_cancel = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "channel-1",
+        None::<String>,
+        "user-2",
+    );
+
+    tokio::time::pause();
+    let old_batch_msg = InboundEvent::message(session_cancel.clone(), "old-1", "old content");
+    debouncer.enqueue(old_batch_msg, data.clone()).await;
+
+    // Advance 200ms into the 600ms debounce window
+    tokio::time::advance(Duration::from_millis(200)).await;
+
+    // Cancel old batch
+    let cancelled = debouncer.cancel(&session_cancel).await;
+    assert!(cancelled.is_some(), "old batch should be cancelled");
+
+    // Re-enqueue an equal-size new batch (1 message)
+    let new_batch_msg = InboundEvent::message(session_cancel.clone(), "new-1", "new content");
+    debouncer.enqueue(new_batch_msg, data.clone()).await;
+
+    // Advance 400ms: total elapsed since T=0 is 600ms (when old sleeper would wake),
+    // but only 400ms elapsed since new batch was enqueued (which requires 600ms)
+    tokio::time::advance(Duration::from_millis(400)).await;
+
+    // Assert no early flush has occurred: runner must not have received new_batch_msg yet
+    assert_eq!(
+        runner.events.lock().await.len(),
+        1,
+        "equal-size replacement batch must not be prematurely flushed by older sleeper"
+    );
+    assert!(
+        routed_rx.try_recv().is_err(),
+        "runner channel must have no turn queued prematurely"
+    );
+
+    // Now advance the remaining 200ms to reach full 600ms debounce for the new batch
+    tokio::time::advance(Duration::from_millis(200)).await;
+    tokio::time::resume();
+
+    routed_rx
+        .recv()
+        .await
+        .expect("new batch should flush after its full debounce duration");
+
+    // Verify the new batch was executed
+    {
+        let runs = runner.events.lock().await;
+        assert_eq!(runs.len(), 2, "new batch should execute exactly once");
+        assert_eq!(runs[1].content, "new content");
+        assert_eq!(runs[1].platform_message_id, "new-1");
+    }
+
+    // Verify claim row for new batch in ledger
+    for _ in 0..100 {
+        if let Ok(Some(entry)) = ledger.get("discord:new-1").await {
+            if entry.status == "delivered" {
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    let claim_new = ledger.get("discord:new-1").await.unwrap();
+    assert!(claim_new.is_some());
+    assert_eq!(claim_new.unwrap().status, "delivered");
+}
+
+#[tokio::test]
+async fn startup_recovery_preserves_work_and_source_time() {
+    use omon_gateway::discord::adapter::{
+        get_bot_channel_cursor, run_missed_message_backfill_with_fetcher, DiscordHistoryFetcher,
+    };
+    use omon_gateway::{
+        AgentRunner, Database, MultiplexerConfig, OmonError, PoiseData, SessionContext,
+        SessionMultiplexer,
+    };
+    use serenity::all::{Channel, GuildId};
+    use std::collections::HashMap;
+
+    struct RecordingRunner {
+        events: Mutex<Vec<InboundEvent>>,
+        fail_channel_id: Mutex<Option<String>>,
+        ran_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for RecordingRunner {
+        async fn run(&self, _session: &mut SessionContext, event: InboundEvent) -> Result<()> {
+            if let Some(ref fail_id) = *self.fail_channel_id.lock().await {
+                if event.session.channel_id == *fail_id {
+                    return Err(OmonError::Multiplexer(format!(
+                        "simulated routing failure for channel {fail_id}"
+                    )));
+                }
+            }
+            self.events.lock().await.push(event.clone());
+            let _ = self.ran_tx.send(event.platform_message_id.clone());
+            Ok(())
+        }
+    }
+
+    let (ran_tx, mut ran_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let runner = Arc::new(RecordingRunner {
+        events: Mutex::new(Vec::new()),
+        fail_channel_id: Mutex::new(None),
+        ran_tx,
+    });
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let pool = db.pool().clone();
+    let multiplexer =
+        SessionMultiplexer::new(pool.clone(), runner.clone(), MultiplexerConfig::default());
+
+    let mut data = PoiseData::new(multiplexer, pool.clone());
+    data.allowed_roles = vec![777]; // Role-only authorization for user alice
+    data.allowed_channels = vec![100, 200];
+    data.primary_bot_id = Some(42);
+    data.missed_backfill = true;
+
+    fn make_test_msg(
+        id: u64,
+        channel_id: u64,
+        guild_id: Option<u64>,
+        author_id: u64,
+        content: &str,
+        timestamp_str: &str,
+        mentions: Vec<u64>,
+    ) -> Message {
+        let mentions_json: Vec<serde_json::Value> = mentions
+            .into_iter()
+            .map(|m_id| {
+                serde_json::json!({
+                    "id": m_id.to_string(), "username": format!("bot_{m_id}"), "discriminator": "0001",
+                    "avatar": null, "bot": true, "system": false, "mfa_enabled": false,
+                    "banner": null, "accent_color": null, "locale": null, "verified": false,
+                    "email": null, "flags": 0, "premium_type": 0, "public_flags": 0,
+                    "global_name": null, "avatar_decoration_data": null, "collectibles": null,
+                    "primary_guild": null
+                })
+            })
+            .collect();
+
+        serde_json::from_value(serde_json::json!({
+            "id": id.to_string(),
+            "channel_id": channel_id.to_string(),
+            "guild_id": guild_id.map(|g| g.to_string()),
+            "author": {
+                "id": author_id.to_string(), "username": "alice", "discriminator": "0001", "avatar": null,
+                "bot": false, "system": false, "mfa_enabled": false, "banner": null,
+                "accent_color": null, "locale": null, "verified": false, "email": null,
+                "flags": 0, "premium_type": 0, "public_flags": 0, "global_name": null,
+                "avatar_decoration_data": null, "collectibles": null, "primary_guild": null
+            },
+            "content": content,
+            "timestamp": timestamp_str,
+            "edited_timestamp": null,
+            "tts": false,
+            "mention_everyone": false,
+            "mentions": mentions_json,
+            "mention_roles": [],
+            "mention_channels": [],
+            "attachments": [],
+            "embeds": [], "reactions": [], "nonce": null, "pinned": false, "webhook_id": null,
+            "type": 0, "activity": null, "application": null, "application_id": null,
+            "message_reference": null, "flags": null, "referenced_message": null,
+            "message_snapshots": [], "interaction": null, "interaction_metadata": null,
+            "thread": null, "components": [], "sticker_items": [], "position": null,
+            "role_subscription_data": null, "member": null, "poll": null
+        }))
+        .unwrap()
+    }
+
+    fn make_guild_channel(id: u64, guild_id: u64, kind: u8) -> Channel {
+        serde_json::from_value(serde_json::json!({
+            "id": id.to_string(),
+            "type": kind,
+            "guild_id": guild_id.to_string(),
+            "name": format!("chan_{id}"),
+            "position": 0,
+            "permission_overwrites": [],
+            "rate_limit_per_user": 0,
+            "nsfw": false
+        }))
+        .unwrap()
+    }
+
+    struct MockHistoryFetcher {
+        messages: Mutex<HashMap<u64, Vec<Message>>>,
+        channels: Mutex<HashMap<u64, std::result::Result<Channel, String>>>,
+        member_roles: Mutex<HashMap<(u64, u64), Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl DiscordHistoryFetcher for MockHistoryFetcher {
+        async fn fetch_messages(
+            &self,
+            channel_id: ChannelId,
+            after: Option<MessageId>,
+            limit: u8,
+        ) -> Result<Vec<Message>> {
+            let store = self.messages.lock().await;
+            let msgs = store.get(&channel_id.get()).cloned().unwrap_or_default();
+            let mut filtered: Vec<Message> = if let Some(after_id) = after {
+                msgs.into_iter()
+                    .filter(|m| m.id.get() > after_id.get())
+                    .collect()
+            } else {
+                msgs
+            };
+            filtered.sort_by_key(|m| m.id.get());
+            Ok(filtered.into_iter().take(limit as usize).collect())
+        }
+
+        async fn get_channel(&self, channel_id: ChannelId) -> Result<Option<Channel>> {
+            let store = self.channels.lock().await;
+            if let Some(res) = store.get(&channel_id.get()) {
+                match res {
+                    Ok(ch) => Ok(Some(ch.clone())),
+                    Err(err) => Err(OmonError::Config(err.clone())),
+                }
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn get_member_roles(&self, guild_id: GuildId, user_id: UserId) -> Result<Vec<u64>> {
+            let store = self.member_roles.lock().await;
+            Ok(store
+                .get(&(guild_id.get(), user_id.get()))
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    let fetcher = Arc::new(MockHistoryFetcher {
+        messages: Mutex::new(HashMap::new()),
+        channels: Mutex::new(HashMap::new()),
+        member_roles: Mutex::new(HashMap::new()),
+    });
+
+    fetcher
+        .channels
+        .lock()
+        .await
+        .insert(100, Ok(make_guild_channel(100, 999, 0)));
+    fetcher
+        .member_roles
+        .lock()
+        .await
+        .insert((999, 10), vec![777]);
+
+    // --- Scenario 1: Aug14 role-authorized msg8, crash before debounce flush, restore Sep5 ---
+    let msg8 = make_test_msg(
+        8,
+        100,
+        Some(999),
+        10,
+        "<@42> please execute work",
+        "2026-08-14T12:00:00Z",
+        vec![42],
+    );
+    fetcher.messages.lock().await.insert(100, vec![msg8]);
+
+    let initial_cursor = get_bot_channel_cursor(&pool, "42", "100").await.unwrap();
+    assert_eq!(
+        initial_cursor, None,
+        "crash before debounce flush must not leave an advanced cursor"
+    );
+
+    let backfilled_count =
+        run_missed_message_backfill_with_fetcher(&pool, fetcher.as_ref(), &data, UserId::new(42))
+            .await
+            .unwrap();
+
+    assert_eq!(
+        backfilled_count, 1,
+        "Aug14 role-authorized msg8 must be backfilled on restore"
+    );
+
+    {
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), ran_rx.recv())
+            .await
+            .expect("msg8 dispatch must be observed within 5s");
+        assert_eq!(
+            dispatched.as_deref(),
+            Some("8"),
+            "msg8 must be dispatched exactly once"
+        );
+        let evs = runner.events.lock().await;
+        assert_eq!(evs.len(), 1, "msg8 must be dispatched exactly once");
+        let expected_aug14 = chrono::DateTime::parse_from_rfc3339("2026-08-14T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            evs[0].received_at, expected_aug14,
+            "msg8 must preserve Aug14 source timestamp, not Sep5 restore time"
+        );
+        assert_eq!(evs[0].platform_message_id, "8");
+    }
+
+    let cursor_after_8 = get_bot_channel_cursor(&pool, "42", "100").await.unwrap();
+    assert_eq!(
+        cursor_after_8.as_deref(),
+        Some("8"),
+        "Bot 42 cursor must advance to 8 after successful claim"
+    );
+
+    // --- Scenario 2: msg9 where REST metadata lookup fails must NOT be admitted as DM ---
+    let msg9 = make_test_msg(
+        9,
+        100,
+        Some(999),
+        10,
+        "<@42> message with metadata fail",
+        "2026-08-14T12:05:00Z",
+        vec![42],
+    );
+    {
+        let mut msg_map = fetcher.messages.lock().await;
+        msg_map.get_mut(&100).unwrap().push(msg9);
+    }
+    fetcher.channels.lock().await.insert(
+        100,
+        Err("Discord REST API 500 internal server error".to_string()),
+    );
+
+    let _ =
+        run_missed_message_backfill_with_fetcher(&pool, fetcher.as_ref(), &data, UserId::new(42))
+            .await;
+
+    {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), ran_rx.recv(),)
+                .await
+                .is_err(),
+            "msg9 must NOT be dispatched when channel metadata fails"
+        );
+        let evs = runner.events.lock().await;
+        assert_eq!(
+            evs.len(),
+            1,
+            "msg9 must NOT be admitted or dispatched when channel metadata fails"
+        );
+        assert!(
+            evs.iter().all(|e| e.session.guild_id.is_some()),
+            "msg9 must NOT be admitted as Private/DM"
+        );
+    }
+    let cursor_after_9_fail = get_bot_channel_cursor(&pool, "42", "100").await.unwrap();
+    assert_eq!(
+        cursor_after_9_fail.as_deref(),
+        Some("8"),
+        "cursor must NOT advance on metadata failure"
+    );
+
+    fetcher
+        .channels
+        .lock()
+        .await
+        .insert(100, Ok(make_guild_channel(100, 999, 0)));
+
+    // --- Scenario 3: Two bots scanning the same channel: no cross-bot cursor skip ---
+    let cursor_bot84 = get_bot_channel_cursor(&pool, "84", "100").await.unwrap();
+    assert_eq!(
+        cursor_bot84, None,
+        "Bot 84 must not inherit Bot 42's cursor"
+    );
+
+    let msg9_for_bot84 = make_test_msg(
+        9,
+        100,
+        Some(999),
+        10,
+        "<@84> task for bot 84",
+        "2026-08-14T12:06:00Z",
+        vec![84],
+    );
+    {
+        let mut msg_map = fetcher.messages.lock().await;
+        let m8 = msg_map.get(&100).unwrap()[0].clone();
+        msg_map.insert(100, vec![m8, msg9_for_bot84]);
+    }
+
+    let mut data_bot84 = data.clone();
+    data_bot84.primary_bot_id = Some(84);
+
+    let count_bot84 = run_missed_message_backfill_with_fetcher(
+        &pool,
+        fetcher.as_ref(),
+        &data_bot84,
+        UserId::new(84),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        count_bot84, 1,
+        "Bot 84 must scan from its own start and process its message"
+    );
+    {
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), ran_rx.recv())
+            .await
+            .expect("bot 84 msg9 dispatch must be observed within 5s");
+        assert_eq!(
+            dispatched.as_deref(),
+            Some("9"),
+            "bot 84 msg9 must be dispatched exactly once"
+        );
+    }
+    let cursor_bot84_after = get_bot_channel_cursor(&pool, "84", "100").await.unwrap();
+    assert_eq!(
+        cursor_bot84_after.as_deref(),
+        Some("9"),
+        "Bot 84 cursor must be 9"
+    );
+    let cursor_bot42_still_8 = get_bot_channel_cursor(&pool, "42", "100").await.unwrap();
+    assert_eq!(
+        cursor_bot42_still_8.as_deref(),
+        Some("8"),
+        "Bot 42 cursor must remain unaffected by Bot 84"
+    );
+
+    // --- Scenario 4: Failed-route retry ---
+    let msg10 = make_test_msg(
+        10,
+        100,
+        Some(999),
+        10,
+        "<@42> task that fails initially",
+        "2026-08-14T12:10:00Z",
+        vec![42],
+    );
+    {
+        let mut msg_map = fetcher.messages.lock().await;
+        msg_map.get_mut(&100).unwrap().push(msg10);
+    }
+    *runner.fail_channel_id.lock().await = Some("100".to_string());
+
+    let _ =
+        run_missed_message_backfill_with_fetcher(&pool, fetcher.as_ref(), &data, UserId::new(42))
+            .await;
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), ran_rx.recv(),)
+            .await
+            .is_err(),
+        "msg10 must NOT reach the runner while the route is failing"
+    );
+
+    let cursor_retry = get_bot_channel_cursor(&pool, "42", "100").await.unwrap();
+    assert_eq!(
+        cursor_retry.as_deref(),
+        Some("8"),
+        "cursor must not advance on route failure"
+    );
+
+    *runner.fail_channel_id.lock().await = None;
+    let retry_count =
+        run_missed_message_backfill_with_fetcher(&pool, fetcher.as_ref(), &data, UserId::new(42))
+            .await
+            .unwrap();
+
+    assert_eq!(
+        retry_count, 1,
+        "failed route message 10 must be retried and succeed"
+    );
+    {
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), ran_rx.recv())
+            .await
+            .expect("msg10 retry dispatch must be observed within 5s");
+        assert_eq!(
+            dispatched.as_deref(),
+            Some("10"),
+            "msg10 must be dispatched exactly once on retry"
+        );
+    }
+    let cursor_retry_done = get_bot_channel_cursor(&pool, "42", "100").await.unwrap();
+    assert_eq!(
+        cursor_retry_done.as_deref(),
+        Some("10"),
+        "cursor must advance to 10 after successful retry"
+    );
+
+    // --- Scenario 5: >50 messages pagination coverage ---
+    runner.events.lock().await.clear();
+    fetcher
+        .channels
+        .lock()
+        .await
+        .insert(200, Ok(make_guild_channel(200, 999, 0)));
+    let mut msgs_200 = Vec::new();
+    for id in 101..=175 {
+        msgs_200.push(make_test_msg(
+            id,
+            200,
+            Some(999),
+            10,
+            "<@42> paginated batch item",
+            "2026-08-14T13:00:00Z",
+            vec![42],
+        ));
+    }
+    fetcher.messages.lock().await.insert(200, msgs_200);
+
+    let count_paginated =
+        run_missed_message_backfill_with_fetcher(&pool, fetcher.as_ref(), &data, UserId::new(42))
+            .await
+            .unwrap();
+
+    assert_eq!(
+        count_paginated, 75,
+        "all 75 messages across multiple pages must be backfilled"
+    );
+    for _ in 0..75 {
+        tokio::time::timeout(std::time::Duration::from_secs(5), ran_rx.recv())
+            .await
+            .expect("paginated dispatch must be observed within 5s per message");
+    }
+    {
+        let evs = runner.events.lock().await;
+        let ids: Vec<String> = evs.iter().map(|e| e.platform_message_id.clone()).collect();
+        assert_eq!(
+            evs.len(),
+            75,
+            "all 75 paginated messages must reach the runner; got ids: {ids:?}"
+        );
+    }
+    let cursor_200 = get_bot_channel_cursor(&pool, "42", "200").await.unwrap();
+    assert_eq!(
+        cursor_200.as_deref(),
+        Some("175"),
+        "cursor must advance to 175 covering all paginated pages"
+    );
+}
+
+#[tokio::test]
+async fn reply_parent_attachment_reaches_prompt() {
+    let bot_id = UserId::new(42);
+    let config = InboundFilterConfig {
+        allowed_users: &[10],
+        primary_bot_id: Some(42),
+        ..Default::default()
+    };
+
+    let reply_msg = reply_message_fixture(
+        None,
+        "analyze this",
+        "bob",
+        "Here is the chart",
+        vec![("chart.png", "image/png")],
+    );
+
+    let event =
+        message_to_inbound_with_config(&reply_msg, bot_id, Some(ChannelType::Private), &config)
+            .expect("reply message should convert to inbound event");
+
+    // D04 assertion: event.attachments must include the parent message's referenced attachments
+    assert!(
+        event.attachments.iter().any(|a| a.id == "100" && a.filename == "chart.png"),
+        "parent message attachment 'chart.png' (id 100) must be included in event.attachments, got: {:?}",
+        event.attachments
+    );
+}
+
+#[tokio::test]
+async fn processing_lifecycle_cleans_up() {
+    let egress = DiscordEgress::new(std::sync::Arc::new(serenity::all::Http::new("local-test")));
+    let session = SessionKey::new("discord", Some("guild-1"), "7", None::<String>, "user-1");
+
+    // 1. Start typing: guard is active
+    egress
+        .dispatch(OutboundAction::Typing {
+            session: session.clone(),
+            active: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        egress.active_typing_count().await,
+        1,
+        "typing guard must be active"
+    );
+
+    // 2. Terminal Typing(false) cleans up active guard
+    egress
+        .dispatch(OutboundAction::Typing {
+            session: session.clone(),
+            active: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        egress.active_typing_count().await,
+        0,
+        "terminal typing false must release active guard"
+    );
+
+    // 3. React action targets original parent channel_id (not thread_id)
+    let thread_session = SessionKey::new(
+        "discord",
+        Some("guild-1"),
+        "100",
+        Some("200".to_string()),
+        "",
+    );
+    let react_action = OutboundAction::React {
+        session: thread_session,
+        message_id: "999".to_string(),
+        emoji: "✅".to_string(),
+        remove_others: true,
+    };
+    let _ = egress.dispatch(react_action).await;
+}
+
+#[tokio::test]
+async fn final_output_filters_controls() {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+
+    struct CapturingDispatcher {
+        actions: Arc<Mutex<Vec<OutboundAction>>>,
+    }
+    #[async_trait]
+    impl OutboundDispatcher for CapturingDispatcher {
+        async fn dispatch(&self, action: OutboundAction) -> Result<(), omon_gateway::OmonError> {
+            self.actions.lock().await.push(action);
+            Ok(())
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let peer_handle = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let mut ws = match tokio_tungstenite::accept_async(socket).await {
+                Ok(ws) => ws,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let Ok(req) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
+                    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+
+                    match method {
+                        "initialize" => {
+                            let resp = json!({"jsonrpc":"2.0","id":id,"result":{}});
+                            let _ = ws.send(Message::text(resp.to_string())).await;
+                        }
+                        "thread/resume" | "thread/start" => {
+                            let thread_id = req["params"]["threadId"].as_str().unwrap_or("th-1");
+                            let resp = json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":thread_id}}});
+                            let _ = ws.send(Message::text(resp.to_string())).await;
+                        }
+                        "turn/start" => {
+                            let thread_id = req["params"]["threadId"].as_str().unwrap_or("th-1");
+                            let resp = json!({"jsonrpc":"2.0","id":id,"result":{"turn":{"id":"turn-1","status":"inProgress"}}});
+                            let _ = ws.send(Message::text(resp.to_string())).await;
+
+                            let started = json!({
+                                "jsonrpc": "2.0",
+                                "method": "turn/started",
+                                "params": { "threadId": thread_id, "turnId": "turn-1" }
+                            });
+                            let _ = ws.send(Message::text(started.to_string())).await;
+
+                            if thread_id == "th-think" {
+                                let item_started = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "item/started",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turnId": "turn-1",
+                                        "item": { "id": "m1", "type": "agentMessage" }
+                                    }
+                                });
+                                let _ = ws.send(Message::text(item_started.to_string())).await;
+
+                                let item_completed = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "item/completed",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turnId": "turn-1",
+                                        "item": {
+                                            "id": "m1",
+                                            "type": "agentMessage",
+                                            "text": "<ThInK>PRIVATE</ThInK>answer"
+                                        }
+                                    }
+                                });
+                                let _ = ws.send(Message::text(item_completed.to_string())).await;
+
+                                let completed = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "turn/completed",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turn": { "id": "turn-1", "status": "completed" }
+                                    }
+                                });
+                                let _ = ws.send(Message::text(completed.to_string())).await;
+                            } else if thread_id == "th-silence" {
+                                let tool_started = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "item/started",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turnId": "turn-1",
+                                        "item": { "id": "t1", "type": "toolCall", "tool": "terminal" }
+                                    }
+                                });
+                                let _ = ws.send(Message::text(tool_started.to_string())).await;
+                                let tool_completed = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "item/completed",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turnId": "turn-1",
+                                        "item": { "id": "t1", "type": "toolCall", "tool": "terminal" }
+                                    }
+                                });
+                                let _ = ws.send(Message::text(tool_completed.to_string())).await;
+
+                                let item_started = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "item/started",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turnId": "turn-1",
+                                        "item": { "id": "m2", "type": "agentMessage" }
+                                    }
+                                });
+                                let _ = ws.send(Message::text(item_started.to_string())).await;
+
+                                let item_completed = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "item/completed",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turnId": "turn-1",
+                                        "item": {
+                                            "id": "m2",
+                                            "type": "agentMessage",
+                                            "text": "NO_REPLY"
+                                        }
+                                    }
+                                });
+                                let _ = ws.send(Message::text(item_completed.to_string())).await;
+
+                                let completed = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "turn/completed",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turn": { "id": "turn-1", "status": "completed" }
+                                    }
+                                });
+                                let _ = ws.send(Message::text(completed.to_string())).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+
+    let config = omon_gateway::OmoBackendConfig::new(format!("ws://127.0.0.1:{port}"))
+        .with_request_timeout(std::time::Duration::from_secs(5))
+        .with_total_timeout(std::time::Duration::from_secs(10));
+
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(CapturingDispatcher {
+        actions: actions.clone(),
+    });
+
+    let backend = omon_gateway::OmoBackend::new(config, dispatcher);
+
+    // 1. Turn 1: <ThInK>PRIVATE</ThInK>answer -> only "answer" emitted, NO "PRIVATE"
+    let session_key1 = SessionKey::new("discord", Some("g1"), "c1", None::<String>, "u1");
+    let mut session1 = omon_gateway::SessionContext::new(session_key1.clone());
+    session1.state.metadata.insert(
+        "omo_thread_id".to_string(),
+        serde_json::Value::String("th-think".to_string()),
+    );
+    let ev1 = InboundEvent::message(session_key1, "1", "hello");
+
+    backend.run(&mut session1, ev1).await.unwrap();
+
+    let acts1 = actions.lock().await.clone();
+    assert!(!acts1.is_empty(), "Turn 1 must emit output");
+    let mut full_output = String::new();
+    for act in &acts1 {
+        if let OutboundAction::Stream { chunk, .. } = act {
+            if chunk.is_final {
+                full_output = chunk.content.clone();
+            }
+        }
+    }
+    assert!(
+        !full_output.contains("PRIVATE"),
+        "output must not contain PRIVATE reasoning, got: {full_output}"
+    );
+    assert!(
+        !full_output.to_lowercase().contains("think"),
+        "output must not contain think tags, got: {full_output}"
+    );
+    assert!(
+        full_output.contains("answer"),
+        "output must contain answer, got: {full_output}"
+    );
+
+    // Clear actions for Turn 2
+    actions.lock().await.clear();
+
+    // 2. Turn 2: tool event + NO_REPLY -> success, but ZERO sends (no stream chunks, no SendMessage)
+    let session_key2 = SessionKey::new("discord", Some("g1"), "c2", None::<String>, "u2");
+    let mut session2 = omon_gateway::SessionContext::new(session_key2.clone());
+    session2.state.metadata.insert(
+        "omo_thread_id".to_string(),
+        serde_json::Value::String("th-silence".to_string()),
+    );
+    let ev2 = InboundEvent::message(session_key2, "2", "silent please");
+
+    let res2 = backend.run(&mut session2, ev2).await;
+    assert!(res2.is_ok(), "silence turn must succeed");
+
+    let acts2 = actions.lock().await.clone();
+    let sent_count = acts2
+        .iter()
+        .filter(|a| {
+            matches!(
+                a,
+                OutboundAction::SendMessage { .. } | OutboundAction::Stream { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        sent_count, 0,
+        "silence turn must result in zero sends, got: {acts2:?}"
+    );
+
+    peer_handle.abort();
+}
+
+#[tokio::test]
+async fn dead_target_is_identity_and_resource_scoped() {
+    use omon_gateway::DeadTargetRegistry;
+
+    let registry = DeadTargetRegistry::new();
+    registry.mark_dead_for_bot("bot-a", 7, 403, "HTTP 403: Missing Permissions");
+
+    assert!(
+        registry.is_dead_for_bot("bot-a", 7),
+        "bot-a must be dead on channel 7"
+    );
+    assert!(
+        !registry.is_dead_for_bot("bot-b", 7),
+        "bot-b must NOT be dead on channel 7 when only bot-a was marked dead"
+    );
+
+    let probe_registry = DeadTargetRegistry::new().with_probe_interval(std::time::Duration::ZERO);
+    probe_registry.mark_dead_for_bot("bot-a", 99, 404, "HTTP 404: Unknown Channel");
+    assert!(
+        !probe_registry.is_dead_for_bot("bot-a", 99),
+        "virtual expiry probe must permit one trial probe send"
+    );
+    assert!(
+        probe_registry.is_dead_for_bot("bot-a", 99),
+        "probe send must lock target again until trial outcome"
+    );
+
+    let client = Arc::new(serenity::all::Http::new("token-a"));
+    let egress = DiscordEgress::new(client).with_dead_targets(Arc::new(registry));
+    let session = SessionKey::new("discord", None::<String>, "7", None::<String>, "user");
+    let send_res = egress
+        .dispatch(OutboundAction::SendMessage {
+            session,
+            content: "hello".into(),
+            reply_to: None,
+        })
+        .await;
+    assert!(
+        send_res.is_err(),
+        "short-circuited dead target must return Err without claiming delivered"
+    );
+}
+
+#[tokio::test]
+async fn final_stream_references_trigger() {
+    #[derive(Clone)]
+    struct ReferenceCapturingTransport {
+        sent_refs: Arc<Mutex<Vec<Option<MessageId>>>>,
+        fail_references: Arc<Mutex<Vec<MessageId>>>,
+    }
+
+    #[async_trait]
+    impl DiscordMessageTransport for ReferenceCapturingTransport {
+        async fn start_typing(&self, _channel_id: ChannelId) -> Result<()> {
+            Ok(())
+        }
+        async fn edit_message(
+            &self,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+            _content: String,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn send_message(
+            &self,
+            _channel_id: ChannelId,
+            _content: String,
+        ) -> Result<MessageId> {
+            self.sent_refs.lock().await.push(None);
+            Ok(MessageId::new(100))
+        }
+        async fn send_message_with_reference(
+            &self,
+            channel_id: ChannelId,
+            content: String,
+            reference: Option<MessageId>,
+        ) -> Result<MessageId> {
+            self.sent_refs.lock().await.push(reference);
+            if let Some(ref_id) = reference {
+                if self.fail_references.lock().await.contains(&ref_id) {
+                    return self.send_message(channel_id, content).await;
+                }
+            }
+            Ok(MessageId::new(100))
+        }
+        async fn delete_message(
+            &self,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let sent_refs = Arc::new(Mutex::new(Vec::new()));
+    let fail_references = Arc::new(Mutex::new(Vec::new()));
+    let transport = Arc::new(ReferenceCapturingTransport {
+        sent_refs: sent_refs.clone(),
+        fail_references: fail_references.clone(),
+    });
+
+    let http = Arc::new(serenity::all::Http::new("test-token"));
+    let egress = DiscordEgress::new(http).with_message_transport(transport);
+
+    // 1. Turn 1: trigger8 -> first request must have message_reference.message_id = 8, no reference on further chunks
+    let session1 = SessionKey::new("discord", Some("g1"), "7", None::<String>, "u1");
+    let stream_id1 = uuid::Uuid::new_v4();
+
+    let chunk1 = omon_gateway::StreamChunk {
+        stream_id: stream_id1,
+        sequence: 0,
+        content: "intermediate".into(),
+        is_final: false,
+        reply_to: Some("8".into()),
+    };
+    egress
+        .dispatch(OutboundAction::Stream {
+            session: session1.clone(),
+            chunk: chunk1,
+        })
+        .await
+        .unwrap();
+
+    let chunk1_final = omon_gateway::StreamChunk {
+        stream_id: stream_id1,
+        sequence: 1,
+        content: "completed answer".into(),
+        is_final: true,
+        reply_to: Some("8".into()),
+    };
+    egress
+        .dispatch(OutboundAction::Stream {
+            session: session1,
+            chunk: chunk1_final,
+        })
+        .await
+        .unwrap();
+
+    let refs = sent_refs.lock().await.clone();
+    assert_eq!(
+        refs,
+        vec![Some(MessageId::new(8))],
+        "first message must reference triggering message_id 8, and no reference on further chunks"
+    );
+
+    // Clear recorded references for Turn 2
+    sent_refs.lock().await.clear();
+
+    // 2. Turn 2: deleted8 -> first attempt returns 404 (code 10008), retries without anchor
+    fail_references.lock().await.push(MessageId::new(888));
+    let session2 = SessionKey::new("discord", Some("g1"), "7", None::<String>, "u2");
+    let stream_id2 = uuid::Uuid::new_v4();
+
+    let chunk2 = omon_gateway::StreamChunk {
+        stream_id: stream_id2,
+        sequence: 0,
+        content: "answer for deleted trigger".into(),
+        is_final: true,
+        reply_to: Some("888".into()),
+    };
+    let res2 = egress
+        .dispatch(OutboundAction::Stream {
+            session: session2,
+            chunk: chunk2,
+        })
+        .await;
+    assert!(
+        res2.is_ok(),
+        "deleted8 turn must succeed via retry fallback"
+    );
+
+    let refs2 = sent_refs.lock().await.clone();
+    assert_eq!(
+        refs2,
+        vec![Some(MessageId::new(888)), None],
+        "deleted8 must first attempt with reference, then retry without anchor"
+    );
+}
+
+#[tokio::test]
+async fn final_media_directive_uploads() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let valid_media_path = temp_dir.path().join("report one.png");
+    std::fs::write(&valid_media_path, b"fake png content").unwrap();
+
+    let uploader = Arc::new(MockFileUploader::default());
+    let (typing_tx, _typing_rx) = mpsc::unbounded_channel();
+    let transport = Arc::new(MockTransport {
+        calls: Mutex::new(Vec::new()),
+        typing: typing_tx,
+    });
+
+    let egress = DiscordEgress::new(Arc::new(serenity::all::Http::new("test-token")))
+        .with_file_uploader(uploader.clone())
+        .with_message_transport(transport.clone());
+
+    let session = SessionKey::new("discord", Some("g1"), "7", None::<String>, "u1");
+    let stream_id = uuid::Uuid::new_v4();
+
+    // 1. Valid temp file with spaces in path inside quotes
+    let directive = format!(
+        "Here is your report:\nMEDIA:\"{}\"",
+        valid_media_path.display()
+    );
+    let chunk = omon_gateway::StreamChunk {
+        stream_id,
+        sequence: 0,
+        content: directive,
+        is_final: true,
+        reply_to: None,
+    };
+
+    let result = egress
+        .dispatch(OutboundAction::Stream {
+            session: session.clone(),
+            chunk,
+        })
+        .await;
+    assert!(result.is_ok(), "valid media upload must succeed");
+
+    // Check uploader was called exactly once with the valid path
+    let upload_calls = uploader.calls.lock().await.clone();
+    assert_eq!(
+        upload_calls.len(),
+        1,
+        "uploader must be called exactly once"
+    );
+    let upload_call_path =
+        std::fs::canonicalize(&upload_calls[0].1).unwrap_or_else(|_| upload_calls[0].1.clone());
+    let expected_media_path =
+        std::fs::canonicalize(&valid_media_path).unwrap_or_else(|_| valid_media_path.clone());
+    assert_eq!(upload_call_path, expected_media_path);
+
+    // Check transport received edited text with the MEDIA directive stripped (no literal directive)
+    let calls = transport.calls.lock().await.clone();
+    let sent_or_edited_texts: Vec<String> = calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::Edit(_, text) => Some(text.clone()),
+            Call::Send(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        sent_or_edited_texts
+            .iter()
+            .any(|t| t.contains("Here is your report:") && !t.contains("MEDIA:")),
+        "delivered text must have MEDIA directive stripped, got: {:?}",
+        sent_or_edited_texts
+    );
+
+    // 2. Invalid / unauthorized root path produces explicit delivery error and NO secret upload
+    let unauthorized_path = "/etc/passwd";
+    let bad_directive = format!("Steal this:\nMEDIA:\"{unauthorized_path}\"");
+    let bad_chunk = omon_gateway::StreamChunk {
+        stream_id: uuid::Uuid::new_v4(),
+        sequence: 0,
+        content: bad_directive,
+        is_final: true,
+        reply_to: None,
+    };
+
+    let bad_result = egress
+        .dispatch(OutboundAction::Stream {
+            session,
+            chunk: bad_chunk,
+        })
+        .await;
+
+    assert!(
+        bad_result.is_err(),
+        "unauthorized media path must produce explicit delivery error"
+    );
+    // Uploader call count must still be 1 (no new secret upload)
+    assert_eq!(uploader.calls.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn native_voice_wire_metadata_and_fallback() {
+    use omon_gateway::{
+        DiscordFileUploader, DiscordUploadTransport, SerenityFileUploader, VoiceMetadata,
+        DISCORD_VOICE_MESSAGE_FLAG,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum CapturedWireCall {
+        Voice {
+            filename: String,
+            flags: u64,
+            duration_secs: f64,
+            waveform: String,
+        },
+        Ordinary {
+            filename: String,
+        },
+        Forum {
+            filename: String,
+            is_voice: bool,
+            flags: u64,
+        },
+    }
+
+    struct SurrogateTransport {
+        calls: Mutex<Vec<CapturedWireCall>>,
+        reject_native_voice: AtomicBool,
+    }
+
+    #[async_trait]
+    impl DiscordUploadTransport for SurrogateTransport {
+        async fn send_voice_file(
+            &self,
+            _http: &serenity::all::Http,
+            _channel: ChannelId,
+            filename: &str,
+            _bytes: Vec<u8>,
+            meta: &VoiceMetadata,
+        ) -> omon_gateway::Result<()> {
+            if self.reject_native_voice.load(Ordering::SeqCst) {
+                return Err(omon_gateway::OmonError::Multiplexer(
+                    "Discord API 400 Bad Request: Voice notes disabled in channel".into(),
+                ));
+            }
+            // Surrogate rejects flagged payload lacking metadata
+            if meta.flags != DISCORD_VOICE_MESSAGE_FLAG
+                || meta.duration_secs <= 0.0
+                || meta.waveform.is_empty()
+            {
+                return Err(omon_gateway::OmonError::Multiplexer(
+                    "Discord API 400 Bad Request: Voice message requires duration_secs and waveform metadata".into(),
+                ));
+            }
+            self.calls.lock().await.push(CapturedWireCall::Voice {
+                filename: filename.to_owned(),
+                flags: meta.flags,
+                duration_secs: meta.duration_secs,
+                waveform: meta.waveform.clone(),
+            });
+            Ok(())
+        }
+
+        async fn send_ordinary_file(
+            &self,
+            _http: &serenity::all::Http,
+            _channel: ChannelId,
+            filename: &str,
+            _bytes: Vec<u8>,
+        ) -> omon_gateway::Result<()> {
+            self.calls.lock().await.push(CapturedWireCall::Ordinary {
+                filename: filename.to_owned(),
+            });
+            Ok(())
+        }
+
+        async fn send_forum_file(
+            &self,
+            _http: &serenity::all::Http,
+            _channel: ChannelId,
+            filename: &str,
+            _bytes: Vec<u8>,
+            is_voice: bool,
+        ) -> omon_gateway::Result<()> {
+            self.calls.lock().await.push(CapturedWireCall::Forum {
+                filename: filename.to_owned(),
+                is_voice,
+                flags: 0,
+            });
+            Ok(())
+        }
+
+        async fn send_attachments(
+            &self,
+            _http: &serenity::all::Http,
+            _channel: ChannelId,
+            _attachments: Vec<serenity::all::CreateAttachment>,
+        ) -> omon_gateway::Result<()> {
+            Ok(())
+        }
+    }
+
+    let surrogate = Arc::new(SurrogateTransport {
+        calls: Mutex::new(Vec::new()),
+        reject_native_voice: AtomicBool::new(false),
+    });
+
+    let uploader = SerenityFileUploader::new().with_transport(surrogate.clone());
+    let http = Arc::new(serenity::all::Http::new("test-token"));
+    let channel = ChannelId::new(12345);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // 1. Valid OggOpus with explicit voice intent -> native voice metadata present and accepted
+    let voice_path = temp_dir.path().join("my-voice-note.voice.ogg");
+    tokio::fs::write(&voice_path, vec![1, 2, 3, 4, 5, 6, 7, 8])
+        .await
+        .unwrap();
+    uploader
+        .upload(http.clone(), channel, &voice_path)
+        .await
+        .expect("voice note should upload with valid metadata");
+
+    let calls = surrogate.calls.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    match &calls[0] {
+        CapturedWireCall::Voice {
+            flags,
+            duration_secs,
+            waveform,
+            ..
+        } => {
+            assert_eq!(*flags, DISCORD_VOICE_MESSAGE_FLAG);
+            assert!(*duration_secs > 0.0);
+            assert!(!waveform.is_empty());
+        }
+        _ => panic!("expected Voice wire call, got {:?}", calls[0]),
+    }
+
+    // 2. Injected native rejection falls back to ordinary file
+    surrogate.reject_native_voice.store(true, Ordering::SeqCst);
+    let rejected_voice_path = temp_dir.path().join("another-voice-message.ogg");
+    tokio::fs::write(&rejected_voice_path, vec![10, 20, 30])
+        .await
+        .unwrap();
+    uploader
+        .upload(http.clone(), channel, &rejected_voice_path)
+        .await
+        .expect("native rejection should fall back to ordinary file");
+
+    let calls = surrogate.calls.lock().await.clone();
+    assert_eq!(calls.len(), 2);
+    match &calls[1] {
+        CapturedWireCall::Ordinary { filename } => {
+            assert_eq!(filename, "another-voice-message.ogg");
+        }
+        _ => panic!("expected Ordinary fallback wire call, got {:?}", calls[1]),
+    }
+
+    // 3. Ordinary .ogg without voice intent remains document (never flagged as voice)
+    surrogate.reject_native_voice.store(false, Ordering::SeqCst);
+    let ordinary_path = temp_dir.path().join("soundtrack.ogg");
+    tokio::fs::write(&ordinary_path, vec![99, 100, 101])
+        .await
+        .unwrap();
+    uploader
+        .upload(http.clone(), channel, &ordinary_path)
+        .await
+        .expect("ordinary ogg should upload as document");
+
+    let calls = surrogate.calls.lock().await.clone();
+    assert_eq!(calls.len(), 3);
+    match &calls[2] {
+        CapturedWireCall::Ordinary { filename } => {
+            assert_eq!(filename, "soundtrack.ogg");
+        }
+        _ => panic!(
+            "expected Ordinary wire call for ordinary .ogg, got {:?}",
+            calls[2]
+        ),
+    }
+}
+
+#[tokio::test]
+async fn tables_survive_forum_and_attachment_limits() {
+    use omon_gateway::{
+        DiscordEgress, DiscordUploadTransport, OutboundAction, OutboundDispatcher, SessionKey,
+        VoiceMetadata, DISCORD_ATTACHMENT_LIMIT,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct MockTableTransport {
+        uploaded_batches: Mutex<Vec<Vec<String>>>,
+        fail_upload: AtomicBool,
+    }
+
+    #[async_trait]
+    impl DiscordUploadTransport for MockTableTransport {
+        async fn send_voice_file(
+            &self,
+            _http: &serenity::all::Http,
+            _channel: ChannelId,
+            _filename: &str,
+            _bytes: Vec<u8>,
+            _meta: &VoiceMetadata,
+        ) -> omon_gateway::Result<()> {
+            Ok(())
+        }
+
+        async fn send_ordinary_file(
+            &self,
+            _http: &serenity::all::Http,
+            _channel: ChannelId,
+            _filename: &str,
+            _bytes: Vec<u8>,
+        ) -> omon_gateway::Result<()> {
+            Ok(())
+        }
+
+        async fn send_forum_file(
+            &self,
+            _http: &serenity::all::Http,
+            _channel: ChannelId,
+            _filename: &str,
+            _bytes: Vec<u8>,
+            _is_voice: bool,
+        ) -> omon_gateway::Result<()> {
+            Ok(())
+        }
+
+        async fn send_attachments(
+            &self,
+            _http: &serenity::all::Http,
+            _channel: ChannelId,
+            attachments: Vec<serenity::all::CreateAttachment>,
+        ) -> omon_gateway::Result<()> {
+            if self.fail_upload.load(Ordering::SeqCst) {
+                return Err(omon_gateway::OmonError::Multiplexer(
+                    "Simulated Discord attachment upload failure".into(),
+                ));
+            }
+            // Discord rejects requests exceeding 10 attachments
+            if attachments.len() > DISCORD_ATTACHMENT_LIMIT {
+                return Err(omon_gateway::OmonError::Multiplexer(format!(
+                    "Discord 400 Bad Request: Request has {} attachments, limit is {}",
+                    attachments.len(),
+                    DISCORD_ATTACHMENT_LIMIT
+                )));
+            }
+            let names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
+            self.uploaded_batches.lock().await.push(names);
+            Ok(())
+        }
+    }
+
+    let mock_transport = Arc::new(MockTableTransport {
+        uploaded_batches: Mutex::new(Vec::new()),
+        fail_upload: AtomicBool::new(false),
+    });
+
+    let http = Arc::new(serenity::all::Http::new("test-token"));
+    let (typing_tx, _typing_rx) = tokio::sync::mpsc::unbounded_channel();
+    let msg_transport = Arc::new(MockTransport {
+        calls: Mutex::new(Vec::new()),
+        typing: typing_tx,
+    });
+    let egress = DiscordEgress::new(http)
+        .with_upload_transport(mock_transport.clone())
+        .with_message_transport(msg_transport);
+
+    // 1. Build markdown content containing 11 distinct tables
+    let mut eleven_tables = String::new();
+    for i in 1..=11 {
+        eleven_tables.push_str(&format!(
+            "\n### Table {i}\n| Column A | Column B |\n| --- | --- |\n| Value {i}A | Value {i}B |\n"
+        ));
+    }
+
+    let session = SessionKey::new("discord", Some("g1"), "7", None::<String>, "u1");
+    let stream_id = uuid::Uuid::new_v4();
+
+    // 2. Test Stream delivery of 11 tables
+    let stream_res = egress
+        .dispatch(OutboundAction::Stream {
+            session: session.clone(),
+            chunk: omon_gateway::StreamChunk {
+                stream_id,
+                sequence: 0,
+                content: eleven_tables.clone(),
+                is_final: true,
+                reply_to: None,
+            },
+        })
+        .await;
+
+    // Delivery must succeed AND all 11 tables must be received across valid batches (<= 10)
+    assert!(
+        stream_res.is_ok(),
+        "11 table stream should succeed with batching: {:?}",
+        stream_res.err()
+    );
+    let batches = mock_transport.uploaded_batches.lock().await.clone();
+    assert!(
+        batches.len() >= 2,
+        "11 tables must be split across at least 2 batches of <= 10, got {} batches: {:?}",
+        batches.len(),
+        batches
+    );
+    let total_uploaded: usize = batches.iter().map(|b| b.len()).sum();
+    assert_eq!(total_uploaded, 11, "All 11 table images must be uploaded");
+    assert!(
+        batches.iter().all(|b| b.len() <= DISCORD_ATTACHMENT_LIMIT),
+        "Every batch must be <= 10 attachments"
+    );
+
+    // 3. Test forced upload failure must NOT be acknowledged as fully delivered
+    mock_transport.fail_upload.store(true, Ordering::SeqCst);
+    let fail_res = egress
+        .dispatch(OutboundAction::Stream {
+            session: session.clone(),
+            chunk: omon_gateway::StreamChunk {
+                stream_id: uuid::Uuid::new_v4(),
+                sequence: 0,
+                content: "| Col 1 | Col 2 |\n| --- | --- |\n| X | Y |\n".into(),
+                is_final: true,
+                reply_to: None,
+            },
+        })
+        .await;
+
+    assert!(
+        fail_res.is_err(),
+        "Forced upload failure must be propagated, not swallowed as success"
+    );
+}
+
+#[tokio::test]
+async fn voice_note_transcription_is_wired() {
+    use omon_gateway::{
+        AttachmentDownloader, AudioFrame, AudioPayload, MessageAttachment, SpeechToText,
+    };
+
+    struct MockSttProvider {
+        received_payloads: Mutex<Vec<AudioPayload>>,
+        fail_next: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl SpeechToText for MockSttProvider {
+        async fn transcribe(&self, frames: &[AudioFrame]) -> omon_gateway::Result<String> {
+            if self.fail_next.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(omon_gateway::OmonError::Multiplexer(
+                    "STT provider temporary failure".into(),
+                ));
+            }
+            if let Some(frame) = frames.first() {
+                self.received_payloads
+                    .lock()
+                    .await
+                    .push(frame.payload.clone());
+                match &frame.payload {
+                    AudioPayload::Pcm(samples) => Ok(format!("wav samples: {}", samples.len())),
+                    AudioPayload::Opus(_) => Ok("ogg transcription successful".to_string()),
+                }
+            } else {
+                Ok(String::new())
+            }
+        }
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mock_stt = Arc::new(MockSttProvider {
+        received_payloads: Mutex::new(Vec::new()),
+        fail_next: std::sync::atomic::AtomicBool::new(false),
+    });
+
+    let downloader = AttachmentDownloader::new(temp_dir.path())
+        .unwrap()
+        .with_stt(mock_stt.clone());
+
+    // 1. OGG voice note
+    let ogg_bytes = vec![0x4f, 0x67, 0x67, 0x53, 1, 2, 3, 4];
+    let ogg_path = downloader
+        .attachment_root()
+        .join("att_1-my-voice-note.voice.ogg");
+    tokio::fs::write(&ogg_path, &ogg_bytes).await.unwrap();
+    let mut att_ogg = MessageAttachment {
+        id: "att_1".into(),
+        filename: "my-voice-note.voice.ogg".into(),
+        url: "https://cdn.discordapp.com/voice.ogg".into(),
+        content_type: Some("audio/ogg".into()),
+        size_bytes: Some(ogg_bytes.len() as u64),
+        local_path: None,
+        text_content: None,
+    };
+
+    downloader.hydrate(&mut att_ogg).await.unwrap();
+    assert_eq!(
+        att_ogg.text_content.as_deref(),
+        Some("[Voice message transcription]: ogg transcription successful")
+    );
+
+    // 2. WAV voice note - must decode to PCM
+    // Build a minimal valid 16-bit mono 16000Hz PCM WAV header + 4 samples
+    let mut wav_bytes = Vec::new();
+    wav_bytes.extend_from_slice(b"RIFF");
+    wav_bytes.extend_from_slice(&44u32.to_le_bytes()); // size
+    wav_bytes.extend_from_slice(b"WAVE");
+    wav_bytes.extend_from_slice(b"fmt ");
+    wav_bytes.extend_from_slice(&16u32.to_le_bytes()); // subchunk1size
+    wav_bytes.extend_from_slice(&1u16.to_le_bytes()); // audio format = 1 (PCM)
+    wav_bytes.extend_from_slice(&1u16.to_le_bytes()); // num channels = 1
+    wav_bytes.extend_from_slice(&16000u32.to_le_bytes()); // sample rate
+    wav_bytes.extend_from_slice(&32000u32.to_le_bytes()); // byte rate
+    wav_bytes.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav_bytes.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav_bytes.extend_from_slice(b"data");
+    wav_bytes.extend_from_slice(&8u32.to_le_bytes()); // data size (8 bytes = 4 samples)
+    wav_bytes.extend_from_slice(&100i16.to_le_bytes());
+    wav_bytes.extend_from_slice(&200i16.to_le_bytes());
+    wav_bytes.extend_from_slice(&(-300i16).to_le_bytes());
+    wav_bytes.extend_from_slice(&400i16.to_le_bytes());
+
+    let wav_path = downloader
+        .attachment_root()
+        .join("att_2-recording.voice.wav");
+    tokio::fs::write(&wav_path, &wav_bytes).await.unwrap();
+    let mut att_wav = MessageAttachment {
+        id: "att_2".into(),
+        filename: "recording.voice.wav".into(),
+        url: "https://cdn.discordapp.com/recording.wav".into(),
+        content_type: Some("audio/wav".into()),
+        size_bytes: Some(wav_bytes.len() as u64),
+        local_path: None,
+        text_content: None,
+    };
+
+    downloader.hydrate(&mut att_wav).await.unwrap();
+    assert_eq!(
+        att_wav.text_content.as_deref(),
+        Some("[Voice message transcription]: wav samples: 4")
+    );
+
+    // Verify mock received AudioPayload::Pcm, not Opus!
+    let payloads = mock_stt.received_payloads.lock().await.clone();
+    assert_eq!(payloads.len(), 2);
+    match &payloads[1] {
+        AudioPayload::Pcm(samples) => {
+            assert_eq!(samples.len(), 4);
+            assert_eq!(samples[0], 100);
+            assert_eq!(samples[1], 200);
+            assert_eq!(samples[2], -300);
+            assert_eq!(samples[3], 400);
+        }
+        _ => panic!("Expected AudioPayload::Pcm for WAV, got {:?}", payloads[1]),
+    }
+
+    // 3. Provider failure surfaces neutral failure metadata
+    mock_stt
+        .fail_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed_path = downloader
+        .attachment_root()
+        .join("att_3-failed-voice.voice.ogg");
+    tokio::fs::write(&failed_path, &ogg_bytes).await.unwrap();
+    let mut att_failed = MessageAttachment {
+        id: "att_3".into(),
+        filename: "failed-voice.voice.ogg".into(),
+        url: "https://cdn.discordapp.com/failed.ogg".into(),
+        content_type: Some("audio/ogg".into()),
+        size_bytes: Some(ogg_bytes.len() as u64),
+        local_path: None,
+        text_content: None,
+    };
+
+    downloader.hydrate(&mut att_failed).await.unwrap();
+    assert_eq!(
+        att_failed.text_content.as_deref(),
+        Some("[Voice message: audio received (transcription unavailable)]")
+    );
+}
+
+#[test]
+fn slash_skill_read_unicode_and_long_output() {
+    use omon_gateway::{chunk_slash_reply, skill_read_preview};
+
+    // 1. 1799 ASCII bytes + 3-byte '한' + tail
+    let mut input = "a".repeat(1799);
+    input.push('한');
+    input.push_str(" additional text tail");
+
+    let preview = skill_read_preview(&input);
+    assert!(preview.len() <= 1800);
+    assert_eq!(preview, &"a".repeat(1799));
+
+    // 2. >2000-char list chunking
+    let long_list = (1..=100)
+        .map(|i| {
+            format!(
+                "- Skill number {i:03}: detailed capability description for testing chunked output"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(long_list.len() > 2000);
+
+    let chunks = chunk_slash_reply(&long_list, 2000);
+    assert!(chunks.len() >= 2);
+    assert!(chunks.iter().all(|c| c.len() <= 2000));
+}
+
+#[tokio::test]
+async fn completed_response_has_bounded_message_count() {
+    use omon_gateway::{
+        DiscordMessageTransport, LiveEditThrottler, MAX_SPLIT_MESSAGES, TRUNCATION_NOTICE,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Clone, Default)]
+    struct MockThrottlerTransport {
+        sent_messages: Arc<Mutex<Vec<(ChannelId, String)>>>,
+        edited_messages: Arc<Mutex<Vec<(ChannelId, MessageId, String)>>>,
+        deleted_messages: Arc<Mutex<Vec<(ChannelId, MessageId)>>>,
+        next_id: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl DiscordMessageTransport for MockThrottlerTransport {
+        async fn send_message(
+            &self,
+            channel: ChannelId,
+            content: String,
+        ) -> omon_gateway::Result<MessageId> {
+            let id = MessageId::new(self.next_id.fetch_add(1, Ordering::SeqCst) + 1);
+            self.sent_messages.lock().await.push((channel, content));
+            Ok(id)
+        }
+
+        async fn edit_message(
+            &self,
+            channel: ChannelId,
+            message_id: MessageId,
+            content: String,
+        ) -> omon_gateway::Result<()> {
+            self.edited_messages
+                .lock()
+                .await
+                .push((channel, message_id, content));
+            Ok(())
+        }
+
+        async fn delete_message(
+            &self,
+            channel: ChannelId,
+            message_id: MessageId,
+        ) -> omon_gateway::Result<()> {
+            self.deleted_messages
+                .lock()
+                .await
+                .push((channel, message_id));
+            Ok(())
+        }
+
+        async fn start_typing(&self, _channel: ChannelId) -> omon_gateway::Result<()> {
+            Ok(())
+        }
+
+        async fn send_message_with_reference(
+            &self,
+            channel: ChannelId,
+            content: String,
+            _reference_message_id: Option<MessageId>,
+        ) -> omon_gateway::Result<MessageId> {
+            self.send_message(channel, content).await
+        }
+    }
+
+    let transport = Arc::new(MockThrottlerTransport::default());
+    let throttler =
+        LiveEditThrottler::new(transport.clone(), ChannelId::new(999), MessageId::new(100));
+
+    // Build oversized content that splits into 12 distinct chunks (> 8)
+    let paragraph = "This is a detailed analysis section of the system architecture.\n".repeat(30);
+    let huge_content = (1..=12)
+        .map(|i| format!("\n\n# Section {i}\n{paragraph}"))
+        .collect::<Vec<_>>()
+        .join("");
+
+    throttler.update(&huge_content, true).await.unwrap();
+
+    let sent = transport.sent_messages.lock().await.clone();
+    let edited = transport.edited_messages.lock().await.clone();
+    let total_messages = edited.len() + sent.len();
+    assert_eq!(
+        total_messages, MAX_SPLIT_MESSAGES,
+        "Total response messages must be bounded to MAX_SPLIT_MESSAGES ({MAX_SPLIT_MESSAGES}), got {total_messages}"
+    );
+    let last_chunk = &sent.last().unwrap().1;
+    assert!(
+        last_chunk.contains(TRUNCATION_NOTICE),
+        "Last chunk must contain truncation notice, got: {last_chunk}"
+    );
+}
+
+#[tokio::test]
+async fn runtime_footer_toggle_is_wired() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let transport = Arc::new(MockTransport {
+        calls: Mutex::new(Vec::new()),
+        typing: tx,
+    });
+    let http = Arc::new(serenity::all::Http::new("token"));
+
+    // Case 1: with_runtime_footer(true)
+    let egress_on = DiscordEgress::new(http.clone())
+        .with_message_transport(transport.clone())
+        .with_runtime_footer(true)
+        .with_default_model("model_x".into())
+        .with_workspace_root(PathBuf::from("/tmp/test_workspace"));
+
+    let session = SessionKey::new("discord", Some("9"), "7", None::<String>, "10");
+
+    egress_on
+        .dispatch(OutboundAction::SendMessage {
+            session: session.clone(),
+            content: "Hello world".into(),
+            reply_to: None,
+        })
+        .await
+        .unwrap();
+
+    let calls = transport.calls.lock().await.clone();
+    let sent_on = calls
+        .iter()
+        .find_map(|c| match c {
+            Call::Send(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("Message must be sent");
+    assert!(sent_on.contains("Hello world"));
+    assert!(sent_on.contains("_model_x · /tmp/test_workspace_"));
+
+    // Case 2: with_runtime_footer(false)
+    let (tx2, _rx2) = mpsc::unbounded_channel();
+    let transport2 = Arc::new(MockTransport {
+        calls: Mutex::new(Vec::new()),
+        typing: tx2,
+    });
+    let egress_off = DiscordEgress::new(http)
+        .with_message_transport(transport2.clone())
+        .with_runtime_footer(false);
+
+    egress_off
+        .dispatch(OutboundAction::SendMessage {
+            session,
+            content: "Hello world".into(),
+            reply_to: None,
+        })
+        .await
+        .unwrap();
+
+    let calls2 = transport2.calls.lock().await.clone();
+    let sent_off = calls2
+        .iter()
+        .find_map(|c| match c {
+            Call::Send(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("Message must be sent");
+    assert_eq!(sent_off, "Hello world");
+}
+
+#[tokio::test]
+async fn destructive_slash_waits_for_confirmation() {
+    use omon_gateway::{MultiplexerConfig, PoiseData, SessionMultiplexer};
+
+    struct NoopRunner;
+    #[async_trait]
+    impl omon_gateway::AgentRunner for NoopRunner {
+        async fn run(
+            &self,
+            _session: &mut omon_gateway::SessionContext,
+            _event: omon_gateway::InboundEvent,
+        ) -> Result<(), omon_gateway::OmonError> {
+            Ok(())
+        }
+    }
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let runner = Arc::new(NoopRunner);
+    let multiplexer =
+        SessionMultiplexer::new(db.pool().clone(), runner, MultiplexerConfig::default());
+    let mut data = PoiseData::new(multiplexer, db.pool().clone());
+    data.destructive_slash_confirm = true;
+
+    let session = SessionKey::new("discord", Some("9"), "7", None::<String>, "10");
+
+    // Insert dummy session and message to be cleared
+    sqlx::query("INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json) VALUES (?, 'discord', '7', '10', '{}')")
+        .bind(session.storage_key())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO messages (id, session_key, role, content) VALUES (?, ?, 'user', 'hello')",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(session.storage_key())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // 1. Without confirmation: must NOT delete and must return NeedsConfirmation
+    let res1 = omon_gateway::discord::commands::execute_reset_command(&data, &session, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        res1,
+        omon_gateway::discord::commands::ResetCommandResult::NeedsConfirmation,
+        "Must require confirmation before executing destructive slash command"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_key = ?")
+        .bind(session.storage_key())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "Messages must NOT be deleted without confirmation"
+    );
+
+    // 2. With confirmation: must delete and return Executed
+    let res2 = omon_gateway::discord::commands::execute_reset_command(&data, &session, Some(true))
+        .await
+        .unwrap();
+    assert_eq!(
+        res2,
+        omon_gateway::discord::commands::ResetCommandResult::Executed
+    );
+    let count2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_key = ?")
+        .bind(session.storage_key())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count2, 0, "Messages must be deleted after confirmation");
+}
+
+#[tokio::test]
+async fn slash_controls_change_authoritative_session() {
+    use omon_gateway::discord::commands::execute_model_command;
+    use omon_gateway::discord::PoiseData;
+    use omon_gateway::{
+        AgentRunner, Database, InboundEvent, MultiplexerConfig, OmonError, SessionContext,
+        SessionKey, SessionMultiplexer,
+    };
+
+    type RunRecord = (Option<String>, Option<String>);
+    struct CapturingRunner {
+        runs: Arc<tokio::sync::Mutex<Vec<RunRecord>>>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for CapturingRunner {
+        async fn run(
+            &self,
+            session: &mut SessionContext,
+            _event: InboundEvent,
+        ) -> Result<(), OmonError> {
+            let model = session.state.active_model.clone();
+            let thread_id = session
+                .state
+                .metadata
+                .get("omo_thread_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            self.runs.lock().await.push((model, thread_id));
+            session
+                .state
+                .metadata
+                .insert("omo_thread_id".into(), serde_json::json!("t1"));
+            Ok(())
+        }
+    }
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let runs = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let runner = Arc::new(CapturingRunner { runs: runs.clone() });
+    let multiplexer =
+        SessionMultiplexer::new(db.pool().clone(), runner, MultiplexerConfig::default());
+    let data = PoiseData::new(multiplexer.clone(), db.pool().clone());
+    let session = SessionKey::new("discord", Some("9"), "7", None::<String>, "10");
+
+    let ev1 = InboundEvent::message(session.clone(), "m1", "turn 1");
+    multiplexer.route_awaiting_turn(ev1).await.unwrap();
+
+    execute_model_command(&data, &session, "model-2")
+        .await
+        .unwrap();
+
+    let ev2 = InboundEvent::message(session.clone(), "m2", "turn 2");
+    multiplexer.route_awaiting_turn(ev2).await.unwrap();
+
+    let runs_snapshot = runs.lock().await.clone();
+    assert_eq!(
+        runs_snapshot[1].0.as_deref(),
+        Some("model-2"),
+        "Turn 2 must observe updated active model"
+    );
+    assert_eq!(
+        runs_snapshot[1].1.as_deref(),
+        Some("t1"),
+        "Turn 2 reuses thread t1 before reset"
+    );
+
+    omon_gateway::discord::commands::execute_reset_command(&data, &session, Some(true))
+        .await
+        .unwrap();
+
+    let ev3 = InboundEvent::message(session.clone(), "m3", "turn 3");
+    multiplexer.route_awaiting_turn(ev3).await.unwrap();
+
+    let runs_final = runs.lock().await.clone();
+    assert_eq!(
+        runs_final[2].1, None,
+        "Turn 3 must have a fresh thread after authoritative reset"
+    );
+}
+
+#[tokio::test]
+async fn reconnect_replays_only_owned_transport_failures() {
+    let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let bot_a = "bot-a";
+    let bot_b = "bot-b";
+
+    let session_a =
+        SessionKey::new("discord", None::<String>, "101", None::<String>, "u1").with_bot_id(bot_a);
+    let session_b =
+        SessionKey::new("discord", None::<String>, "102", None::<String>, "u2").with_bot_id(bot_b);
+
+    let ledger = DeliveryLedgerService::new(pool.clone());
+
+    // 1. Bot A failed row: retryable connection refused (current owner)
+    let obl_a_conn = "obl:test:a-conn";
+    ledger
+        .record_obligation(obl_a_conn, &session_a, "Retryable payload A")
+        .await
+        .unwrap();
+    ledger
+        .mark_obligation_failed(obl_a_conn, "connection refused: 127.0.0.1:443")
+        .await
+        .unwrap();
+
+    // 2. Bot A failed row: non-retryable timeout (current owner)
+    let obl_a_timeout = "obl:test:a-timeout";
+    ledger
+        .record_obligation(obl_a_timeout, &session_a, "Timeout payload A")
+        .await
+        .unwrap();
+    ledger
+        .mark_obligation_failed(obl_a_timeout, "request timeout after 30s")
+        .await
+        .unwrap();
+
+    // 3. Bot A failed row: non-retryable 403 Forbidden (current owner)
+    let obl_a_forbidden = "obl:test:a-forbidden";
+    ledger
+        .record_obligation(obl_a_forbidden, &session_a, "Forbidden payload A")
+        .await
+        .unwrap();
+    ledger
+        .mark_obligation_failed(obl_a_forbidden, "HTTP 403: Missing Permissions")
+        .await
+        .unwrap();
+
+    // 4. Bot B failed row: retryable connection refused (current owner, but bot B)
+    let obl_b_conn = "obl:test:b-conn";
+    ledger
+        .record_obligation(obl_b_conn, &session_b, "Retryable payload B")
+        .await
+        .unwrap();
+    ledger
+        .mark_obligation_failed(obl_b_conn, "connection refused: 127.0.0.1:443")
+        .await
+        .unwrap();
+
+    // 5. Another process instance row (different owner_started_at)
+    let obl_other_proc = "obl:test:other-proc";
+    ledger
+        .record_obligation(obl_other_proc, &session_a, "Other proc payload")
+        .await
+        .unwrap();
+    ledger
+        .mark_obligation_failed(obl_other_proc, "connection refused: 127.0.0.1:443")
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE delivery_obligations SET owner_started_at = '2026-01-01T00:00:00Z' WHERE id = ?",
+    )
+    .bind(obl_other_proc)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Set up mock Discord egress
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mock_transport = Arc::new(MockTransport {
+        calls: Mutex::new(Vec::new()),
+        typing: tx,
+    });
+    let client_a = Arc::new(serenity::all::Http::new("token-a"));
+    let client_b = Arc::new(serenity::all::Http::new("token-b"));
+    let mut clients = std::collections::HashMap::new();
+    clients.insert(bot_a.to_string(), client_a);
+    clients.insert(bot_b.to_string(), client_b);
+
+    let egress = DiscordEgress::with_bot_clients(bot_a, clients)
+        .unwrap()
+        .with_message_transport(mock_transport.clone());
+
+    // Trigger replay for bot A
+    let replayed = egress
+        .replay_failed_transport_obligations(bot_a, &pool)
+        .await
+        .expect("replay must succeed");
+
+    assert_eq!(
+        replayed, 1,
+        "Exactly 1 obligation (bot A connection-refused) must be replayed"
+    );
+
+    // Verify DB state of all 5 rows:
+    // 1. Bot A connection refused: now 'delivered'
+    let row_a_conn = ledger.get_obligation(obl_a_conn).await.unwrap().unwrap();
+    assert_eq!(
+        row_a_conn.state, "delivered",
+        "Bot A connection-refused must be marked delivered"
+    );
+
+    // 2. Bot A timeout: still 'failed'
+    let row_a_timeout = ledger.get_obligation(obl_a_timeout).await.unwrap().unwrap();
+    assert_eq!(
+        row_a_timeout.state, "failed",
+        "Bot A timeout must remain failed"
+    );
+
+    // 3. Bot A forbidden: still 'failed'
+    let row_a_forbidden = ledger
+        .get_obligation(obl_a_forbidden)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row_a_forbidden.state, "failed",
+        "Bot A 403 must remain failed"
+    );
+
+    // 4. Bot B connection refused: still 'failed' (bot A sweep must not touch bot B)
+    let row_b_conn = ledger.get_obligation(obl_b_conn).await.unwrap().unwrap();
+    assert_eq!(
+        row_b_conn.state, "failed",
+        "Bot B must remain untouched by bot A replay"
+    );
+
+    // 5. Other process instance: still 'failed'
+    let row_other = ledger
+        .get_obligation(obl_other_proc)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row_other.state, "failed",
+        "Other process instance must remain untouched"
+    );
+
+    // Verify mock transport received the message
+    let calls = mock_transport.calls.lock().await;
+    let sent_calls: Vec<_> = calls
+        .iter()
+        .filter_map(|c| {
+            if let Call::Send(content) = c {
+                Some(content.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        sent_calls.len(),
+        1,
+        "Mock transport must have received exactly 1 message"
+    );
+    assert_eq!(sent_calls[0], "Retryable payload A");
+}
+
+#[tokio::test]
+async fn test_dis006_approval_scoped_dead_targets_and_persistence() {
+    use omon_gateway::{
+        storage::init_pool, DeadTargetRegistry, DiscordEgress, OutboundAction, OutboundDispatcher,
+        SessionKey,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let pool = init_pool("sqlite::memory:").await.unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let registry = Arc::new(
+        DeadTargetRegistry::new()
+            .with_pool(pool.clone())
+            .with_probe_interval(std::time::Duration::from_secs(60)),
+    );
+
+    // Bot A has marked dead target on channel 7
+    registry.mark_dead_for_bot("bot-a", 7, 403, "HTTP 403: Forbidden");
+
+    let http_a = Arc::new(serenity::all::Http::new("token-a"));
+    let http_b = Arc::new(serenity::all::Http::new("token-b"));
+    let clients = HashMap::from([("bot-a".to_string(), http_a), ("bot-b".to_string(), http_b)]);
+
+    let egress = DiscordEgress::with_bot_clients("bot-a".to_string(), clients)
+        .unwrap()
+        .with_dead_targets(registry.clone());
+
+    let session_a = SessionKey::new("discord", None::<String>, "7", None::<String>, "user-1")
+        .with_bot_id("bot-a");
+    let session_b = SessionKey::new("discord", None::<String>, "7", None::<String>, "user-2")
+        .with_bot_id("bot-b");
+
+    // 1. ApprovalRequest for bot-a: must be short-circuited because bot-a is dead on channel 7
+    let err_a = egress
+        .dispatch(OutboundAction::ApprovalRequest {
+            session: session_a.clone(),
+            request_id: uuid::Uuid::new_v4(),
+            command: "cmd-a".into(),
+            reason: "reason-a".into(),
+        })
+        .await;
+    assert!(
+        err_a.is_err(),
+        "bot-a approval request must be short-circuited"
+    );
+    let err_msg = err_a.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("approval target 7 is unavailable"),
+        "Expected dead target error for bot-a, got: {err_msg}"
+    );
+
+    // 2. ApprovalRequest for bot-b: must NOT be short-circuited by bot-a's dead state!
+    let res_b = egress
+        .dispatch(OutboundAction::ApprovalRequest {
+            session: session_b.clone(),
+            request_id: uuid::Uuid::new_v4(),
+            command: "cmd-b".into(),
+            reason: "reason-b".into(),
+        })
+        .await;
+    let err_b_msg = res_b.unwrap_err().to_string();
+    assert!(
+        !err_b_msg.contains("approval target 7 is unavailable"),
+        "bot-b must not be suppressed by bot-a's dead state on channel 7; got {err_b_msg}"
+    );
+
+    // 3. Persistence: Recreate registry and egress over the SAME DB, call load_from_db
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let new_registry = Arc::new(
+        DeadTargetRegistry::new()
+            .with_pool(pool.clone())
+            .with_probe_interval(std::time::Duration::from_secs(60)),
+    );
+    new_registry.load_from_db(&pool).await.unwrap();
+    assert!(
+        new_registry.is_dead_for_bot("bot-a", 7),
+        "bot-a dead state on channel 7 must survive recreation over same DB"
+    );
+    assert!(
+        !new_registry.is_dead_for_bot("bot-b", 7),
+        "bot-b must remain not dead after recreation"
+    );
 }

@@ -812,6 +812,23 @@ impl DiscordMessageContextProvider {
             .filter(|metadata| metadata.is_thread)
         {
             if thread_metadata.parent_channel_id.as_deref() == Some(target) {
+                if self.policy.ignored_channels.contains(message_id) {
+                    return Err(OmonError::ToolExecution(format!(
+                        "message_context access denied: thread {message_id} is ignored by policy"
+                    )));
+                }
+                if self.policy.ignored_channels.contains(target) {
+                    return Err(OmonError::ToolExecution(format!(
+                        "message_context access denied: channel {target} is ignored by policy"
+                    )));
+                }
+                if let Some(parent) = thread_metadata.parent_channel_id.as_deref() {
+                    if self.policy.ignored_channels.contains(parent) {
+                        return Err(OmonError::ToolExecution(format!(
+                            "message_context access denied: parent channel {parent} is ignored by policy"
+                        )));
+                    }
+                }
                 let mut messages = self
                     .api
                     .recent_messages(

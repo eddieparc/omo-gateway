@@ -1,0 +1,10 @@
+[
+  "cargo test --test test_migrate dry_run_reports_nonimportable_jobs -- --exact --nocapture",
+  "cargo test --test test_migrate",
+  "cargo test --lib cron::store",
+  "cargo test --lib cron_cutover",
+  "cargo test --lib gateway_down",
+  "cargo test --lib config_import",
+  "cargo fmt -- --check src/cron/store.rs src/migrate/mod.rs tests/test_migrate.rs",
+  "cargo clippy --test test_migrate"
+]

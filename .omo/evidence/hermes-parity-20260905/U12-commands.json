@@ -1,0 +1,11 @@
+[
+  "cargo test --test test_omo_backend rejects_foreign_and_stale_turn_frames -- --exact --nocapture",
+  "cargo test --test test_omo_backend correlation_requires_ack_and_ignores_subscription_replay -- --exact --nocapture",
+  "cargo test --test test_omo_backend correlation_distinguishes_interrupted_and_failed -- --exact --nocapture",
+  "cargo test --test test_omo_backend -- --nocapture",
+  "cargo build",
+  "git diff --check",
+  "cargo test --test test_omo_backend test_omo_backend_waits_for_final_message_after_tool_activity -- --exact --nocapture",
+  "rustfmt --check --edition 2021 tests/test_omo_backend.rs",
+  "git diff --check -- tests/test_omo_backend.rs"
+]

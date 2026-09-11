@@ -62,6 +62,91 @@ pub fn reaction_emoji_for_outcome(success: bool) -> &'static str {
     }
 }
 
+pub const SILENCE_SENTINELS: &[&str] = &["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"];
+
+static SILENCE_NARRATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^[\s*_~`]*\(?\s*(silent|silence|no\s+response|no\s+reply)\s*\.?\)?[\\s*_~`]*$|^[\s*_~`]*[\x{1f507}\.\x{2026}]+[\s*_~`]*$",
+    )
+    .expect("valid silence narration regex")
+});
+
+static REASONING_TAGS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)<\s*(?:think|thought|reasoning)\b[^>]*>.*?(?:<\s*/\s*(?:think|thought|reasoning)\s*>|$)",
+    )
+    .expect("valid reasoning regex")
+});
+
+fn strip_edge_silence_punctuation(text: &str) -> &str {
+    let trimmed = text.trim();
+    let start = trimmed
+        .char_indices()
+        .find(|&(_, c)| !c.is_ascii_punctuation() || c == '[' || c == ']')
+        .map(|(idx, _)| idx)
+        .unwrap_or(trimmed.len());
+    let end = trimmed
+        .char_indices()
+        .rfind(|&(_, c)| !c.is_ascii_punctuation() || c == '[' || c == ']')
+        .map(|(idx, c)| idx + c.len_utf8())
+        .unwrap_or(0);
+    if start >= end {
+        ""
+    } else {
+        &trimmed[start..end]
+    }
+}
+
+/// Returns `true` if `text` is an intentional silence response sentinel or anti-loop narration token.
+pub fn is_silence_response(text: &str) -> bool {
+    let stripped = text.trim();
+    if stripped.is_empty() {
+        return true;
+    }
+    if stripped.chars().count() > 64 {
+        return false;
+    }
+
+    let normalized: String = stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase();
+    if SILENCE_SENTINELS.contains(&normalized.as_str()) {
+        return true;
+    }
+
+    let edge_stripped = strip_edge_silence_punctuation(stripped);
+    if !edge_stripped.is_empty() {
+        let normalized_edge: String = edge_stripped
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
+        if SILENCE_SENTINELS.contains(&normalized_edge.as_str()) {
+            return true;
+        }
+    }
+
+    SILENCE_NARRATION_RE.is_match(stripped)
+}
+
+/// Returns `true` if `text` is an explicit silence token (not just empty text).
+pub fn is_explicit_silence(text: &str) -> bool {
+    let stripped = text.trim();
+    if stripped.is_empty() {
+        return false;
+    }
+    is_silence_response(stripped)
+}
+
+/// Scrubs reasoning tags (<think>...</think>, <thought>...</thought>, <reasoning>...</reasoning>)
+/// from model outputs.
+pub fn filter_reasoning(text: &str) -> String {
+    let replaced = REASONING_TAGS_RE.replace_all(text, "");
+    replaced.trim().to_string()
+}
+
 pub fn format_inlined_text(filename: &str, content: &str) -> String {
     format!("\n\n[Content of {filename}]:\n\n{content}")
 }
@@ -102,14 +187,17 @@ pub fn render_user_prompt(event: &InboundEvent) -> String {
         .attachments
         .iter()
         .map(|attachment| {
-            let is_voice = attachment.filename.ends_with(".ogg")
-                || attachment.filename.ends_with(".opus")
-                || attachment.filename.contains("voice-message")
+            let is_voice = attachment.filename.contains("voice-message")
                 || attachment.filename.contains("voice_message")
+                || attachment.filename.contains("voice-note")
+                || attachment.filename.contains("voice_note")
+                || attachment.filename.ends_with(".voice.ogg")
+                || attachment.filename.ends_with(".voice.opus")
                 || attachment.content_type.as_deref().is_some_and(|ct| {
-                    ct.starts_with("audio/ogg")
-                        || ct.starts_with("audio/opus")
-                        || ct.contains("voice")
+                    let ct_lower = ct.to_ascii_lowercase();
+                    ct_lower.contains("voice")
+                        || ct_lower.starts_with("audio/ogg; codecs=opus")
+                        || ct_lower.starts_with("audio/opus; voice=true")
                 });
             let label = if is_voice {
                 "Voice message"
@@ -168,8 +256,33 @@ impl InboundEvent {
         self
     }
 
+    pub fn with_received_at(mut self, received_at: DateTime<Utc>) -> Self {
+        self.received_at = received_at;
+        self
+    }
+
     pub fn with_delivery_id(mut self, delivery_id: impl Into<String>) -> Self {
         self.delivery_id = Some(delivery_id.into());
+        self
+    }
+
+    /// Returns the parent channel/chat ID if this event is inside a thread.
+    pub fn parent_chat_id(&self) -> Option<&str> {
+        if self.session.thread_id.is_some() {
+            Some(&self.session.channel_id)
+        } else {
+            None
+        }
+    }
+
+    /// Alias for `parent_chat_id` matching channel terminology.
+    pub fn parent_channel_id(&self) -> Option<&str> {
+        self.parent_chat_id()
+    }
+
+    /// Sets the parent chat/channel ID on this event's session.
+    pub fn with_parent_chat_id(mut self, parent_chat_id: impl Into<String>) -> Self {
+        self.session.channel_id = parent_chat_id.into();
         self
     }
 }
@@ -180,6 +293,8 @@ pub struct StreamChunk {
     pub sequence: u64,
     pub content: String,
     pub is_final: bool,
+    #[serde(default)]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +449,7 @@ mod tests {
                 sequence: 2,
                 content: "partial response".into(),
                 is_final: false,
+                reply_to: None,
             },
         };
 

@@ -1,0 +1,12 @@
+[
+  "cargo test --test test_omo_backend failed_first_turn_keeps_durable_binding -- --exact --nocapture",
+  "cargo test --test test_omo_backend missing_rollout_fails_with_continuity_error -- --exact --nocapture",
+  "cargo test --test test_omo_backend persistence_failure_prevents_turn_submission -- --exact --nocapture",
+  "cargo test --test test_omo_backend test_omo_backend_replaces_stale_cached_thread -- --exact --nocapture",
+  "cargo test --lib test_persist_session_binding -- --nocapture",
+  "cargo test --test test_multiplexer -- --nocapture",
+  "cargo test --test test_omo_backend -- --nocapture",
+  "cargo build",
+  "git diff --check src/agent/omo_backend.rs src/multiplexer/actor.rs src/storage/db.rs tests/test_omo_backend.rs",
+  "rustfmt --check --edition 2021 src/agent/omo_backend.rs src/multiplexer/actor.rs src/storage/db.rs tests/test_omo_backend.rs"
+]

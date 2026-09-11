@@ -1,0 +1,53 @@
+    Blocking waiting for file lock on build directory
+    Checking omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+error: you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`
+   --> src/agent/omo_backend.rs:595:25
+    |
+595 | /                         match item.get("type").and_then(Value::as_str) {
+596 | |                             Some("agentMessage") => {
+597 | |                                 if let Some(text) = item.get("text").and_then(Value::as_str) {
+598 | |                                     full_content.clear();
+...   |
+602 | |                             _ => {}
+603 | |                         }
+    | |_________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.92.0/index.html#single_match
+    = note: `-D clippy::single-match` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::single_match)]`
+help: try
+    |
+595 ~                         if let Some("agentMessage") = item.get("type").and_then(Value::as_str) {
+596 +                             if let Some(text) = item.get("text").and_then(Value::as_str) {
+597 +                                 full_content.clear();
+598 +                                 full_content.push_str(text);
+599 +                             }
+600 +                         }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/agent/omo_backend.rs:827:25
+    |
+827 | /                         if frame_turn == Some(&active.turn_id) || frame_turn.is_none() {
+828 | |                             if status == Some("interrupted")
+829 | |                                 || status == Some("completed")
+830 | |                                 || status == Some("failed")
+...   |
+834 | |                         }
+    | |_________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.92.0/index.html#collapsible_if
+    = note: `-D clippy::collapsible-if` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+    |
+827 ~                         if (frame_turn == Some(&active.turn_id) || frame_turn.is_none()) {
+828 ~                             && (status == Some("interrupted")
+829 |                                 || status == Some("completed")
+830 ~                                 || status == Some("failed"))
+831 |                             {
+832 |                                 return Ok(());
+833 ~                             }
+    |
+
+error: could not compile `omo-gateway` (lib) due to 2 previous errors

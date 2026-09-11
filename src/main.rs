@@ -1,7 +1,7 @@
 // allow: SIZE_OK — main gateway application orchestration and integration tests
 use std::collections::HashMap;
 use std::env;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,20 +9,19 @@ use clap::{Parser, Subcommand};
 use omon_gateway::migrate::MigrateArgs;
 use omon_gateway::storage::init_pool;
 use omon_gateway::{
-    augmented_path_from_environment, cron_runs_retention_days_from_environment,
-    cron_script_timeout_secs_from, format_context_from_block, parse_context_from_ids,
-    parse_profile_routes, parse_wake_gate, prune_terminal_cron_runs, resolve_cron_script_timeout,
-    resolve_predecessor_output, truncate_context_output, validate_agent_backend_env,
-    AgentBackend, ApprovalPolicy, AttachmentDownloader, CronJob,
-    CronScheduler, CronTaskExecutor, CronTool, DeliveryLedgerService, DiscordAdapter,
-    DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob, HermesStoreSynchronizer,
-    InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool, MultiplexerConfig, OmoBackend,
-    OmoBackendConfig, OmoDaemonSupervisor, OmonError, OutboundAction, OutboundDispatcher,
-    PoiseData, ProfileRoute, ProfileRouter, RestartLoopGuard, Result, ScaleToZero, SessionContext,
-    SessionKey, SessionMultiplexer, SmartApprovalGuard, TerminalTool, ToolRegistry,
-    MAX_CONTEXT_CHARS,
+    authorized_cron_roots, canonical_authorized_directory,
+    cron_runs_retention_days_from_environment, cron_script_timeout_secs_from, parse_profile_routes,
+    prune_terminal_cron_runs, validate_agent_backend_env, AgentBackend, AgentCronExecutor,
+    ApprovalPolicy, AttachmentDownloader, CronScheduler, CronTool, DeadTargetRegistry,
+    DiscordAdapter, DiscordApprovalRequester, DiscordEgress, FileTool, HermesJob,
+    HermesStoreSynchronizer, InboundEvent, LlmClient, LlmConfig, LlmProvider, McpTool,
+    MultiplexerConfig, OmoBackend, OmoBackendConfig, OmoDaemonSupervisor, OmonError,
+    OpenAiSpeechToText, OutboundAction, OutboundDispatcher, PoiseData, ProfileRoute, ProfileRouter,
+    RestartLoopGuard, Result, ScaleToZero, SessionContext, SessionKey, SessionMultiplexer,
+    SmartApprovalGuard, TerminalTool, ToolRegistry,
 };
-use serde_json::json;
+#[allow(unused_imports)]
+pub use omon_gateway::{load_cron_skills, resolve_skill_bundle, resolve_workspace_instructions};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -81,6 +80,7 @@ pub(crate) struct Config {
     allow_bots: omon_gateway::AllowBotsMode,
     channel_topic_context: bool,
     discord_missed_backfill: bool,
+    destructive_slash_confirm: bool,
 }
 
 impl Config {
@@ -184,7 +184,7 @@ impl Config {
             discord_bot_tokens: tokens,
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://omon_gateway.db".to_owned()),
-            default_model: required_env("DEFAULT_MODEL")?,
+            default_model: Self::resolve_default_model(),
             openai_api_base: optional_env("OPENAI_API_BASE"),
             openai_api_key: optional_env("OPENAI_API_KEY"),
             anthropic_base_url: optional_env("ANTHROPIC_BASE_URL"),
@@ -249,7 +249,17 @@ impl Config {
                 optional_env("DISCORD_MISSED_BACKFILL").as_deref(),
                 false,
             ),
+            destructive_slash_confirm: parse_bool_from(
+                optional_env("APPROVALS_DESTRUCTIVE_SLASH_CONFIRM").as_deref(),
+                true,
+            ),
         })
+    }
+
+    pub(crate) fn resolve_default_model() -> String {
+        optional_env("OMON_DEFAULT_MODEL")
+            .or_else(|| optional_env("DEFAULT_MODEL"))
+            .unwrap_or_else(|| "gpt-4o".to_string())
     }
 
     fn llm_config(&self, model: impl Into<String>) -> LlmConfig {
@@ -296,73 +306,35 @@ impl OutboundDispatcher for SharedDispatcher {
     }
 }
 
-/// Startup recovery sweep: finds undelivered obligations from previous dead processes,
-/// claims them, and re-dispatches them to the platform (tagging recovered deliveries).
-pub async fn recover_pending_delivery_obligations(
-    pool: &SqlitePool,
-    dispatcher: Arc<dyn OutboundDispatcher>,
-) -> Result<usize> {
-    let ledger = DeliveryLedgerService::new(pool.clone());
-    let recoverable = ledger.sweep_recoverable(3, 86400).await?;
-    let count = recoverable.len();
-    for obligation in recoverable {
-        let session_key: SessionKey = if let Ok(Some((platform, guild_id, channel_id, thread_id, user_id))) =
-            sqlx::query_as::<_, (String, Option<String>, String, Option<String>, String)>(
-                "SELECT platform, guild_id, channel_id, thread_id, user_id FROM sessions WHERE session_key = ?",
-            )
-            .bind(&obligation.session_key)
-            .fetch_optional(pool)
-            .await
-        {
-            SessionKey::new(platform, guild_id, channel_id, thread_id, user_id)
-        } else {
-            SessionKey::new(
-                "discord",
-                None::<String>,
-                &obligation.channel_id,
-                obligation.thread_id.as_deref(),
-                "recovered-delivery",
-            )
-        };
+pub use omon_gateway::ledger::recover_pending_delivery_obligations;
 
-        let content = if obligation.state == "pending" {
-            obligation.content.clone()
-        } else {
-            format!(
-                "{}{}",
-                omon_gateway::ledger::RECOVERED_REPLY_MARKER,
-                obligation.content
-            )
-        };
+#[derive(Clone, Debug, Default)]
+pub struct StartupAuthorization {
+    pub allowed_users: Vec<u64>,
+    pub allow_all_users: bool,
+    pub allowed_channels: Vec<u64>,
+    pub ignored_channels: Vec<u64>,
+}
 
-        let stream_id = Uuid::new_v4();
-        let chunk = omon_gateway::StreamChunk {
-            stream_id,
-            sequence: 0,
-            content,
-            is_final: true,
-        };
+impl StartupAuthorization {
+    pub fn is_authorized(&self, session_key: &SessionKey) -> bool {
+        self.is_authorized_actor(session_key, Some(&session_key.user_id))
+    }
 
-        let _ = ledger.mark_obligation_attempting(&obligation.id).await;
-        let result = dispatcher
-            .dispatch(OutboundAction::Stream {
-                session: session_key,
-                chunk,
-            })
-            .await;
-
-        match result {
-            Ok(_) => {
-                let _ = ledger.mark_obligation_delivered(&obligation.id).await;
+    fn is_authorized_actor(&self, session_key: &SessionKey, actor: Option<&str>) -> bool {
+        if let Ok(channel_id) = session_key.channel_id.parse::<u64>() {
+            if !self.ignored_channels.is_empty() && self.ignored_channels.contains(&channel_id) {
+                return false;
             }
-            Err(error) => {
-                let _ = ledger
-                    .mark_obligation_failed(&obligation.id, &error.to_string())
-                    .await;
+            if !self.allowed_channels.is_empty() && !self.allowed_channels.contains(&channel_id) {
+                return false;
             }
         }
+        self.allow_all_users
+            || actor
+                .and_then(|id| id.parse::<u64>().ok())
+                .is_some_and(|id| self.allowed_users.contains(&id))
     }
-    Ok(count)
 }
 
 /// Startup recovery: finds sessions marked resume_pending from a previous run/crash/restart,
@@ -371,17 +343,88 @@ pub async fn recover_resume_pending_sessions(
     pool: &SqlitePool,
     multiplexer: &SessionMultiplexer,
 ) -> Result<usize> {
+    recover_resume_pending_sessions_with_auth(pool, multiplexer, None).await
+}
+
+// Only an exact platform message fetched by the Discord REST provider supplies
+// trusted shared-lane author provenance. Transcript/inbound-event search entries
+// derive author_id from historical session state and must not authorize recovery.
+async fn pending_recovery_actor(
+    pool: &SqlitePool,
+    key: &SessionKey,
+    unfinished: &omon_gateway::storage::UnfinishedTurn,
+) -> Result<Option<String>> {
+    if key.platform == "discord" {
+        if let Some(message_id) = unfinished.platform_message_id.as_deref() {
+            let author: Option<String> = sqlx::query_scalar(
+                "SELECT author_id FROM message_search_documents
+                 WHERE platform = 'discord' AND guild_id IS ? AND channel_id = ?
+                   AND message_id = ? AND CASE WHEN json_valid(metadata_json)
+                       THEN json_extract(metadata_json, '$.source') END = 'discord_rest'",
+            )
+            .bind(&key.guild_id)
+            .bind(key.thread_id.as_deref().unwrap_or(&key.channel_id))
+            .bind(message_id)
+            .fetch_optional(pool)
+            .await?;
+            // Even an empty/invalid REST author prevents a stale legacy fallback.
+            if author.is_some() {
+                return Ok(author);
+            }
+        }
+    }
+    if key.guild_id.is_none() {
+        return Ok(Some(key.user_id.clone()));
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT p.author_id FROM legacy_guild_pending_auth p
+         JOIN messages m ON m.id = p.message_id AND m.sequence = p.message_sequence
+         WHERE m.id = ? AND m.session_key = ? AND p.canonical_key = m.session_key
+           AND m.role = 'user'",
+    )
+    .bind(&unfinished.message_id)
+    .bind(key.storage_key())
+    .fetch_optional(pool)
+    .await?)
+}
+
+// Deferred/unknown actors must not consume the global restart-loop budget merely
+// because their durable pending markers are intentionally retained.
+async fn count_authorized_pending_recoveries(
+    pool: &SqlitePool,
+    auth: &StartupAuthorization,
+) -> Result<usize> {
+    let mut count = 0;
+    for key in omon_gateway::storage::fetch_resume_pending_session_keys(pool).await? {
+        if omon_gateway::storage::is_session_suspended(pool, &key.storage_key()).await? {
+            continue;
+        }
+        if let Some(unfinished) =
+            omon_gateway::storage::find_last_unfinished_user_turn(pool, &key.storage_key()).await?
+        {
+            let actor = pending_recovery_actor(pool, &key, &unfinished).await?;
+            if auth.is_authorized_actor(&key, actor.as_deref()) {
+                count += 1;
+            } else {
+                warn!(session = %key, actor = ?actor, "deferring pending recovery: current actor unknown or unauthorized; marker retained");
+            }
+        }
+    }
+    Ok(count)
+}
+
+pub async fn recover_resume_pending_sessions_with_auth(
+    pool: &SqlitePool,
+    multiplexer: &SessionMultiplexer,
+    auth: Option<&StartupAuthorization>,
+) -> Result<usize> {
     let pending_keys = omon_gateway::storage::fetch_resume_pending_session_keys(pool).await?;
     let mut resumed_count = 0;
     for session_key in pending_keys {
         let storage_key = session_key.storage_key();
         let is_suspended = omon_gateway::storage::is_session_suspended(pool, &storage_key).await?;
-        let cleared =
-            omon_gateway::storage::clear_session_resume_pending(pool, &storage_key).await?;
-        if !cleared {
-            continue;
-        }
         if is_suspended {
+            omon_gateway::storage::clear_session_resume_pending(pool, &storage_key).await?;
             info!(
                 session = %session_key,
                 "skipping restart recovery for suspended session"
@@ -392,6 +435,21 @@ pub async fn recover_resume_pending_sessions(
         if let Some(unfinished) =
             omon_gateway::storage::find_last_unfinished_user_turn(pool, &storage_key).await?
         {
+            if let Some(auth) = auth {
+                let actor = pending_recovery_actor(pool, &session_key, &unfinished).await?;
+                if !auth.is_authorized_actor(&session_key, actor.as_deref()) {
+                    warn!(
+                        session = %session_key, actor = ?actor,
+                        "deferring pending recovery: current actor unknown or unauthorized; marker retained"
+                    );
+                    continue;
+                }
+            }
+            let cleared =
+                omon_gateway::storage::clear_session_resume_pending(pool, &storage_key).await?;
+            if !cleared {
+                continue;
+            }
             let attachments: Vec<omon_gateway::MessageAttachment> =
                 serde_json::from_str(&unfinished.metadata_json).unwrap_or_default();
             let event = InboundEvent {
@@ -416,6 +474,8 @@ pub async fn recover_resume_pending_sessions(
             } else {
                 resumed_count += 1;
             }
+        } else {
+            omon_gateway::storage::clear_session_resume_pending(pool, &storage_key).await?;
         }
     }
     Ok(resumed_count)
@@ -450,496 +510,6 @@ async fn ensure_agent_session(pool: &SqlitePool, session: &SessionContext) -> Re
     .execute(pool)
     .await?;
     Ok(())
-}
-
-pub(crate) struct AgentCronExecutor {
-    pub(crate) backend: Arc<dyn AgentBackend>,
-    pub(crate) workspace_root: PathBuf,
-    pub(crate) pool: SqlitePool,
-    pub(crate) cron_script_timeout_secs: u64,
-}
-
-#[async_trait]
-impl CronTaskExecutor for AgentCronExecutor {
-    async fn execute(&self, job: &CronJob) -> Result<Option<String>> {
-        let payload = job.payload()?;
-        if payload.get("schedule").is_none() {
-            return execute_native_cron(
-                &self.backend,
-                &self.workspace_root,
-                job,
-                &payload,
-                self.cron_script_timeout_secs,
-            )
-            .await;
-        }
-        let hermes: HermesJob = serde_json::from_value(payload).map_err(|error| {
-            OmonError::Config(format!("invalid Hermes job {}: {error}", job.id))
-        })?;
-        let script_output = if let Some(script) = hermes.script.as_deref() {
-            Some(
-                run_cron_script(
-                    &hermes,
-                    script,
-                    &self.workspace_root,
-                    self.cron_script_timeout_secs,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        if hermes.no_agent {
-            return Ok(script_output.filter(|output| !output.trim().is_empty()));
-        }
-        if let Some(output) = script_output.as_deref() {
-            if !parse_wake_gate(output) {
-                tracing::info!(job_id = %hermes.id, "wakeAgent:false detected in script output, skipping agent execution");
-                return Ok(None);
-            }
-        }
-        if hermes.prompt.trim().is_empty() && script_output.is_none() {
-            return Err(OmonError::Config(format!(
-                "Hermes job {} has neither prompt nor executable script",
-                hermes.id
-            )));
-        }
-        let cron_hint = "[IMPORTANT: You are running as a scheduled cron job. DELIVERY: Your final response will be automatically delivered to the user — do NOT use send_message or try to deliver the output yourself. Just produce your report/output as your final response and the system handles the rest. SILENT: If there is genuinely nothing new to report, respond with exactly \"[SILENT]\" (nothing else) to suppress delivery. Never combine [SILENT] with content — either report your findings normally, or say [SILENT] and nothing more.]\n\n";
-        let mut prompt = cron_hint.to_string();
-
-        let workdir = if let Some(custom_workdir) = hermes.workdir.as_ref() {
-            let roots = authorized_cron_roots(&hermes, &self.workspace_root).ok();
-            if let Some(roots) = roots {
-                canonical_authorized_directory(custom_workdir, &roots, "Hermes workdir")
-                    .unwrap_or_else(|_| self.workspace_root.clone())
-            } else {
-                self.workspace_root.clone()
-            }
-        } else {
-            self.workspace_root.clone()
-        };
-
-        if let Some(instructions) = resolve_workspace_instructions(&workdir) {
-            prompt.push_str(&instructions);
-            prompt.push_str("\n\n");
-        }
-
-        let context_ids = parse_context_from_ids(hermes.context_from.as_ref());
-        if !context_ids.is_empty() {
-            let home_path = hermes_home(&hermes).ok();
-            for source_id in &context_ids {
-                if let Some(output) =
-                    resolve_predecessor_output(&self.pool, home_path.as_deref(), source_id).await
-                {
-                    if !output.trim().is_empty() {
-                        let truncated = truncate_context_output(output.trim(), MAX_CONTEXT_CHARS);
-                        prompt.push_str(&format_context_from_block(source_id, &truncated));
-                        prompt.push_str("\n\n");
-                    }
-                }
-            }
-        }
-
-        let skills = load_cron_skills(&hermes)?;
-        if !skills.is_empty() {
-            prompt.push_str(&skills);
-            if !hermes.prompt.trim().is_empty() {
-                prompt.push_str("\n\n[Task]\n");
-            }
-        }
-        prompt.push_str(&hermes.prompt);
-        if let Some(output) = script_output.filter(|output| !output.trim().is_empty()) {
-            prompt.push_str("\n\n[Script output]\n");
-            prompt.push_str(&output);
-        }
-        let destination = hermes.discord_destination()?;
-        let session_key = destination
-            .as_ref()
-            .map(|target| {
-                SessionKey::new(
-                    "discord",
-                    None::<String>,
-                    target.chat_id.clone(),
-                    target.thread_id.clone(),
-                    target
-                        .user_id
-                        .clone()
-                        .unwrap_or_else(|| format!("cron:{}", hermes.id)),
-                )
-            })
-            .unwrap_or_else(|| {
-                SessionKey::new(
-                    "local",
-                    None::<String>,
-                    hermes.id.clone(),
-                    None::<String>,
-                    format!("cron:{}", hermes.id),
-                )
-            });
-        let mut session = SessionContext::new(session_key.clone());
-        session.state.active_model = hermes.model.clone();
-        session
-            .state
-            .metadata
-            .insert("hermes_cron_job_id".into(), json!(hermes.id));
-        // The scheduler delivers the returned response exactly once.
-        session
-            .state
-            .metadata
-            .insert("cron_scheduler_delivery".into(), json!(true));
-        if let Some(ack_command) = hermes
-            .ack_command
-            .as_deref()
-            .filter(|command| !command.trim().is_empty())
-        {
-            session
-                .state
-                .metadata
-                .insert("cron_ack_command".into(), json!(ack_command));
-        }
-        let event = InboundEvent::message(session_key, format!("cron:{}", job.id), prompt);
-        // TODO(omo-only): Cron execution runs directly through AgentBackend (OMO appserver backend).
-        // Model selection is propagated via session.state.active_model.
-        self.backend.run(&mut session, event).await?;
-        Ok(None)
-    }
-}
-
-async fn execute_native_cron(
-    backend: &Arc<dyn AgentBackend>,
-    workspace_root: &Path,
-    job: &CronJob,
-    payload: &serde_json::Value,
-    global_timeout_secs: u64,
-) -> Result<Option<String>> {
-    let script_output = if let Some(script) =
-        payload.get("script").and_then(serde_json::Value::as_str)
-    {
-        let workspace = canonical_directory(workspace_root, "workspace root")?;
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg(script)
-            .current_dir(workspace)
-            .kill_on_drop(true);
-        let augmented_path = augmented_path_from_environment();
-        if !augmented_path.is_empty() {
-            command.env("PATH", augmented_path);
-        }
-        let job_timeout = payload
-            .get("timeout_secs")
-            .or_else(|| payload.get("timeout_seconds"))
-            .or_else(|| payload.get("timeout"))
-            .or_else(|| payload.get("script_timeout"))
-            .or_else(|| payload.get("script_timeout_seconds"))
-            .and_then(serde_json::Value::as_u64);
-        let timeout = resolve_cron_script_timeout(job_timeout, global_timeout_secs);
-        let output = tokio::time::timeout(timeout, command.output())
-            .await
-            .map_err(|_| OmonError::ToolExecution(format!("cron script timed out for {}", job.id)))?
-            .map_err(|error| {
-                OmonError::ToolExecution(format!("failed to execute cron script: {error}"))
-            })?;
-        if !output.status.success() {
-            return Err(OmonError::ToolExecution(format!(
-                "cron script failed with {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        None
-    };
-    if let Some(output) = script_output.as_deref() {
-        if !parse_wake_gate(output) {
-            tracing::info!(job_id = %job.id, "wakeAgent:false detected in script output, skipping agent execution");
-            return Ok(None);
-        }
-    }
-    let prompt = payload
-        .get("prompt")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if prompt.is_empty() {
-        return Ok(script_output.filter(|output| !output.trim().is_empty()));
-    }
-    let mut task = prompt.to_owned();
-    if let Some(output) = script_output.filter(|output| !output.trim().is_empty()) {
-        task.push_str("\n\n[Script output]\n");
-        task.push_str(&output);
-    }
-    let channel = payload
-        .get("deliver")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| value.strip_prefix("discord:"));
-    let session_key = SessionKey::new(
-        if channel.is_some() {
-            "discord"
-        } else {
-            "local"
-        },
-        None::<String>,
-        channel.unwrap_or(&job.id),
-        None::<String>,
-        format!("cron:{}", job.id),
-    );
-    let mut session = SessionContext::new(session_key.clone());
-    // The scheduler delivers the returned response exactly once.
-    session
-        .state
-        .metadata
-        .insert("cron_scheduler_delivery".into(), json!(true));
-    if let Some(ack_command) = payload
-        .get("ack_command")
-        .and_then(serde_json::Value::as_str)
-        .filter(|command| !command.trim().is_empty())
-    {
-        session
-            .state
-            .metadata
-            .insert("cron_ack_command".into(), json!(ack_command));
-    }
-    let event = InboundEvent::message(session_key, format!("cron:{}", job.id), task);
-    backend.run(&mut session, event).await?;
-    Ok(None)
-}
-
-fn load_cron_skills(job: &HermesJob) -> Result<String> {
-    let mut names = job.skills.clone();
-    if let Some(skill) = job.skill.as_ref().filter(|skill| !names.contains(skill)) {
-        names.push(skill.clone());
-    }
-    if names.is_empty() {
-        return Ok(String::new());
-    }
-    let Ok(home) = hermes_home(job) else {
-        if job.prompt.trim().is_empty() {
-            return Err(OmonError::Config(format!(
-                "Hermes job {} has an empty prompt and all skills are missing: {}",
-                job.id,
-                names.join(", ")
-            )));
-        }
-        return Ok(format!(
-            "⚠️ Skill(s) not found and skipped: {}",
-            names.join(", ")
-        ));
-    };
-    let Ok(root) = canonical_directory(&home.join("skills"), "Hermes skills root") else {
-        if job.prompt.trim().is_empty() {
-            return Err(OmonError::Config(format!(
-                "Hermes job {} has an empty prompt and all skills are missing: {}",
-                job.id,
-                names.join(", ")
-            )));
-        }
-        return Ok(format!(
-            "⚠️ Skill(s) not found and skipped: {}",
-            names.join(", ")
-        ));
-    };
-
-    let mut expanded_names = Vec::new();
-    for name in names {
-        if let Some(members) = resolve_skill_bundle(&root, Some(&home), &name) {
-            for member in members {
-                if !expanded_names.contains(&member) {
-                    expanded_names.push(member);
-                }
-            }
-        } else if !expanded_names.contains(&name) {
-            expanded_names.push(name);
-        }
-    }
-
-    let mut assembled = String::new();
-    let mut skipped = Vec::new();
-    for name in expanded_names {
-        let path = match find_skill_file(&root, &name) {
-            Some(p) => p,
-            None => {
-                warn!(job_id = %job.id, skill = %name, "Cron job skill not found, skipping");
-                skipped.push(name);
-                continue;
-            }
-        };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(error) => {
-                warn!(job_id = %job.id, skill = %name, %error, "Failed to read cron skill file, skipping");
-                skipped.push(name);
-                continue;
-            }
-        };
-        if !assembled.is_empty() {
-            assembled.push_str("\n\n");
-        }
-        assembled.push_str(&format!("[Skill: {name}]\n{content}"));
-    }
-
-    if assembled.is_empty() && !skipped.is_empty() && job.prompt.trim().is_empty() {
-        return Err(OmonError::Config(format!(
-            "Hermes job {} has an empty prompt and all skills were missing: {}",
-            job.id,
-            skipped.join(", ")
-        )));
-    }
-
-    if !skipped.is_empty() {
-        let warning = format!("⚠️ Skill(s) not found and skipped: {}", skipped.join(", "));
-        if !assembled.is_empty() {
-            Ok(format!("{warning}\n\n{assembled}"))
-        } else {
-            Ok(warning)
-        }
-    } else {
-        Ok(assembled)
-    }
-}
-
-fn resolve_skill_bundle(
-    skills_root: &Path,
-    hermes_home: Option<&Path>,
-    name: &str,
-) -> Option<Vec<String>> {
-    if Path::new(name).components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return None;
-    }
-
-    fn parse_bundle_manifest(content: &str) -> Option<Vec<String>> {
-        #[derive(serde::Deserialize)]
-        struct Manifest {
-            #[serde(default)]
-            skills: Vec<String>,
-        }
-        if let Ok(m) = serde_yaml::from_str::<Manifest>(content) {
-            if !m.skills.is_empty() {
-                return Some(m.skills);
-            }
-        }
-        if let Ok(m) = serde_json::from_str::<Manifest>(content) {
-            if !m.skills.is_empty() {
-                return Some(m.skills);
-            }
-        }
-        None
-    }
-
-    // 1. Check <hermes_home>/skill-bundles/<name>.yaml / .yml / .json
-    if let Some(home) = hermes_home {
-        let bundles_dir = home.join("skill-bundles");
-        for ext in &["yaml", "yml", "json"] {
-            let path = bundles_dir.join(format!("{name}.{ext}"));
-            if path.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Some(skills) = parse_bundle_manifest(&content) {
-                        return Some(skills);
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Check <skills_root>/<name>.yaml / .yml / .json
-    for ext in &["yaml", "yml", "json"] {
-        let path = skills_root.join(format!("{name}.{ext}"));
-        if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Some(skills) = parse_bundle_manifest(&content) {
-                    return Some(skills);
-                }
-            }
-        }
-    }
-
-    // 3. Check <skills_root>/<name>/bundle.yaml / .yml / .json / manifest.yaml ...
-    let dir = skills_root.join(name);
-    if dir.is_dir() {
-        for filename in &[
-            "bundle.yaml",
-            "bundle.yml",
-            "bundle.json",
-            "manifest.yaml",
-            "manifest.yml",
-            "manifest.json",
-        ] {
-            let path = dir.join(filename);
-            if path.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Some(skills) = parse_bundle_manifest(&content) {
-                        return Some(skills);
-                    }
-                }
-            }
-        }
-
-        // 4. Directory containing multiple member skills (subdirectories with SKILL.md),
-        // provided the directory itself does not have a direct SKILL.md.
-        if !dir.join("SKILL.md").exists() {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                let mut members = Vec::new();
-                for entry in entries.flatten() {
-                    let sub_path = entry.path();
-                    if sub_path.is_dir() && sub_path.join("SKILL.md").is_file() {
-                        if let Some(file_name) = sub_path.file_name().and_then(|n| n.to_str()) {
-                            members.push(format!("{name}/{file_name}"));
-                        }
-                    }
-                }
-                if !members.is_empty() {
-                    members.sort();
-                    return Some(members);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn find_skill_file(root: &Path, name: &str) -> Option<PathBuf> {
-    if Path::new(name).components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return None;
-    }
-    let direct = root.join(name).join("SKILL.md");
-    if let Ok(candidate) = std::fs::canonicalize(&direct) {
-        if candidate.starts_with(root) && candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    let mut pending = vec![root.to_owned()];
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(directory).ok()?.flatten() {
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).ok()?;
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            if metadata.is_dir() {
-                if path.file_name().is_some_and(|value| value == name) {
-                    let candidate = path.join("SKILL.md");
-                    if let Ok(candidate) = std::fs::canonicalize(candidate) {
-                        if candidate.starts_with(root) && candidate.is_file() {
-                            return Some(candidate);
-                        }
-                    }
-                }
-                pending.push(path);
-            }
-        }
-    }
-    None
 }
 
 fn build_cron_tools(
@@ -996,155 +566,6 @@ pub fn build_cron_llm_config(
     config
 }
 
-pub fn resolve_workspace_instructions(workdir: &Path) -> Option<String> {
-    const MAX_WORKSPACE_INSTRUCTION_CHARS: usize = 8000;
-    for filename in &["AGENTS.md", "agents.md", "CLAUDE.md", "claude.md"] {
-        let candidate = workdir.join(filename);
-        if candidate.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&candidate) {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    let truncated: String =
-                        if trimmed.chars().count() > MAX_WORKSPACE_INSTRUCTION_CHARS {
-                            trimmed
-                                .chars()
-                                .take(MAX_WORKSPACE_INSTRUCTION_CHARS)
-                                .collect()
-                        } else {
-                            trimmed.to_string()
-                        };
-                    return Some(format!("[Workspace instructions]\n{truncated}"));
-                }
-            }
-        }
-    }
-    None
-}
-
-async fn run_cron_script(
-    job: &HermesJob,
-    script: &str,
-    workspace_root: &Path,
-    global_timeout_secs: u64,
-) -> Result<String> {
-    let home = hermes_home(job)?;
-    let scripts_root = canonical_directory(&home.join("scripts"), "Hermes scripts root")?;
-    let candidate = Path::new(script);
-    if candidate.is_absolute()
-        || candidate.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(OmonError::Config(format!(
-            "Hermes job {} script path escapes its scripts root: {script}",
-            job.id
-        )));
-    }
-    let path = std::fs::canonicalize(scripts_root.join(candidate)).map_err(|error| {
-        OmonError::Config(format!(
-            "failed to resolve Hermes script for {}: {error}",
-            job.id
-        ))
-    })?;
-    if !path.starts_with(&scripts_root) || !path.is_file() {
-        return Err(OmonError::Config(format!(
-            "Hermes job {} script escapes its scripts root: {}",
-            job.id,
-            path.display()
-        )));
-    }
-
-    let roots = authorized_cron_roots(job, workspace_root)?;
-    let workdir = match job.workdir.as_ref() {
-        Some(workdir) => canonical_authorized_directory(workdir, &roots, "Hermes workdir")?,
-        None => home,
-    };
-    let mut command = if matches!(
-        path.extension().and_then(|value| value.to_str()),
-        Some("sh" | "bash")
-    ) {
-        let mut command = tokio::process::Command::new("bash");
-        command.arg(&path);
-        command
-    } else {
-        let mut command = tokio::process::Command::new("python3");
-        command.arg(&path);
-        command
-    };
-    let augmented_path = augmented_path_from_environment();
-    if !augmented_path.is_empty() {
-        command.env("PATH", augmented_path);
-    }
-    let timeout = resolve_cron_script_timeout(job.timeout_secs, global_timeout_secs);
-    let output = tokio::time::timeout(
-        timeout,
-        command.current_dir(workdir).kill_on_drop(true).output(),
-    )
-    .await
-    .map_err(|_| {
-        OmonError::ToolExecution(format!("Hermes cron script timed out: {}", path.display()))
-    })?
-    .map_err(|error| {
-        OmonError::ToolExecution(format!("failed to execute {}: {error}", path.display()))
-    })?;
-    if !output.status.success() {
-        return Err(OmonError::ToolExecution(format!(
-            "Hermes cron script {} failed with {:?}: {}",
-            path.display(),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn hermes_home(job: &HermesJob) -> Result<PathBuf> {
-    let home = job
-        .extra
-        .get("_omon_hermes_home")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| OmonError::Config(format!("Hermes job {} is missing its home", job.id)))?;
-    canonical_directory(&home, "Hermes home")
-}
-
-fn authorized_cron_roots(job: &HermesJob, workspace_root: &Path) -> Result<Vec<PathBuf>> {
-    let workspace_root = canonical_directory(workspace_root, "workspace root")?;
-    let home = hermes_home(job)?;
-    if home == workspace_root {
-        Ok(vec![workspace_root])
-    } else {
-        Ok(vec![workspace_root, home])
-    }
-}
-
-fn canonical_authorized_directory(path: &Path, roots: &[PathBuf], kind: &str) -> Result<PathBuf> {
-    let path = canonical_directory(path, kind)?;
-    if roots.iter().any(|root| path.starts_with(root)) {
-        Ok(path)
-    } else {
-        Err(OmonError::Config(format!(
-            "{kind} is outside authorized workspace/Hermes roots: {}",
-            path.display()
-        )))
-    }
-}
-
-fn canonical_directory(path: &Path, kind: &str) -> Result<PathBuf> {
-    let path = std::fs::canonicalize(path)
-        .map_err(|error| OmonError::Config(format!("failed to resolve {kind}: {error}")))?;
-    if !path.is_dir() {
-        return Err(OmonError::Config(format!(
-            "{kind} is not a directory: {}",
-            path.display()
-        )));
-    }
-    Ok(path)
-}
-
 fn hermes_skill_dirs(hermes_root: &Path, home: &Path) -> Vec<PathBuf> {
     vec![
         hermes_root.join("skills"),
@@ -1178,6 +599,8 @@ async fn run_gateway() -> Result<()> {
         loaded_allowlist,
         "loaded persisted approval allowlist entries"
     );
+    let loaded_yolo = approval_guard.load_persisted_yolo().await?;
+    info!(loaded_yolo, "loaded persisted yolo sessions");
     let approval_requester = Arc::new(DiscordApprovalRequester::new(
         approval_guard.clone(),
         std::time::Duration::from_secs(config.approval_timeout_secs),
@@ -1219,7 +642,8 @@ async fn run_gateway() -> Result<()> {
             .with_authorized_roots(config.extra_tool_roots.clone()),
     );
     tools.register(McpTool::default());
-    tools.register(CronTool::new(pool.clone()));
+    let cron_tool = CronTool::new(pool.clone());
+    tools.register(cron_tool.clone());
     tools.register(omon_gateway::WebSearchTool);
     tools.register(omon_gateway::WebFetchTool);
     tools.register(omon_gateway::BrowserTool::default());
@@ -1245,8 +669,9 @@ async fn run_gateway() -> Result<()> {
         "Initializing agent backend: OMO app-server"
     );
     let shared_dispatcher = Arc::new(SharedDispatcher::default());
-    let omo_backend =
-        Arc::new(OmoBackend::new(omo_config, shared_dispatcher.clone()).with_pool(pool.clone()));
+    let omo_backend = Arc::new(
+        OmoBackend::new(omo_config.clone(), shared_dispatcher.clone()).with_pool(pool.clone()),
+    );
     let runner: Arc<dyn AgentBackend> = omo_backend.clone();
     let profile_router = ProfileRouter::new(config.profile_routes.clone());
     let multiplexer = SessionMultiplexer::with_profile_router(
@@ -1274,9 +699,19 @@ async fn run_gateway() -> Result<()> {
     }
     let default_bot_id = default_bot_id
         .ok_or_else(|| OmonError::Config("no Discord bot identities were configured".into()))?;
+    let dead_targets = Arc::new(
+        DeadTargetRegistry::new()
+            .with_pool(pool.clone())
+            .with_probe_interval(std::time::Duration::from_secs(60)),
+    );
+    dead_targets.load_from_db(&pool).await?;
     let discord_egress = Arc::new(
         DiscordEgress::with_bot_clients(default_bot_id.clone(), bot_http_clients)?
-            .with_approval_mentions(config.allowed_users.clone(), config.approval_mentions),
+            .with_dead_targets(dead_targets.clone())
+            .with_approval_mentions(config.allowed_users.clone(), config.approval_mentions)
+            .with_runtime_footer(config.runtime_footer)
+            .with_default_model(config.default_model.clone())
+            .with_workspace_root(config.workspace_root.clone()),
     );
     shared_dispatcher.set(discord_egress.clone()).await;
     approval_requester
@@ -1302,8 +737,13 @@ async fn run_gateway() -> Result<()> {
 
     let restart_guard_path = config.workspace_root.join("restart_loop.json");
     let restart_guard = RestartLoopGuard::new(restart_guard_path);
-    let pending_sessions_count =
-        omon_gateway::storage::count_resume_pending_sessions(&pool).await?;
+    let auth = StartupAuthorization {
+        allowed_users: config.allowed_users.clone(),
+        allow_all_users: config.allow_all_users,
+        allowed_channels: config.allowed_channels.clone(),
+        ignored_channels: config.ignored_channels.clone(),
+    };
+    let pending_sessions_count = count_authorized_pending_recoveries(&pool, &auth).await?;
     if pending_sessions_count > 0 {
         if restart_guard.check_and_record() {
             warn!(
@@ -1311,7 +751,8 @@ async fn run_gateway() -> Result<()> {
                 "Restart-loop breaker TRIPPED: skipping auto-resume of in-flight sessions to break crash loop"
             );
         } else {
-            let recovered_sessions = recover_resume_pending_sessions(&pool, &multiplexer).await?;
+            let recovered_sessions =
+                recover_resume_pending_sessions_with_auth(&pool, &multiplexer, Some(&auth)).await?;
             info!(
                 recovered_sessions,
                 "recovered resume_pending sessions on boot"
@@ -1319,16 +760,21 @@ async fn run_gateway() -> Result<()> {
         }
     }
 
-    // Cron runs on its own app-server instance: an agent thread executes one
-    // turn at a time, so a long digest turn on the interactive daemon would
-    // stall every Discord message behind it.
-    let cron_omo_config =
+    // Cron and interactive share one multiplexed daemon instance with distinct agent threads
+    let mut cron_omo_config =
         OmoBackendConfig::cron_from_env()?.with_workspace_root(config.workspace_root.clone());
-    let _cron_daemon_supervisor = OmoDaemonSupervisor::ensure(&cron_omo_config).await?;
+    cron_omo_config
+        .default_model
+        .get_or_insert_with(|| config.default_model.clone());
+    let _cron_daemon_supervisor = if cron_omo_config.appserver_url == omo_config.appserver_url {
+        None
+    } else {
+        OmoDaemonSupervisor::ensure(&cron_omo_config).await?
+    };
     info!(
         appserver_url = %cron_omo_config.appserver_url,
         total_timeout_secs = cron_omo_config.total_timeout.as_secs(),
-        "Initializing isolated cron agent backend: OMO app-server"
+        "Initializing cron agent backend: OMO app-server"
     );
     let cron_backend: Arc<dyn AgentBackend> = Arc::new(
         OmoBackend::new(cron_omo_config, shared_dispatcher.clone()).with_pool(pool.clone()),
@@ -1346,10 +792,14 @@ async fn run_gateway() -> Result<()> {
     )
     .with_hermes_sync(cron_sync);
     scheduler.start().await;
+    cron_tool.bind_scheduler(Arc::new(scheduler.clone()));
 
     let mut poise_data = PoiseData::new(multiplexer.clone(), pool.clone());
+    poise_data.approvals = approval_guard.clone();
     poise_data.pairing_store.init_cache().await?;
     poise_data.profile_router = profile_router;
+    poise_data.runtime_footer = config.runtime_footer;
+    poise_data.destructive_slash_confirm = config.destructive_slash_confirm;
     poise_data.missed_backfill = config.discord_missed_backfill;
     poise_data.llm = LlmClient::new(config.llm_config(config.default_model.clone())).ok();
     poise_data.tools = tool_names;
@@ -1370,7 +820,15 @@ async fn run_gateway() -> Result<()> {
     poise_data.processing_reactions = config.processing_reactions;
     poise_data.approval_mentions = config.approval_mentions;
     poise_data.approvals_deny = config.approvals_deny.clone();
-    poise_data.attachment_downloader = Some(AttachmentDownloader::new(&config.workspace_root)?);
+    let mut downloader = AttachmentDownloader::new(&config.workspace_root)?;
+    if let Some(api_key) = &config.openai_api_key {
+        let base_url = config
+            .openai_api_base
+            .as_deref()
+            .unwrap_or("https://api.openai.com/v1");
+        downloader = downloader.with_stt(Arc::new(OpenAiSpeechToText::new(api_key, base_url)));
+    }
+    poise_data.attachment_downloader = Some(downloader);
     poise_data.primary_bot_id = Some(default_bot_id.parse().map_err(|_| {
         OmonError::Config(format!(
             "invalid primary Discord bot identity {default_bot_id}"
@@ -1510,6 +968,655 @@ mod runner_tests {
         assert_eq!(cron_script_timeout_secs_from(Some("0")), 1800);
         assert_eq!(cron_script_timeout_secs_from(Some("-10")), 1800);
         assert_eq!(cron_script_timeout_secs_from(Some("invalid")), 1800);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cron_script_timeout_reaps_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("hermes");
+        let scripts_dir = home.join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+
+        let pid_file = temp.path().join("child.pid");
+        let script = format!(
+            "#!/bin/bash\nsleep 30 &\necho $! > {}\nwait\n",
+            pid_file.display()
+        );
+        fs::write(scripts_dir.join("leaker.sh"), script).unwrap();
+
+        let job_json = serde_json::json!({
+            "id": "leaker-job",
+            "name": "Leaker Job",
+            "prompt": "run",
+            "script": "leaker.sh",
+            "timeout_secs": 1,
+            "schedule": {"kind": "cron", "expr": "0 * * * *"},
+            "_omon_hermes_home": home.to_str().unwrap()
+        });
+
+        let hermes_job: HermesJob = serde_json::from_value(job_json).unwrap();
+        let res = omon_gateway::run_cron_script(&hermes_job, "leaker.sh", temp.path(), 1).await;
+        assert!(res.is_err(), "Script must timeout");
+
+        let pid_str = fs::read_to_string(&pid_file).unwrap_or_default();
+        let pid: i32 = pid_str.trim().parse().unwrap();
+
+        #[cfg(unix)]
+        {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let ret = unsafe { libc::kill(pid, 0) };
+            if ret == 0 {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert_ne!(
+                ret, 0,
+                "Descendant process {pid} must NOT be running after script timeout"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cron_monitor_unchanged_skips_agent() {
+        use omon_gateway::CronTaskExecutor;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("hermes");
+        let scripts_dir = home.join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+
+        let data_file = temp.path().join("data.txt");
+        fs::write(&data_file, "initial content").unwrap();
+
+        let monitor_script = format!("#!/bin/sh\ncat {}\n", data_file.display());
+        fs::write(scripts_dir.join("monitor.sh"), monitor_script).unwrap();
+
+        let job_json = serde_json::json!({
+            "id": "monitored-job",
+            "name": "Monitored Job",
+            "prompt": "analyze changes",
+            "monitor_script": "monitor.sh",
+            "schedule": {"kind": "cron", "expr": "0 * * * *"},
+            "_omon_hermes_home": home.to_str().unwrap()
+        });
+
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let hermes_job: HermesJob = serde_json::from_value(job_json).unwrap();
+        let run_count = Arc::new(std::sync::Mutex::new(0));
+
+        #[derive(Clone)]
+        struct MonitorTestBackend {
+            runs: Arc<std::sync::Mutex<usize>>,
+        }
+        #[async_trait::async_trait]
+        impl omon_gateway::AgentBackend for MonitorTestBackend {
+            async fn run(
+                &self,
+                _session: &mut omon_gateway::SessionContext,
+                _event: omon_gateway::InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                *self.runs.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+
+        let executor = omon_gateway::AgentCronExecutor {
+            backend: Arc::new(MonitorTestBackend {
+                runs: run_count.clone(),
+            }),
+            workspace_root: home.clone(),
+            pool: pool.clone(),
+            cron_script_timeout_secs: 10,
+        };
+
+        let cron_job = omon_gateway::CronJob {
+            id: "monitored-job".into(),
+            session_key: None,
+            expression: "0 * * * *".into(),
+            payload_json: serde_json::to_string(&hermes_job).unwrap(),
+            enabled: true,
+            next_run_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            authority: "omon_owned".into(),
+        };
+
+        let res1 = executor.execute(&cron_job).await;
+        assert!(res1.is_ok());
+        assert_eq!(
+            *run_count.lock().unwrap(),
+            1,
+            "Agent must run on first changed/initial snapshot"
+        );
+
+        let res2 = executor.execute(&cron_job).await;
+        assert!(res2.is_ok());
+        assert_eq!(
+            *run_count.lock().unwrap(),
+            1,
+            "Agent must be SKIPPED when monitor snapshot is unchanged"
+        );
+
+        fs::write(&data_file, "updated content").unwrap();
+        let res3 = executor.execute(&cron_job).await;
+        assert!(res3.is_ok());
+        assert_eq!(
+            *run_count.lock().unwrap(),
+            2,
+            "Agent must run when monitor snapshot changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_notepad_is_durable_and_profile_scoped() {
+        use omon_gateway::CronTaskExecutor;
+        use serde_json::Value;
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // 1. Set notepad for profile A and profile B for the same job_id
+        omon_gateway::set_cron_notepad(&pool, "alpha", "job1", "cursor", "100")
+            .await
+            .unwrap();
+        omon_gateway::set_cron_notepad(&pool, "beta", "job1", "cursor", "200")
+            .await
+            .unwrap();
+
+        let notes_alpha = omon_gateway::get_cron_notepads(&pool, "alpha", "job1")
+            .await
+            .unwrap();
+        assert_eq!(
+            notes_alpha,
+            vec![("cursor".to_string(), "100".to_string())],
+            "Profile alpha must retain its scoped cursor note"
+        );
+
+        let notes_beta = omon_gateway::get_cron_notepads(&pool, "beta", "job1")
+            .await
+            .unwrap();
+        assert_eq!(
+            notes_beta,
+            vec![("cursor".to_string(), "200".to_string())],
+            "Profile beta must retain its scoped cursor note"
+        );
+
+        // 2. Reject notes exceeding 16 KiB
+        let oversized = "x".repeat(17 * 1024);
+        let err = omon_gateway::set_cron_notepad(&pool, "alpha", "job1", "big", &oversized)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("16 KiB"));
+
+        // 3. Verify notepad is injected into the assembled cron prompt
+        struct NotepadTestBackend {
+            captured: Arc<std::sync::Mutex<Option<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl omon_gateway::AgentBackend for NotepadTestBackend {
+            async fn run(
+                &self,
+                _session: &mut omon_gateway::SessionContext,
+                event: omon_gateway::InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                *self.captured.lock().unwrap() = Some(event.content);
+                Ok(())
+            }
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let home = std::env::temp_dir().join(format!("omon-test-notepad-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let executor = omon_gateway::AgentCronExecutor {
+            backend: Arc::new(NotepadTestBackend {
+                captured: captured.clone(),
+            }),
+            workspace_root: home.clone(),
+            pool: pool.clone(),
+            cron_script_timeout_secs: 10,
+        };
+
+        let mut extra = HashMap::new();
+        extra.insert("profile".into(), Value::String("alpha".into()));
+
+        let hermes_job = HermesJob {
+            id: "job1".into(),
+            name: "Notepad Job".into(),
+            prompt: "Summarize status".into(),
+            skills: vec![],
+            skill: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            script: None,
+            no_agent: false,
+            ack_command: None,
+            context_from: None,
+            schedule: omon_gateway::HermesSchedule::default(),
+            schedule_display: "".into(),
+            repeat: omon_gateway::HermesRepeat::default(),
+            enabled: true,
+            state: "".into(),
+            created_at: None,
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            deliver: None,
+            failure_deliver: None,
+            origin: None,
+            enabled_toolsets: None,
+            workdir: None,
+            attach_to_session: None,
+            timeout_secs: None,
+            monitor_script: None,
+            monitor_url: None,
+            monitor_state: None,
+            extra,
+        };
+
+        let cron_job = omon_gateway::CronJob {
+            id: "job1".into(),
+            session_key: None,
+            expression: "0 * * * *".into(),
+            payload_json: serde_json::to_string(&hermes_job).unwrap(),
+            enabled: true,
+            next_run_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            authority: "omon_owned".into(),
+        };
+
+        executor.execute(&cron_job).await.unwrap();
+
+        let prompt = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("Prompt must be captured");
+        assert!(
+            prompt.contains("[Notepad]\ncursor: 100"),
+            "Prompt must contain scoped notepad note: {prompt}"
+        );
+        assert!(
+            !prompt.contains("200"),
+            "Prompt must not contain other profile note"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn cron_preflight_blocks_unconfigured_discord() {
+        use omon_gateway::{CronJob, CronScheduler, CronTaskExecutor, OmonError};
+        use std::sync::Arc;
+
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        struct CountingExecutor(Arc<std::sync::Mutex<usize>>);
+        #[async_trait::async_trait]
+        impl CronTaskExecutor for CountingExecutor {
+            async fn execute(
+                &self,
+                _job: &CronJob,
+            ) -> std::result::Result<Option<String>, OmonError> {
+                *self.0.lock().unwrap() += 1;
+                Ok(Some("completed".into()))
+            }
+        }
+
+        let runs = Arc::new(std::sync::Mutex::new(0));
+        let executor = Arc::new(CountingExecutor(runs.clone()));
+        // CronScheduler with NO dispatcher
+        let scheduler = CronScheduler::new(pool.clone(), executor);
+
+        // 1. Explicit discord delivery with unconfigured discord -> preflight blocked
+        let explicit_discord_job = serde_json::json!({
+            "id": "unconfigured_discord_job",
+            "name": "Unconfigured Discord",
+            "prompt": "run task",
+            "deliver": "discord:12345",
+            "schedule": {"kind": "cron", "expr": "0 * * * *"}
+        });
+        let cron_job_discord = CronJob {
+            id: "unconfigured_discord_job".into(),
+            session_key: None,
+            expression: "0 * * * *".into(),
+            payload_json: serde_json::to_string(&explicit_discord_job).unwrap(),
+            enabled: true,
+            next_run_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            authority: "omon_owned".into(),
+        };
+
+        let err = scheduler.execute_job(&cron_job_discord).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unconfigured delivery transport: discord"),
+            "Preflight must fail with unconfigured transport: {err}"
+        );
+        assert_eq!(
+            *runs.lock().unwrap(),
+            0,
+            "Agent must not be invoked when delivery preflight fails"
+        );
+
+        // 2. Local delivery -> bypasses check and executes
+        let local_job = serde_json::json!({
+            "id": "local_job",
+            "name": "Local Job",
+            "prompt": "run task",
+            "deliver": "local",
+            "schedule": {"kind": "cron", "expr": "0 * * * *"}
+        });
+        let cron_job_local = CronJob {
+            id: "local_job".into(),
+            session_key: None,
+            expression: "0 * * * *".into(),
+            payload_json: serde_json::to_string(&local_job).unwrap(),
+            enabled: true,
+            next_run_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            authority: "omon_owned".into(),
+        };
+
+        let res = scheduler.execute_job(&cron_job_local).await;
+        assert!(res.is_ok(), "Local job must execute successfully");
+        assert_eq!(
+            *runs.lock().unwrap(),
+            1,
+            "Agent must be invoked for local delivery"
+        );
+    }
+
+    #[test]
+    fn default_model_precedence_matches_dashboard() {
+        // Case 1: OMON_DEFAULT_MODEL=A, DEFAULT_MODEL=B -> both resolve A
+        unsafe {
+            std::env::set_var("OMON_DEFAULT_MODEL", "model_a");
+            std::env::set_var("DEFAULT_MODEL", "model_b");
+        }
+        let gw_model = super::Config::resolve_default_model();
+        let db_model = super::dashboard_runtime::effective_default_model();
+        assert_eq!(gw_model, "model_a");
+        assert_eq!(db_model, "model_a");
+
+        // Case 2: Only DEFAULT_MODEL=B -> both resolve B
+        unsafe {
+            std::env::remove_var("OMON_DEFAULT_MODEL");
+            std::env::set_var("DEFAULT_MODEL", "model_b");
+        }
+        let gw_model = super::Config::resolve_default_model();
+        let db_model = super::dashboard_runtime::effective_default_model();
+        assert_eq!(gw_model, "model_b");
+        assert_eq!(db_model, "model_b");
+
+        // Case 3: Both absent -> both resolve to documented fallback "gpt-4o"
+        unsafe {
+            std::env::remove_var("OMON_DEFAULT_MODEL");
+            std::env::remove_var("DEFAULT_MODEL");
+        }
+        let gw_model = super::Config::resolve_default_model();
+        let db_model = super::dashboard_runtime::effective_default_model();
+        assert_eq!(gw_model, "gpt-4o");
+        assert_eq!(db_model, "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn readiness_degrades_when_backend_unavailable() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let workspace_root =
+            std::env::temp_dir().join(format!("omon-test-ready-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).unwrap();
+
+        struct DummyExec;
+        #[async_trait::async_trait]
+        impl omon_gateway::CronTaskExecutor for DummyExec {
+            async fn execute(
+                &self,
+                _job: &omon_gateway::CronJob,
+            ) -> std::result::Result<Option<String>, omon_gateway::OmonError> {
+                Ok(None)
+            }
+        }
+
+        let state = super::dashboard::DashboardState::new(
+            pool.clone(),
+            None,
+            omon_gateway::CronScheduler::new(pool.clone(), std::sync::Arc::new(DummyExec)),
+            omon_gateway::ToolRegistry::new(),
+            omon_gateway::SmartApprovalGuard::new(),
+            super::dashboard::WebDashboardDispatcher::new(),
+            serde_json::json!({"appserver_url": "http://127.0.0.1:59999"}),
+            workspace_root.clone(),
+            vec![],
+            1,
+            workspace_root.clone(),
+        );
+
+        let app = super::dashboard::router(state);
+
+        // 1. Probe health: must be HTTP 200
+        let health_req = Request::builder()
+            .uri("/api/health")
+            .header("Host", "127.0.0.1:19744")
+            .body(Body::empty())
+            .unwrap();
+        let health_resp = app.clone().oneshot(health_req).await.unwrap();
+        assert_eq!(health_resp.status(), StatusCode::OK);
+
+        // 2. Probe readiness: must be HTTP 503 Service Unavailable when backend connection is refused
+        let ready_req = Request::builder()
+            .uri("/api/ready")
+            .header("Host", "127.0.0.1:19744")
+            .body(Body::empty())
+            .unwrap();
+        let ready_resp = app.oneshot(ready_req).await.unwrap();
+        assert_eq!(
+            ready_resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Readiness must degrade to 503 when backend is unreachable"
+        );
+        let bytes = axum::body::to_bytes(ready_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["checks"]["backend"], false,
+            "Checks must report backend as false"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn recovery_rechecks_current_owner_authorization() {
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // User 42 in channel 7
+        let session_key =
+            omon_gateway::SessionKey::new("discord", Some("bot1"), "7", None::<String>, "42");
+        let storage_key = session_key.storage_key();
+
+        // Setup session and unfinished turn in DB
+        sqlx::query("INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json) VALUES (?, 'discord', '7', '42', '{}')")
+            .bind(&storage_key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        omon_gateway::storage::mark_session_resume_pending(&pool, &storage_key)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json)
+             VALUES ('turn1', ?, 'user', 'unfinished task', '[]')",
+        )
+        .bind(&storage_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        struct TestRunner(tokio::sync::mpsc::UnboundedSender<String>);
+        #[async_trait::async_trait]
+        impl omon_gateway::AgentRunner for TestRunner {
+            async fn run(
+                &self,
+                _session: &mut omon_gateway::SessionContext,
+                event: omon_gateway::InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                let _ = self.0.send(event.content);
+                Ok(())
+            }
+        }
+
+        let multiplexer = omon_gateway::SessionMultiplexer::new(
+            pool.clone(),
+            std::sync::Arc::new(TestRunner(tx)),
+            omon_gateway::MultiplexerConfig::default(),
+        );
+
+        // Current authorization: user 42 is REVOKED (only user 99 is allowed)
+        let auth = super::StartupAuthorization {
+            allowed_users: vec![99],
+            allow_all_users: false,
+            allowed_channels: vec![],
+            ignored_channels: vec![],
+        };
+
+        let recovered =
+            super::recover_resume_pending_sessions_with_auth(&pool, &multiplexer, Some(&auth))
+                .await
+                .unwrap();
+        assert_eq!(recovered, 0, "Revoked user session must NOT be recovered");
+        assert!(
+            rx.try_recv().is_err(),
+            "No event should be dispatched for revoked user"
+        );
+    }
+
+    #[test]
+    fn cron_and_interactive_share_one_daemon() {
+        unsafe {
+            std::env::remove_var("OMON_OMO_APPSERVER_URL");
+            std::env::remove_var("OMON_OMO_CRON_APPSERVER_URL");
+        }
+
+        let interactive = omon_gateway::agent::OmoBackendConfig::from_env().unwrap();
+        let cron = omon_gateway::agent::OmoBackendConfig::cron_from_env().unwrap();
+
+        assert_eq!(interactive.appserver_url, "ws://127.0.0.1:19742");
+        assert_eq!(
+            cron.appserver_url, interactive.appserver_url,
+            "Cron and interactive must share one daemon endpoint"
+        );
+        assert!(
+            cron.total_timeout < interactive.total_timeout,
+            "Cron retains dedicated per-turn timeout policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_is_reversible_and_preserves_accepted_work() {
+        use omon_gateway::{
+            write_drain_request, AgentRunner, DrainWatcher, InboundEvent, MultiplexerConfig,
+            OmonError, SessionContext, SessionKey, SessionMultiplexer,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let state_dir =
+            std::env::temp_dir().join(format!("omon-test-drain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let watcher = DrainWatcher::new(state_dir.clone(), std::time::Duration::from_millis(10));
+        let epoch = omon_gateway::current_instantiation_epoch().to_string();
+
+        let processed = Arc::new(AtomicUsize::new(0));
+        struct CountingRunner(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl AgentRunner for CountingRunner {
+            async fn run(
+                &self,
+                _session: &mut SessionContext,
+                _event: InboundEvent,
+            ) -> Result<(), OmonError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let mux = SessionMultiplexer::new(
+            pool.clone(),
+            Arc::new(CountingRunner(processed.clone())),
+            MultiplexerConfig::default(),
+        )
+        .with_drain_receiver(watcher.receiver());
+
+        let session = SessionKey::new("discord", Some("bot1"), "123", None::<String>, "42");
+        sqlx::query("INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json) VALUES (?, 'discord', '123', '42', '{}')")
+            .bind(session.storage_key())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let m1 = InboundEvent::message(session.clone(), "m1", "turn 1");
+        let m2 = InboundEvent::message(session.clone(), "m2", "turn 2");
+        mux.route(m1).await.unwrap();
+        mux.route(m2).await.unwrap();
+
+        // Drain marker placed
+        write_drain_request(&state_dir, Some("operator"), false).unwrap();
+        watcher.scan_at(&epoch, chrono::Utc::now());
+
+        // m3 must be rejected because gateway is draining
+        let m3 = InboundEvent::message(session.clone(), "m3", "turn 3");
+        let err = mux.route(m3).await.unwrap_err();
+        assert!(err.to_string().contains("gateway is draining"));
+
+        // Drain marker removed
+        std::fs::remove_file(state_dir.join(".drain_request.json")).unwrap();
+        watcher.scan_at(&epoch, chrono::Utc::now());
+
+        // m4 must be accepted after drain is reversed
+        let m4 = InboundEvent::message(session.clone(), "m4", "turn 4");
+        let res4 = mux.route(m4).await;
+        assert!(res4.is_ok(), "m4 must be accepted after drain is reversed");
+
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]
@@ -1757,6 +1864,948 @@ mod runner_tests {
             .unwrap()
             .unwrap();
         assert_eq!(obl2.state, "delivered");
+    }
+
+    #[tokio::test]
+    async fn test_recover_pending_delivery_obligations_preserves_bot_identity() {
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+        let dispatcher = std::sync::Arc::new(CapturingDispatcher::default());
+        let dead_pid = 999_999_i64;
+
+        let session_key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-recover-bot",
+            None::<String>,
+            "user-recover-bot",
+        )
+        .with_bot_id("42");
+        super::ensure_agent_session(
+            &pool,
+            &omon_gateway::SessionContext::new(session_key.clone()),
+        )
+        .await
+        .unwrap();
+
+        let ledger = omon_gateway::ledger::DeliveryLedgerService::new(pool.clone());
+        let _ = ledger
+            .record_obligation("obl-rec-bot", &session_key, "bot response text")
+            .await;
+        sqlx::query("UPDATE delivery_obligations SET owner_pid = ? WHERE id = 'obl-rec-bot'")
+            .bind(dead_pid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let recovered_count =
+            super::recover_pending_delivery_obligations(&pool, dispatcher.clone())
+                .await
+                .unwrap();
+        assert_eq!(recovered_count, 1);
+
+        let actions = dispatcher.actions.lock().await.clone();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            omon_gateway::OutboundAction::Stream { session, chunk } => {
+                assert_eq!(session.bot_id.as_deref(), Some("42"));
+                assert_eq!(session.channel_id, "chan-recover-bot");
+                assert_eq!(chunk.content, "bot response text");
+            }
+            _ => panic!("expected Stream action"),
+        }
+    }
+
+    #[cfg(test)]
+    mod ag07_upgrade_tests {
+        use std::collections::BTreeMap;
+        use std::panic::AssertUnwindSafe;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use futures_util::FutureExt;
+        use omon_gateway::{InboundEvent, SessionContext, SessionKey, SessionMultiplexer};
+        use serde_json::{json, Value};
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use sqlx::SqlitePool;
+        use tokio::sync::mpsc;
+
+        const LIMIT: Duration = Duration::from_secs(20);
+        const KEYS: [&str; 7] = [
+            "7:discord|3:100|3:200|-|2:42|2:84",
+            "7:discord|3:100|3:200|-|2:43|2:84",
+            "7:discord|3:100|3:200|-|0:|2:84",
+            "7:discord|3:100|3:201|-|2:42|2:84",
+            "7:discord|3:100|3:201|-|2:43|2:84",
+            "7:discord|3:100|3:202|-|2:42|2:84",
+            "7:discord|3:100|3:203|-|0:|2:84",
+        ];
+        const CANONICAL: &str = "7:discord|3:100|3:202|-|0:|2:84";
+        type Snapshot = BTreeMap<String, Vec<Value>>;
+
+        // Capture every column, including IDs, sequence numbers, timestamps and opaque
+        // serialized payload bytes. These are real tables, not mocked lookup results.
+        async fn snapshot(pool: &SqlitePool) -> Snapshot {
+            let mut result = BTreeMap::new();
+            for table in [
+                "sessions",
+                "messages",
+                "delivery_ledger",
+                "cron_jobs",
+                "memories",
+                "delivery_obligations",
+                "pending_writes",
+                "message_search_documents",
+                "delivery_ledger_constituents",
+            ] {
+                let columns: Vec<String> =
+                    sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+                        .bind(table)
+                        .fetch_all(pool)
+                        .await
+                        .unwrap();
+                let fields = columns
+                    .iter()
+                    .map(|c| format!("'{c}',\"{c}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let rows: Vec<String> = sqlx::query_scalar(&format!(
+                    "SELECT json_object({fields}) FROM {table} ORDER BY rowid",
+                ))
+                .fetch_all(pool)
+                .await
+                .unwrap();
+                result.insert(
+                    table.to_owned(),
+                    rows.into_iter()
+                        .map(|s| serde_json::from_str(&s).unwrap())
+                        .collect(),
+                );
+            }
+            result
+        }
+
+        #[allow(clippy::large_enum_variant)]
+        enum Observed {
+            Run(SessionContext, InboundEvent),
+            Finished,
+        }
+        struct Recorder {
+            tx: mpsc::UnboundedSender<Observed>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl omon_gateway::AgentRunner for Recorder {
+            async fn run(
+                &self,
+                session: &mut SessionContext,
+                event: InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.tx
+                    .send(Observed::Run(session.clone(), event))
+                    .map_err(|e| omon_gateway::OmonError::Multiplexer(e.to_string()))?;
+                Ok(())
+            }
+        }
+        #[async_trait::async_trait]
+        impl omon_gateway::OutboundDispatcher for Recorder {
+            async fn dispatch(
+                &self,
+                action: omon_gateway::OutboundAction,
+            ) -> omon_gateway::Result<()> {
+                if matches!(
+                    action,
+                    omon_gateway::OutboundAction::Typing { active: false, .. }
+                ) {
+                    self.tx
+                        .send(Observed::Finished)
+                        .map_err(|e| omon_gateway::OmonError::Multiplexer(e.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Authorization {
+            AllowAll,
+            ExplicitAllowlist,
+            Deferral,
+        }
+
+        #[test]
+        fn ag07_collisions_defer_only_ambiguous_lanes() {
+            exercise_upgrade(false, Authorization::AllowAll);
+        }
+
+        #[test]
+        fn ag07_upgrade_preserves_references_and_rolls_back() {
+            exercise_upgrade(true, Authorization::AllowAll);
+        }
+
+        #[test]
+        fn ag07_explicit_allowlist_uses_exact_pending_actor() {
+            exercise_upgrade(false, Authorization::ExplicitAllowlist);
+        }
+
+        #[test]
+        fn ag07_unknown_or_unauthorized_actor_retains_pending() {
+            exercise_upgrade(false, Authorization::Deferral);
+        }
+
+        fn exercise_upgrade(inject_failure: bool, authorization: Authorization) {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("legacy.sqlite");
+            let url = format!("sqlite://{}", path.to_string_lossy().replace('\\', "/"));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (outcome, actors_closed, pool_closed, calls) = runtime.block_on(async {
+                let mut pool: Option<SqlitePool> = None;
+                let mut mux: Option<SessionMultiplexer> = None;
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let mut tx = Some(tx);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let outcome = AssertUnwindSafe(async {
+                    tokio::time::timeout(LIMIT, async {
+                        pool = Some(SqlitePoolOptions::new().max_connections(1).connect_with(
+                            SqliteConnectOptions::new().filename(&path).create_if_missing(true).foreign_keys(true),
+                        ).await.unwrap());
+                        let old = pool.as_ref().unwrap();
+                        let shipped = sqlx::migrate!("./migrations");
+                        let old_schema = sqlx::migrate::Migrator {
+                            migrations: std::borrow::Cow::Owned(shipped.iter().filter(|m| m.version <= 27).cloned().collect()),
+                            ..sqlx::migrate::Migrator::DEFAULT
+                        };
+                        old_schema.run(old).await.unwrap();
+                        // The pre-upgrade runtime creates this non-FK constituent table.
+                        sqlx::query("CREATE TABLE delivery_ledger_constituents (parent_delivery_id TEXT NOT NULL, constituent_id TEXT NOT NULL PRIMARY KEY)")
+                            .execute(old).await.unwrap();
+                        for (i, raw) in KEYS.iter().enumerate() {
+                            let key = SessionKey::from_storage_key(raw).unwrap();
+                            let user = if i == 1 || i == 4 { "43" } else if i == 2 || i == 6 { "" } else { "42" };
+                            let state = json!({"active_model":"fixture-model", "system_prompt":"fixture-persona", "enabled_toolsets":["memory"],
+                                "metadata":{"omo_thread_id":format!("remote-{i}"),"checkpoint":{"literal_raw":raw}}});
+                            sqlx::query("INSERT INTO sessions (session_key,platform,guild_id,channel_id,user_id,state_json,resume_pending,created_at,updated_at) VALUES (?,'discord','100',?,?,?,?, '2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+                                .bind(raw).bind(&key.channel_id).bind(user).bind(state.to_string()).bind(if i == 1 { 0 } else { 1 })
+                                .execute(old).await.unwrap();
+                            sqlx::query("INSERT INTO messages (id,session_key,role,content,metadata_json,created_at,platform_message_id) VALUES (?,?,'user',?,?,'2020-01-01T00:00:00Z',?)")
+                                .bind(format!("00000000-0000-4000-8000-{i:012}"))
+                                .bind(raw).bind(format!("work {raw}")).bind("[]").bind(format!("p{i}"))
+                                .execute(old).await.unwrap();
+                            sqlx::query("INSERT INTO delivery_ledger (delivery_id,session_key,event_id,status,message_id,platform_message_id,received_at) VALUES (?,?,?,'pending',?,?,'2020-01-01T00:00:00Z')")
+                                .bind(format!("d{i}")).bind(raw).bind(format!("e{i}")).bind(format!("discord:p{i}")).bind(format!("p{i}"))
+                                .execute(old).await.unwrap();
+                            sqlx::query("INSERT INTO delivery_ledger_constituents VALUES (?,?)")
+                                .bind(format!("discord:p{i}")).bind(format!("part{i}")).execute(old).await.unwrap();
+                            sqlx::query("INSERT INTO cron_jobs (id,session_key,expression,payload_json,enabled) VALUES (?,?,'0 * * * * *',?,0)")
+                                .bind(format!("c{i}")).bind(raw).bind(json!({"prompt":raw,"checkpoint":{"raw":raw}}).to_string())
+                                .execute(old).await.unwrap();
+                            sqlx::query("INSERT INTO memories (id,session_key,content,metadata_json) VALUES (?,?,?,?)")
+                                .bind(format!("m{i}")).bind(raw).bind(raw).bind(json!({"raw":raw}).to_string())
+                                .execute(old).await.unwrap();
+                            sqlx::query("INSERT INTO delivery_obligations (id,session_key,channel_id,content,state) VALUES (?,?,?,?,'pending')")
+                                .bind(format!("o{i}")).bind(raw).bind(&key.channel_id).bind(json!({"text":raw,"checkpoint":{"raw":raw}}).to_string())
+                                .execute(old).await.unwrap();
+                            sqlx::query("INSERT INTO pending_writes (id,kind,payload) VALUES (?,'memory',?)")
+                                .bind(format!("w{i}")).bind(json!({"session_key":raw,"content":raw,"metadata":{"original_key":raw}}).to_string())
+                                .execute(old).await.unwrap();
+                        }
+                        sqlx::query("INSERT INTO pending_writes (id,kind,payload) VALUES ('skill','skill',?),('invalid','memory','not-json')")
+                            .bind(json!({"session_key":KEYS[5],"content":KEYS[5]}).to_string()).execute(old).await.unwrap();
+                        if authorization != Authorization::AllowAll {
+                            // Real search storage, with the provenance emitted by Discord REST.
+                            // The transcript trigger's historical user_id is not such evidence.
+                            let index = omon_gateway::MessageSearchIndex::new(old.clone());
+                            let mut document = index.get("discord", "203", "p6").await.unwrap().unwrap();
+                            document.author_id = "42".into();
+                            document.metadata = json!({"source":"discord_rest", "author_is_bot":false});
+                            index.upsert(&document).await.unwrap();
+                        }
+                        let before = snapshot(old).await;
+                        eprintln!("AG-07 upgrade pre-existing raw_keys={KEYS:?}; inject_failure={inject_failure}");
+                        if inject_failure {
+                            sqlx::query("CREATE TRIGGER ag07_reject_rekey BEFORE UPDATE OF session_key ON memories BEGIN SELECT RAISE(ABORT,'ag07-rekey-fault'); END")
+                                .execute(old).await.unwrap();
+                        }
+                        pool.take().unwrap().close().await;
+                        if inject_failure {
+                            match omon_gateway::storage::init_pool(&url).await {
+                                Ok(opened) => { opened.close().await; panic!("injected rekey fault must reject the upgrade"); }
+                                Err(error) => assert!(error.to_string().contains("ag07-rekey-fault"), "unexpected upgrade error: {error}"),
+                            }
+                            // Inspect the failed upgrade without running it again. All parent and
+                            // dependent rows must be exactly the pre-upgrade snapshot.
+                            pool = Some(SqlitePoolOptions::new().max_connections(1).connect_with(
+                                SqliteConnectOptions::new().filename(&path).foreign_keys(true),
+                            ).await.unwrap());
+                            let failed = pool.as_ref().unwrap();
+                            assert_eq!(snapshot(failed).await, before, "partial rekey escaped rollback");
+                            let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_foreign_key_check")
+                                .fetch_one(failed).await.unwrap();
+                            assert_eq!(violations, 0);
+                            let deferred: i64 = sqlx::query_scalar("SELECT count(*) FROM legacy_guild_session_conflicts")
+                                .fetch_one(failed).await.unwrap();
+                            assert_eq!(deferred, 0, "quarantine writes escaped the failed transaction");
+                            let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM legacy_guild_pending_auth")
+                                .fetch_one(failed).await.unwrap();
+                            assert_eq!(grants, 0, "pending-author grants escaped the failed transaction");
+                            sqlx::query("DROP TRIGGER ag07_reject_rekey").execute(failed).await.unwrap();
+                            pool.take().unwrap().close().await;
+                        }
+                        pool = Some(omon_gateway::storage::init_pool(&url).await.unwrap());
+                        let mut expected = before.clone();
+                        for (table, rows) in &mut expected {
+                            for row in rows {
+                                if row.get("session_key").and_then(Value::as_str) == Some(KEYS[5]) {
+                                    row["session_key"] = CANONICAL.into();
+                                }
+                                if table == "pending_writes" && row["id"] == "w5" {
+                                    let mut payload: Value = serde_json::from_str(row["payload"].as_str().unwrap()).unwrap();
+                                    payload["session_key"] = CANONICAL.into();
+                                    row["payload"] = payload.to_string().into();
+                                }
+                            }
+                        }
+                        let upgraded = snapshot(pool.as_ref().unwrap()).await;
+                        pool.take().unwrap().close().await;
+                        pool = Some(omon_gateway::storage::init_pool(&url).await.unwrap());
+                        assert_eq!(snapshot(pool.as_ref().unwrap()).await, upgraded, "reopening repeated or changed the upgrade");
+                        // Replay first: pre-repair RED must be wrong-lane behavior, not a query
+                        // against the not-yet-shipped quarantine table.
+                        let current = pool.as_ref().unwrap();
+                        let probe = Arc::new(Recorder { tx: tx.take().unwrap(), calls: calls.clone() });
+                        mux = Some(SessionMultiplexer::with_dispatcher(current.clone(), probe.clone(), Some(probe), Default::default()));
+                        let current_mux = mux.as_ref().unwrap();
+                        let auth = if authorization == Authorization::AllowAll {
+                            super::super::StartupAuthorization { allow_all_users: true, ..Default::default() }
+                        } else {
+                            super::super::StartupAuthorization { allowed_users: vec![42], allow_all_users: false,
+                                allowed_channels: vec![202,203], ignored_channels: vec![] }
+                        };
+                        if authorization == Authorization::Deferral {
+                            for allowed_users in [vec![99], vec![]] {
+                                let denied = super::super::StartupAuthorization { allowed_users, ..auth.clone() };
+                                let recovered = super::super::recover_resume_pending_sessions_with_auth(current,current_mux,Some(&denied)).await.unwrap();
+                                eprintln!("AG-07 revoked actor recovery recovered={recovered}; allowed_users={:?}",denied.allowed_users);
+                                assert_eq!(recovered,0);
+                                assert_eq!(snapshot(current).await,upgraded,"authorization denial consumed pending intent");
+                                assert_eq!(calls.load(Ordering::SeqCst),0);
+                            }
+                        }
+                        let recovered = super::super::recover_resume_pending_sessions_with_auth(current,current_mux,Some(&auth)).await.unwrap();
+                        eprintln!("AG-07 collision recovery recovered={recovered}");
+                        assert_eq!(recovered, 2);
+                        let mut observed = BTreeMap::new();
+                        let mut finished = 0;
+                        for _ in 0..4 {
+                            match rx.recv().await.expect("actor event channel closed") {
+                                Observed::Run(context, event) => {
+                                    eprintln!("AG-07 collision backend key={}; remote={:?}",context.key.storage_key(),context.state.metadata.get("omo_thread_id"));
+                                    assert!(context.key.user_id.is_empty(),"authorization leaked actor identity into the shared routing key");
+                                    observed.insert(context.key.storage_key(), (context.state, event.content));
+                                }
+                                Observed::Finished => finished += 1,
+                            }
+                        }
+                        assert_eq!(observed.keys().map(String::as_str).collect::<Vec<_>>(), vec![CANONICAL, KEYS[6]], "ambiguous history replayed or unrelated lane blocked");
+                        assert_eq!(finished, 2);
+                        for (key, i) in [(CANONICAL,5), (KEYS[6],6)] {
+                            let (state, content) = &observed[key];
+                            assert_eq!(state.metadata["omo_thread_id"], format!("remote-{i}"));
+                            assert_eq!(content, &format!("work {}",KEYS[i]));
+                        }
+                        assert_eq!(upgraded, expected, "rekey changed payloads, IDs, order, initiator, checkpoints or dependent rows");
+                        let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_foreign_key_check")
+                            .fetch_one(current).await.unwrap();
+                        assert_eq!(violations,0);
+                        let conflicts: Vec<(String,String)> = sqlx::query_as("SELECT raw_key,canonical_key FROM legacy_guild_session_conflicts ORDER BY raw_key")
+                            .fetch_all(current).await.unwrap();
+                        let mut expected_conflicts: Vec<_> = KEYS[..5].iter().map(|raw| (raw.to_string(),SessionKey::from_storage_key(raw).unwrap().storage_key())).collect();
+                        expected_conflicts.sort();
+                        assert_eq!(conflicts, expected_conflicts);
+                        eprintln!("AG-07 deferred OD-01 conflicts={conflicts:?}");
+                        // Both canonical-present and canonical-absent collisions must refuse
+                        // real ordinary ingress rather than choose a history or create a shadow.
+                        for channel in ["200","201"] {
+                            let key = SessionKey::new("discord",Some("100"),channel,None::<String>,"42").with_bot_id("84");
+                            let result = current_mux.route_awaiting_turn(InboundEvent::message(key,format!("blocked-{channel}"),"must not execute")).await;
+                            assert!(result.is_err(), "ambiguous lane accepted ingress: {channel}");
+                        }
+                        let after = snapshot(current).await;
+                        for (table, rows) in &before {
+                            assert_eq!(after[table][..5], rows[..5], "ambiguous rows modified in {table}");
+                        }
+                        assert_eq!(super::super::recover_resume_pending_sessions_with_auth(current,current_mux,Some(&auth)).await.unwrap(),0);
+                        assert_eq!(omon_gateway::storage::count_resume_pending_sessions(current).await.unwrap(),4);
+                        assert!(omon_gateway::storage::fetch_resume_pending_session_keys(current).await.unwrap().is_empty(), "deferred lanes must not feed the startup restart-loop gate");
+                        if authorization == Authorization::Deferral {
+                            // Current-format pending work, not obsolete rows seeded after upgrade.
+                            // A new message in the formerly legacy lane must NOT inherit its grant.
+                            for (i,key) in [(5,CANONICAL),(6,KEYS[6])] {
+                                sqlx::query("INSERT INTO messages (id,session_key,role,content,metadata_json,created_at,platform_message_id) VALUES (?,?,'user','new shared-lane work','[]','2020-01-02T00:00:00Z',?)")
+                                    .bind(format!("00000000-0000-4000-8000-00000000008{i}"))
+                                    .bind(key).bind(format!("new-p{i}")).execute(current).await.unwrap();
+                                omon_gateway::storage::mark_session_resume_pending(current,key).await.unwrap();
+                            }
+                            let index = omon_gateway::MessageSearchIndex::new(current.clone());
+                            let unknown = index.get("discord","202","new-p5").await.unwrap().unwrap();
+                            assert_eq!(unknown.author_id,"42");
+                            assert_eq!(unknown.metadata["source"],"transcript");
+                            let mut unauthorized = index.get("discord","203","new-p6").await.unwrap().unwrap();
+                            unauthorized.author_id = "43".into();
+                            unauthorized.metadata = json!({"source":"discord_rest", "author_is_bot":false});
+                            index.upsert(&unauthorized).await.unwrap();
+                            // Reopening must not assign an old user's grant to the new message.
+                            omon_gateway::storage::init_pool(&url).await.unwrap().close().await;
+                            let deferred = snapshot(current).await;
+                            for _ in 0..2 {
+                                let recovered = super::super::recover_resume_pending_sessions_with_auth(current,current_mux,Some(&auth)).await.unwrap();
+                                eprintln!("AG-07 new-work authorization recovered={recovered}; unknown=202; unauthorized=203");
+                                assert_eq!(recovered,0);
+                                assert_eq!(snapshot(current).await,deferred,"unknown/unauthorized pending work was consumed");
+                                assert_eq!(omon_gateway::storage::count_resume_pending_sessions(current).await.unwrap(),6);
+                            }
+                            assert_eq!(calls.load(Ordering::SeqCst),2);
+                            // Reauthorizing the proven actor may replay its lane; the unknown
+                            // neighbor must remain pending instead of causing global refusal.
+                            let reauthorized = super::super::StartupAuthorization { allowed_users: vec![43], ..auth.clone() };
+                            assert_eq!(super::super::recover_resume_pending_sessions_with_auth(current,current_mux,Some(&reauthorized)).await.unwrap(),1);
+                            let Some(Observed::Run(context,event)) = rx.recv().await else { panic!("reauthorized work missing"); };
+                            assert_eq!(context.key.storage_key(),KEYS[6]);
+                            assert!(context.key.user_id.is_empty());
+                            assert_eq!(context.state.metadata["omo_thread_id"],"remote-6");
+                            assert_eq!(event.content,"new shared-lane work");
+                            assert!(matches!(rx.recv().await,Some(Observed::Finished)));
+                            assert_eq!(omon_gateway::storage::count_resume_pending_sessions(current).await.unwrap(),5);
+                        }
+                    }).await.expect("AG-07 upgrade fixture timed out");
+                }).catch_unwind().await;
+                drop(mux.take());
+                drop(tx.take());
+                let actors_closed = tokio::time::timeout(LIMIT,async { while rx.recv().await.is_some() {} }).await;
+                let pool_closed = tokio::time::timeout(LIMIT,async { if let Some(pool) = pool.take() { pool.close().await; } }).await;
+                (outcome,actors_closed,pool_closed,calls.load(Ordering::SeqCst))
+            });
+            drop(runtime);
+            let removed = temp.close();
+            eprintln!("AG-07 upgrade cleanup actors_closed={actors_closed:?}; pool_closed={pool_closed:?}; temp_removed={removed:?}; runtime_dropped=true");
+            assert!(
+                actors_closed.is_ok(),
+                "AG-07 upgrade actor cleanup timed out"
+            );
+            assert!(pool_closed.is_ok(), "AG-07 upgrade pool cleanup timed out");
+            removed.expect("AG-07 upgrade temporary database cleanup failed");
+            if let Err(panic) = outcome {
+                std::panic::resume_unwind(panic);
+            }
+            let expected_calls = if authorization == Authorization::Deferral {
+                3
+            } else {
+                2
+            };
+            assert_eq!(
+                calls, expected_calls,
+                "only authorized unambiguous pending work may execute"
+            );
+        }
+    }
+
+    #[test]
+    fn ag07_legacy_guild_startup_replays_preserved_history_once() {
+        use std::borrow::Cow;
+        use std::panic::AssertUnwindSafe;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use futures_util::FutureExt;
+        use omon_gateway::{
+            AgentRunner, InboundEvent, MultiplexerConfig, OutboundAction, OutboundDispatcher,
+            SessionContext, SessionKey, SessionMultiplexer, SessionState,
+        };
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use tokio::sync::mpsc;
+
+        const RAW: &str = "7:discord|3:100|3:200|-|2:42|2:84";
+        const LIMIT: Duration = Duration::from_secs(20);
+        type History = Vec<(String, String, String, String, Option<String>)>;
+
+        #[allow(clippy::large_enum_variant)]
+        enum Observed {
+            Run(SessionContext, InboundEvent, History),
+            Finished,
+        }
+        struct Recorder {
+            pool: sqlx::SqlitePool,
+            tx: mpsc::UnboundedSender<Observed>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl AgentRunner for Recorder {
+            async fn run(
+                &self,
+                session: &mut SessionContext,
+                event: InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Use the actor's actual key, never RAW or a test-side alias lookup.
+                let history: History = sqlx::query_as(
+                    "SELECT id, role, content, metadata_json, platform_message_id
+                         FROM messages WHERE session_key = ? AND id IN ('ag07-user',
+                         'ag07-assistant', '00000000-0000-4000-8000-000000000007')
+                         ORDER BY sequence",
+                )
+                .bind(session.key.storage_key())
+                .fetch_all(&self.pool)
+                .await?;
+                self.tx
+                    .send(Observed::Run(session.clone(), event, history))
+                    .map_err(|e| omon_gateway::OmonError::Multiplexer(e.to_string()))?;
+                Ok(())
+            }
+        }
+        #[async_trait::async_trait]
+        impl OutboundDispatcher for Recorder {
+            async fn dispatch(&self, action: OutboundAction) -> omon_gateway::Result<()> {
+                // This is emitted by the real actor after completion/flush, not by run().
+                if matches!(action, OutboundAction::Typing { active: false, .. }) {
+                    self.tx
+                        .send(Observed::Finished)
+                        .map_err(|e| omon_gateway::OmonError::Multiplexer(e.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy.sqlite");
+        let url = format!("sqlite://{}", path.to_string_lossy().replace('\\', "/"));
+        // Own the runtime as well: a failed cleanup timeout cannot leave detached actors.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (outcome, actors_closed, pool_closed, calls) = runtime.block_on(async {
+            let mut pool: Option<sqlx::SqlitePool> = None;
+            let mut mux: Option<SessionMultiplexer> = None;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut tx = Some(tx);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let outcome = AssertUnwindSafe(async {
+                tokio::time::timeout(LIMIT, async {
+                    pool = Some(
+                        SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect_with(
+                                SqliteConnectOptions::new()
+                                    .filename(&path)
+                                    .create_if_missing(true)
+                                    .foreign_keys(true),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                    let old = pool.as_ref().unwrap();
+                    // Freeze the old schema, including sqlx checksums/bookkeeping. Never
+                    // connect with today's Database migrator before inserting legacy rows.
+                    let shipped = sqlx::migrate!("./migrations");
+                    let old_schema = sqlx::migrate::Migrator {
+                        migrations: Cow::Owned(
+                            shipped
+                                .iter()
+                                .filter(|m| m.version <= 16)
+                                .cloned()
+                                .collect(),
+                        ),
+                        ..sqlx::migrate::Migrator::DEFAULT
+                    };
+                    old_schema.run(old).await.unwrap();
+                    let mut state = SessionState {
+                        active_model: Some("ag07-model".into()),
+                        system_prompt: Some("ag07-persona".into()),
+                        enabled_toolsets: Some(vec!["memory".into()]),
+                        ..Default::default()
+                    };
+                    state
+                        .metadata
+                        .insert("omo_thread_id".into(), "ag07-remote-history".into());
+                    state.metadata.insert("ag07_checkpoint".into(), 7.into());
+                    sqlx::query(
+                        "INSERT INTO sessions (session_key, platform, guild_id, channel_id,
+                             thread_id, user_id, state_json, resume_pending, created_at, updated_at)
+                             VALUES (?, 'discord', '100', '200', NULL, '42', ?, 1,
+                             '2020-01-01T00:00:00Z', '2020-01-01T00:02:00Z')",
+                    )
+                    .bind(RAW)
+                    .bind(serde_json::to_string(&state).unwrap())
+                    .execute(old)
+                    .await
+                    .unwrap();
+                    let expected: History = vec![
+                        (
+                            "ag07-user".into(),
+                            "user".into(),
+                            "ag07-old-question".into(),
+                            "[]".into(),
+                            Some("7001".into()),
+                        ),
+                        (
+                            "ag07-assistant".into(),
+                            "assistant".into(),
+                            "ag07-old-answer".into(),
+                            "[]".into(),
+                            None,
+                        ),
+                        (
+                            "00000000-0000-4000-8000-000000000007".into(),
+                            "user".into(),
+                            "ag07-pending-work".into(),
+                            "[]".into(),
+                            Some("7003".into()),
+                        ),
+                    ];
+                    for (id, role, content, metadata, platform_id) in &expected {
+                        sqlx::query(
+                            "INSERT INTO messages (id, session_key, role, content,
+                                 metadata_json, platform_message_id, created_at)
+                                 VALUES (?, ?, ?, ?, ?, ?, '2020-01-01T00:01:00Z')",
+                        )
+                        .bind(id)
+                        .bind(RAW)
+                        .bind(role)
+                        .bind(content)
+                        .bind(metadata)
+                        .bind(platform_id)
+                        .execute(old)
+                        .await
+                        .unwrap();
+                    }
+                    let stored: String = sqlx::query_scalar("SELECT session_key FROM sessions")
+                        .fetch_one(old)
+                        .await
+                        .unwrap();
+                    assert_eq!(stored.as_bytes(), RAW.as_bytes());
+                    eprintln!(
+                        "AG-07 pre-upgrade raw={stored}; raw_bytes={:?}",
+                        stored.as_bytes()
+                    );
+                    pool.take().unwrap().close().await;
+
+                    // The same storage-open and authorized recovery functions used by main.
+                    pool = Some(omon_gateway::storage::init_pool(&url).await.unwrap());
+                    let current = pool.as_ref().unwrap();
+                    let probe = Arc::new(Recorder {
+                        pool: current.clone(),
+                        tx: tx.take().unwrap(),
+                        calls: calls.clone(),
+                    });
+                    mux = Some(SessionMultiplexer::with_dispatcher(
+                        current.clone(),
+                        probe.clone(),
+                        Some(probe),
+                        MultiplexerConfig::default(),
+                    ));
+                    let current_mux = mux.as_ref().unwrap();
+                    let auth = super::StartupAuthorization {
+                        allow_all_users: true,
+                        ..Default::default()
+                    };
+                    let recovered = super::recover_resume_pending_sessions_with_auth(
+                        current,
+                        current_mux,
+                        Some(&auth),
+                    )
+                    .await
+                    .unwrap();
+                    eprintln!("AG-07 recovery raw={RAW}; recovered={recovered}");
+                    assert_eq!(recovered, 1, "legacy pending work stranded: {RAW}");
+                    let Some(Observed::Run(context, event, history)) = rx.recv().await else {
+                        panic!("no backend replay for {RAW}");
+                    };
+                    eprintln!(
+                        "AG-07 backend key={}; remote_binding={:?}",
+                        context.key.storage_key(),
+                        context.state.metadata.get("omo_thread_id")
+                    );
+                    assert_eq!(context.state, state, "remote binding/state lost: {RAW}");
+                    assert_eq!(context.key.bot_id.as_deref(), Some("84"));
+                    assert_eq!(event.session, context.key);
+                    assert_eq!(event.content, "ag07-pending-work");
+                    assert_eq!(history, expected, "original history not addressable: {RAW}");
+                    assert!(matches!(rx.recv().await, Some(Observed::Finished)));
+                    // Normal guild ingress must resolve the same preserved conversation too.
+                    let ingress =
+                        SessionKey::new("discord", Some("100"), "200", None::<String>, "42")
+                            .with_bot_id("84");
+                    let loaded = current_mux
+                        .session_context(&ingress)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(loaded.state, state);
+                    assert_eq!(
+                        omon_gateway::storage::count_resume_pending_sessions(current)
+                            .await
+                            .unwrap(),
+                        0
+                    );
+                    assert_eq!(
+                        super::recover_resume_pending_sessions_with_auth(
+                            current,
+                            current_mux,
+                            Some(&auth),
+                        )
+                        .await
+                        .unwrap(),
+                        0
+                    );
+                    // Retain every original transcript row globally as well as at the backend.
+                    let retained: History = sqlx::query_as(
+                        "SELECT id, role, content, metadata_json, platform_message_id FROM messages
+                             WHERE id IN ('ag07-user', 'ag07-assistant',
+                             '00000000-0000-4000-8000-000000000007') ORDER BY sequence",
+                    )
+                    .fetch_all(current)
+                    .await
+                    .unwrap();
+                    assert_eq!(retained, expected);
+                })
+                .await
+                .expect("AG-07 fixture timed out");
+            })
+            .catch_unwind()
+            .await;
+
+            // Finally runs on assertion failure and scenario timeout. Channel closure proves
+            // all actor-held recorder/dispatcher owners were released; no polling or sleeps.
+            drop(mux.take());
+            drop(tx.take());
+            let actors_closed =
+                tokio::time::timeout(LIMIT, async { while rx.recv().await.is_some() {} }).await;
+            let pool_closed = tokio::time::timeout(LIMIT, async {
+                if let Some(pool) = pool.take() {
+                    pool.close().await;
+                }
+            })
+            .await;
+            (
+                outcome,
+                actors_closed,
+                pool_closed,
+                calls.load(Ordering::SeqCst),
+            )
+        });
+        drop(runtime);
+        let removed = temp.close();
+        eprintln!(
+            "AG-07 cleanup actors_closed={actors_closed:?}; pool_closed={pool_closed:?}; temp_removed={removed:?}; runtime_dropped=true"
+        );
+        assert!(actors_closed.is_ok(), "AG-07 actor cleanup timed out");
+        assert!(pool_closed.is_ok(), "AG-07 pool cleanup timed out");
+        removed.expect("AG-07 temporary database cleanup failed");
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        assert_eq!(
+            calls, 1,
+            "legacy work must reach the backend exactly once: {RAW}"
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_bot_identity() {
+        test_recover_resume_pending_sessions_preserves_bot_identity();
+    }
+
+    #[tokio::test]
+    async fn test_recover_resume_pending_sessions_preserves_bot_identity() {
+        let pool = omon_gateway::storage::init_pool("sqlite::memory:")
+            .await
+            .unwrap();
+
+        let bot42 = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-rec-bot",
+            None::<String>,
+            "user-rec-bot",
+        )
+        .with_bot_id("42");
+        let bot84 = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "chan-rec-bot",
+            None::<String>,
+            "user-rec-bot",
+        )
+        .with_bot_id("84");
+
+        super::ensure_agent_session(&pool, &omon_gateway::SessionContext::new(bot42.clone()))
+            .await
+            .unwrap();
+        super::ensure_agent_session(&pool, &omon_gateway::SessionContext::new(bot84.clone()))
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json)
+             VALUES ('msg-42-main', ?, 'user', 'turn 42', '[]')",
+        )
+        .bind(bot42.storage_key())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json)
+             VALUES ('msg-84-main', ?, 'user', 'turn 84', '[]')",
+        )
+        .bind(bot84.storage_key())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        omon_gateway::storage::mark_session_resume_pending(&pool, &bot42.storage_key())
+            .await
+            .unwrap();
+        omon_gateway::storage::mark_session_resume_pending(&pool, &bot84.storage_key())
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Option<String>, String)>(4);
+
+        struct BotRecorderRunner(tokio::sync::mpsc::Sender<(Option<String>, String)>);
+        #[async_trait::async_trait]
+        impl omon_gateway::AgentRunner for BotRecorderRunner {
+            async fn run(
+                &self,
+                session: &mut omon_gateway::SessionContext,
+                event: omon_gateway::InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                let _ = self
+                    .0
+                    .send((session.key.bot_id.clone(), event.content))
+                    .await;
+                Ok(())
+            }
+        }
+
+        let multiplexer = omon_gateway::SessionMultiplexer::new(
+            pool.clone(),
+            std::sync::Arc::new(BotRecorderRunner(tx)),
+            omon_gateway::MultiplexerConfig::default(),
+        );
+
+        let recovered = super::recover_resume_pending_sessions(&pool, &multiplexer)
+            .await
+            .unwrap();
+        assert_eq!(recovered, 2);
+
+        let ev1 = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("first event timeout")
+            .expect("first event channel closed");
+        let ev2 = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("second event timeout")
+            .expect("second event channel closed");
+
+        let runs = [ev1, ev2];
+        assert!(runs
+            .iter()
+            .any(|(b, c)| b.as_deref() == Some("42") && c == "turn 42"));
+        assert!(runs
+            .iter()
+            .any(|(b, c)| b.as_deref() == Some("84") && c == "turn 84"));
+    }
+
+    #[tokio::test]
+    async fn restart_chain_preserves_pending_until_explicit_input() {
+        use omon_gateway::RestartLoopGuard;
+
+        struct RecordingRunner(tokio::sync::mpsc::UnboundedSender<String>);
+        #[async_trait::async_trait]
+        impl omon_gateway::AgentRunner for RecordingRunner {
+            async fn run(
+                &self,
+                _session: &mut omon_gateway::SessionContext,
+                event: omon_gateway::InboundEvent,
+            ) -> omon_gateway::Result<()> {
+                self.0.send(event.content).unwrap();
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", temp.path().join("gateway.db").display());
+        let pool = omon_gateway::storage::init_pool(&url).await.unwrap();
+        let key = omon_gateway::SessionKey::new(
+            "discord",
+            None::<String>,
+            "restart-channel",
+            None::<String>,
+            "owner",
+        );
+        super::ensure_agent_session(&pool, &omon_gateway::SessionContext::new(key.clone()))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content, metadata_json)
+             VALUES ('restart-pending', ?, 'user', 'old pending', '[]')",
+        )
+        .bind(key.storage_key())
+        .execute(&pool)
+        .await
+        .unwrap();
+        omon_gateway::storage::mark_session_resume_pending(&pool, &key.storage_key())
+            .await
+            .unwrap();
+        let path = temp.path().join("restart_loop.json");
+        assert!(!RestartLoopGuard::new(&path).check_and_record_at(0.0));
+        assert!(!RestartLoopGuard::new(&path).check_and_record_at(150.0));
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let multiplexer = omon_gateway::SessionMultiplexer::new(
+            pool.clone(),
+            std::sync::Arc::new(RecordingRunner(sent)),
+            omon_gateway::MultiplexerConfig::default(),
+        );
+        let recovered = if RestartLoopGuard::new(&path).check_and_record_at(300.0) {
+            0
+        } else {
+            super::recover_resume_pending_sessions(&pool, &multiplexer)
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            recovered, 0,
+            "slow restart loop must not automatically rerun work"
+        );
+        assert_eq!(multiplexer.active_sessions(), 0);
+        assert_eq!(
+            omon_gateway::storage::count_resume_pending_sessions(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        multiplexer
+            .route(omon_gateway::InboundEvent::message(
+                key.clone(),
+                "explicit-after-breaker",
+                "explicit new input",
+            ))
+            .await
+            .unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed, "explicit new input");
+        multiplexer.stop(&key).await.unwrap();
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -2034,11 +3083,15 @@ mod runner_tests {
             last_error: None,
             last_delivery_error: None,
             deliver: None,
+            failure_deliver: None,
             origin: None,
             enabled_toolsets: None,
             workdir: None,
             attach_to_session: None,
             timeout_secs: None,
+            monitor_script: None,
+            monitor_url: None,
+            monitor_state: None,
             extra: extra.clone(),
         };
         let loaded = load_cron_skills(&partial_job).unwrap();
@@ -2071,11 +3124,15 @@ mod runner_tests {
             last_error: None,
             last_delivery_error: None,
             deliver: None,
+            failure_deliver: None,
             origin: None,
             enabled_toolsets: None,
             workdir: None,
             attach_to_session: None,
             timeout_secs: None,
+            monitor_script: None,
+            monitor_url: None,
+            monitor_state: None,
             extra: extra.clone(),
         };
         let loaded_warn = load_cron_skills(&missing_with_prompt_job).unwrap();
@@ -2110,11 +3167,15 @@ mod runner_tests {
             last_error: None,
             last_delivery_error: None,
             deliver: None,
+            failure_deliver: None,
             origin: None,
             enabled_toolsets: None,
             workdir: None,
             attach_to_session: None,
             timeout_secs: None,
+            monitor_script: None,
+            monitor_url: None,
+            monitor_state: None,
             extra,
         };
         let err = load_cron_skills(&empty_prompt_missing_job).unwrap_err();
@@ -2215,11 +3276,15 @@ mod runner_tests {
             last_error: None,
             last_delivery_error: None,
             deliver: None,
+            failure_deliver: None,
             origin: None,
             enabled_toolsets: None,
             workdir: None,
             attach_to_session: None,
             timeout_secs: None,
+            monitor_script: None,
+            monitor_url: None,
+            monitor_state: None,
             extra,
         };
 

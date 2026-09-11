@@ -1,0 +1,16 @@
+[
+  "cargo test --lib storage::db::tests::resume_pending_preserves_bot_identity -- --exact --nocapture",
+  "cargo test --lib resume_pending_preserves_bot_identity -- --nocapture",
+  "cargo test --bin omo-gateway test_recover_pending_delivery_obligations_preserves_bot_identity -- --nocapture",
+  "cargo test --bin omo-gateway test_recover_resume_pending_sessions_preserves_bot_identity -- --nocapture",
+  "cargo test --lib models::session::tests::storage_key_strict_inverse_round_trip -- --exact --nocapture",
+  "cargo test --lib models::session::tests::storage_key_parser_rejects_malformed_inputs -- --exact --nocapture",
+  "cargo test --lib models::session -- --nocapture",
+  "cargo test --lib storage::db -- --nocapture",
+  "cargo test --bin omo-gateway test_recover_ -- --nocapture",
+  "cargo test --test test_multiplexer -- --nocapture",
+  "cargo test --test test_omo_backend -- --nocapture",
+  "cargo build",
+  "rustfmt --edition 2021 --check src/models/session.rs src/storage/db.rs src/main.rs",
+  "git --no-pager diff --check src/models/session.rs src/storage/db.rs src/main.rs"
+]

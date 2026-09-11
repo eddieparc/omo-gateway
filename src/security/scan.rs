@@ -139,6 +139,25 @@ pub fn scan_cron_prompt(text: &str) -> Vec<String> {
     threats
 }
 
+pub fn scan_assembled_cron_prompt(text: &str) -> Vec<String> {
+    let mut threats = Vec::new();
+    if text.trim().is_empty() {
+        return threats;
+    }
+
+    if contains_invisible_chars(text) {
+        threats.push("invisible_unicode: hidden or zero-width unicode characters detected".into());
+    }
+
+    for (pattern, description) in PROMPT_INJECTION_PATTERNS.iter() {
+        if pattern.is_match(text) {
+            threats.push((*description).to_string());
+        }
+    }
+
+    threats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

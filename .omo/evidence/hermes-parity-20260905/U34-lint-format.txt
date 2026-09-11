@@ -1,0 +1,5 @@
+=== rustfmt --check --edition 2021 src/discord/table_render/mod.rs ===
+EXIT: 0
+
+=== git diff --check -- src/discord/table_render/mod.rs ===
+EXIT: 0

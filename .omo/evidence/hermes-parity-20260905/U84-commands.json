@@ -1,0 +1,9 @@
+[
+  "cargo test --lib readiness::tests::disk_pressure_uses_absolute_headroom -- --exact --nocapture",
+  "cargo test --bin omo-gateway legacy::dashboard::tests::disk_pressure_real_loopback_http_surface -- --exact --nocapture",
+  "cargo test --lib readiness::tests -- --nocapture",
+  "cargo test --bin omo-gateway legacy::dashboard::tests -- --nocapture",
+  "cargo build",
+  "rustfmt --edition 2021 --check src/readiness.rs src/dashboard.rs",
+  "git diff --check src/readiness.rs src/dashboard.rs"
+]

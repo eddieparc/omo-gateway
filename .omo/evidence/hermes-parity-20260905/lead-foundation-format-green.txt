@@ -1,0 +1,3 @@
+Command: cargo fmt --all -- --check && git diff --check
+status: completed exit_code: 0
+(no new output)

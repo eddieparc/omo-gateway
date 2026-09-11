@@ -1,0 +1,7 @@
+[
+  "cargo test --bin omo-gateway dashboard_rejects_untrusted_host_and_ws_origin -- --nocapture",
+  "cargo test --bin omo-gateway dashboard -- --nocapture",
+  "cargo build --bin omo-gateway",
+  "rustfmt --edition 2021 --check src/dashboard.rs",
+  "git diff --check src/dashboard.rs"
+]

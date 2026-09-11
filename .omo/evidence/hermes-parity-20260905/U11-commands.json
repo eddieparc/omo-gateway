@@ -1,0 +1,13 @@
+[
+  "cargo test --lib yolo_toggle_matches_effective_state_across_reset_and_restart",
+  "cargo test --lib discord::commands::tests::yolo_toggle_matches_effective_state_across_reset_and_restart -- --exact --nocapture",
+  "cargo test --lib discord::approval::tests::test_twin_bot_same_dm_yolo_restoration -- --exact --nocapture",
+  "cargo test --lib discord::approval::tests::test_yolo_persistence_roundtrip_and_restart -- --exact --nocapture",
+  "cargo test --lib storage::db::tests::mark_session_suspended_fails_on_malformed_state_without_overwriting -- --exact --nocapture",
+  "cargo test --lib discord::commands::tests",
+  "cargo test --lib discord::approval::tests",
+  "cargo test --lib storage::db",
+  "cargo build",
+  "rustfmt --edition 2021 --check src/storage/db.rs src/discord/approval.rs src/discord/commands.rs src/main.rs",
+  "git --no-pager diff --check src/storage/db.rs src/discord/approval.rs src/discord/commands.rs src/main.rs"
+]

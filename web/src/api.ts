@@ -151,16 +151,16 @@ export const api = {
   health: () => request<{ status: string }>('/api/health'),
   config: () => request<JsonObject>('/api/config'),
   sessions: (search?: string) =>
-    request<ApiList<SessionRecord>>(search ? `/api/sessions?q=${encodeURIComponent(search)}` : '/api/sessions'),
+    request<ApiList<SessionRecord>>(search ? `/api/sessions?search=${encodeURIComponent(search)}` : '/api/sessions'),
   session: (id: string) => request<SessionRecord>(`/api/sessions/${encodeURIComponent(id)}`),
   sessionMessages: (id: string) =>
     request<ApiList<SessionMessage>>(`/api/sessions/${encodeURIComponent(id)}/messages`),
   deleteSession: (id: string) =>
     request<void>(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  postChat: (id: string, content: string) =>
+  postChat: (id: string, message: string) =>
     request<{ response: string }>(`/api/sessions/${encodeURIComponent(id)}/chat`, {
       method: 'POST',
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ message }),
     }),
   cronJobs: () => request<ApiList<CronJob>>('/api/cron/jobs'),
   cronJob: (id: string) => request<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}`),

@@ -1,0 +1,168 @@
+=== CUTOVER VERIFICATION COMMAND EXECUTION LOGS ===
+Captured: 2026-09-08
+Target: /Users/indo/code/project/omon-gateway
+Scope: U52 (Durable Cron Ownership), U53 (Quiesced Receipt-Verified All-Store Cutover), U54 (Dry-Run Shares Full Import Validation)
+
+================================================================================
+Command 1: cargo test --test test_migrate cutover_survives_startup_sync -- --exact --nocapture
+Unit: U52 / Finding: CFG.C01
+================================================================================
+Exit status: 0
+Output:
+    Blocking waiting for file lock on build directory
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.43s
+     Running tests/test_migrate.rs (target/debug/deps/test_migrate-886788bceb99fc64)
+
+running 1 test
+C01 RED check: count after migrate = 1, count after startup sync = 1
+test cutover_survives_startup_sync ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.03s
+
+================================================================================
+Command 2: cargo test --test test_migrate changed_payload_blocks_cutover -- --exact --nocapture
+Unit: U53 / Finding: CFG.C07
+================================================================================
+Exit status: 0
+Output:
+    Blocking waiting for file lock on build directory
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 32.38s
+     Running tests/test_migrate.rs (target/debug/deps/test_migrate-886788bceb99fc64)
+
+running 1 test
+test changed_payload_blocks_cutover ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.01s
+
+================================================================================
+Command 3: cargo test --test test_migrate cutover_second_store_failure_preserves_bytes_and_receipt -- --exact --nocapture
+Unit: U53 / Finding: CFG.C07
+================================================================================
+Exit status: 0
+Output:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
+     Running tests/test_migrate.rs (target/debug/deps/test_migrate-886788bceb99fc64)
+
+running 1 test
+test cutover_second_store_failure_preserves_bytes_and_receipt ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.03s
+
+================================================================================
+Command 4: cargo test --test test_migrate dry_run_reports_nonimportable_jobs -- --exact --nocapture
+Unit: U54 / Finding: CFG.C08
+================================================================================
+Exit status: 0
+Output:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running tests/test_migrate.rs (target/debug/deps/test_migrate-886788bceb99fc64)
+
+running 1 test
+test dry_run_reports_nonimportable_jobs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.04s
+
+================================================================================
+Command 5: cargo test --test test_cron_authority_upgrade test_migration_0022_backfill_legacy_imported_rows -- --exact --nocapture
+Unit: U52 / Schema Migration 0022 Backfill
+================================================================================
+Exit status: 0
+Output:
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.51s
+     Running tests/test_cron_authority_upgrade.rs (target/debug/deps/test_cron_authority_upgrade-e1f20f06beaae458)
+
+running 1 test
+Upgrade check: legacy_authority=hermes_mirror, native_authority=omon_owned
+test test_migration_0022_backfill_legacy_imported_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+================================================================================
+Command 6: cargo test --test test_migrate
+Full migrate integration test suite
+================================================================================
+Exit status: 0
+Output:
+    Blocking waiting for file lock on build directory
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 52s
+     Running tests/test_migrate.rs (target/debug/deps/test_migrate-886788bceb99fc64)
+
+running 9 tests
+test secret_files_are_private_and_backup_unique ... ok
+test cutover_second_store_failure_preserves_bytes_and_receipt ... ok
+test cutover_survives_startup_sync ... ok
+test dry_run_without_database_reports_creation_without_creating_it ... ok
+test dry_run_projects_every_step_with_zero_writes_or_side_effects ... ok
+test changed_payload_blocks_cutover ... ok
+test private_migration_os_surface_controls ... ok
+test dry_run_reports_nonimportable_jobs ... ok
+test full_migration_imports_config_and_cron_before_cutover ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+================================================================================
+Command 7: cargo test --lib migrate
+Unit test suite for migration module
+================================================================================
+Exit status: 0
+Output:
+   Compiling omo-gateway v0.1.0 (/Users/indo/code/project/omon-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.38s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-e129d555675071bf)
+
+running 49 tests
+test migrate::config_import::tests::malformed_yaml_is_typed_and_never_writes_target ... ok
+test migrate::config_import::tests::malformed_hermes_root_path_is_typed_and_never_writes_target ... ok
+test migrate::config_import::tests::omits_missing_and_empty_values ... ok
+test migrate::config_import::tests::routes_non_claude_custom_provider_to_openai_compatible_keys ... ok
+test migrate::config_import::tests::env_parser_ignores_comments_and_uses_last_value_in_a_file ... ok
+test migrate::config_import::tests::dedupes_profile_tokens_in_stable_order_and_strips_quotes ... ok
+test migrate::config_import::tests::routes_claude_model_to_anthropic_and_maps_runtime_keys ... ok
+test migrate::config_import::tests::dry_run_returns_masked_diff_and_performs_zero_writes ... ok
+test migrate::config_import::tests::root_scalar_values_win_over_profile_fallbacks ... ok
+test migrate::config_import::tests::dotenv_raw_documents_round_trip ... ok
+test migrate::config_import::tests::imported_values_round_trip_through_runtime_environment_parsing ... ok
+test migrate::cron_cutover::tests::stale_store_state_is_rejected_before_backup ... ok
+test migrate::config_import::tests::merges_into_existing_env_and_backs_up_original ... ok
+test migrate::gateway_down::tests::every_matching_plist_is_booted_out_then_renamed_disabled ... ok
+test migrate::config_import::tests::dotenv_existing_assignments_reload_special_values ... ok
+test migrate::gateway_down::tests::malformed_locks_refuse_before_side_effects ... ok
+test migrate::gateway_down::tests::dry_run_reports_intended_actions_with_zero_side_effects ... ok
+test migrate::gateway_down::tests::failed_bootout_preserves_files_and_never_signals ... ok
+test migrate::gateway_down::tests::matching_start_wrong_live_command_never_signaled ... ok
+test migrate::gateway_down::tests::not_loaded_bootout_is_success_and_plist_is_still_disabled ... ok
+test migrate::gateway_down::tests::alive_pids_terminate_then_escalate_only_when_still_alive ... ok
+test migrate::gateway_down::tests::pid_that_dies_during_bounded_wait_is_not_killed ... ok
+test migrate::gateway_down::tests::kill_timeout_preserves_lock_and_is_bounded ... ok
+test migrate::gateway_down::tests::pid_alive_after_bounded_wait_is_killed ... ok
+test migrate::gateway_down::tests::stale_pid_lock_is_removed_and_disabled_plists_remain_a_no_op ... ok
+test migrate::gateway_down::tests::reused_pid_during_term_wait_never_receives_kill ... ok
+test migrate::gateway_down::tests::service_unloads_before_verified_signals_and_delayed_kill_exit ... ok
+test migrate::gateway_down::tests::valid_and_invalid_gateway_command_lines ... ok
+test migrate::sys::tests::fake_clock_is_injectable ... ok
+test migrate::gateway_down::tests::unknown_or_conflicting_identity_never_authorizes_signals ... ok
+test migrate::gateway_down::tests::stale_pid_never_signaled ... ok
+test migrate::sys::tests::fake_read_only_path_rejects_writes ... ok
+test migrate::sys::tests::fake_filesystem_write_read_rename_and_exists_are_coherent ... ok
+test migrate::sys::tests::fake_records_process_and_launchctl_calls_without_os_env ... ok
+test migrate::sys::tests::subprocess_injected_notifier_failure_kills_and_reaps_child_without_hang ... ok
+test migrate::sys::tests::os_env_reads_self_command_line ... ok
+test migrate::sys::tests::subprocess_simultaneous_large_stdout_stderr_does_not_deadlock ... ok
+test migrate::config_import::tests::dotenv_round_trip_special_values ... ok
+test migrate::cron_cutover::tests::unimported_job_returns_typed_error_without_changing_store ... ok
+test migrate::cron_cutover::tests::dry_run_reports_unverified_jobs_and_performs_zero_writes ... ok
+test migrate::cron_cutover::tests::malformed_store_returns_typed_error_and_performs_no_writes ... ok
+test migrate::cron_cutover::tests::reconcile_refuses_unknown_store_state_without_destroying_source ... ok
+test migrate::cron_cutover::tests::alias_store_locks_deduplicate_safely ... ok
+test migrate::cron_cutover::tests::rerun_on_empty_store_creates_no_second_backup ... ok
+test migrate::cron_cutover::tests::profiles_are_discovered_from_the_profiles_directory ... ok
+test migrate::cron_cutover::tests::backup_bytes_equal_the_pre_delete_store ... ok
+test migrate::cron_cutover::tests::verified_jobs_are_backed_up_then_atomically_emptied ... ok
+test migrate::gateway_down::tests::migration_entry_retires_service_with_real_files_and_database ... ok
+test migrate::sys::tests::subprocess_timeout_kills_and_reaps_owned_child ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 313 filtered out; finished in 0.24s

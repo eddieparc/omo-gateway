@@ -1,0 +1,8 @@
+[
+  "umask 022; cargo test --test test_migrate secret_files_are_private_and_backup_unique -- --exact --nocapture",
+  "umask 022; cargo test --test test_migrate",
+  "cargo test --lib migrate::",
+  "cargo build",
+  "umask 022; python3 .omo/evidence/hermes-parity-20260905/U50-cli.py",
+  "git diff --check -- src/migrate/sys.rs src/migrate/config_import.rs src/migrate/cron_cutover.rs tests/test_migrate.rs"
+]

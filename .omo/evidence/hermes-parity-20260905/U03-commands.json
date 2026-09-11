@@ -1,0 +1,6 @@
+[
+  "cargo test --lib discord::approval::tests::approval_lifecycle_cleans_all_surfaces_and_isolates_bots -- --exact --nocapture",
+  "cargo test --lib discord::approval::tests::approval_lifecycle_drop_cleans_pending -- --exact --nocapture",
+  "cargo test --lib discord::adapter::tests::approval_dead_target_refuses_delivery -- --exact --nocapture",
+  "cargo test --bin omo-gateway legacy::dashboard::tests::approval_lifecycle_local_http_surface -- --exact --nocapture"
+]

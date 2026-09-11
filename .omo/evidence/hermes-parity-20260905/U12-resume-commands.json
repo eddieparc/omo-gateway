@@ -1,0 +1,8 @@
+{
+  "task": "st_01a07201",
+  "red": "cargo test --test test_omo_backend test_omo_backend_waits_for_final_message_after_tool_activity -- --exact --nocapture",
+  "green": "cargo test --test test_omo_backend test_omo_backend_waits_for_final_message_after_tool_activity -- --exact --nocapture",
+  "suite": "cargo test --test test_omo_backend",
+  "build": "cargo build",
+  "registration": "Exact clock command was already registered in U12-evidence.md before this child ran RED. This resume command manifest was written after RED/GREEN/suite and before build, not claimed as prior registration."
+}

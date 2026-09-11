@@ -1,0 +1,23 @@
+status: completed exit_code: 0
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.51s
+     Running unittests src/lib.rs (target/debug/deps/omon_gateway-dbf1c807bcd6f72f)
+
+running 1 test
+detector hardline "rm -rf //*": Some("recursive delete of root filesystem")
+detector hardline "echo \"$(reboot)\"": Some("system shutdown/reboot")
+detector hardline "grep \"$(reboot)\" file": Some("system shutdown/reboot")
+detector dangerous "python3 -cprint(1)": true, expected true
+detector dangerous "node --eval=process.exit(0)": true, expected true
+detector dangerous "rg --pre ./helper needle file": true, expected true
+detector dangerous "python script.py -c": false, expected false
+detector dangerous "bash --norc script.sh": false, expected false
+detector dangerous "echo 'reboot'": false, expected false
+argv rm: result=Err(Approval("command was rejected by the user")), exists=true, requests=1
+argv printf: Ok(Object {"exit_code": Number(0), "stderr": String(""), "stderr_truncated": Bool(false), "stdout": String("a'b"), "stdout_truncated": Bool(false), "success": Bool(true)})
+shell "echo \"$(reboot)\"": Err(Approval("BLOCKED (hardline): system shutdown/reboot. This command is on the unconditional blocklist and cannot be executed.")), marker=false
+shell "grep \"$(reboot)\" file": Err(Approval("BLOCKED (hardline): system shutdown/reboot. This command is on the unconditional blocklist and cannot be executed.")), marker=false
+rg helper: Err(Approval("command was rejected by the user")), marker=false, requests=1
+test tools::terminal::approval_tests::approval_detector_preserves_executable_semantics ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 297 filtered out; finished in 1.21s

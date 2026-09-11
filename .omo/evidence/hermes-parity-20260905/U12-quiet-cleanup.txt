@@ -1,0 +1,26 @@
+Protected before/after hashes: identical (diff exit 0)
+Remaining backend test processes:
+
+Final tracked status (preexisting parallel work retained):
+ M src/agent/omo_backend.rs
+ M src/agent/omo_config.rs
+ M src/agent/omo_daemon.rs
+ M src/discord/approval.rs
+ M src/discord/table_render/mod.rs
+ M src/drain_control.rs
+ M src/main.rs
+ M src/migrate/config_import.rs
+ M src/migrate/cron_cutover.rs
+ M src/migrate/gateway_down.rs
+ M src/migrate/sys.rs
+ M src/multiplexer/restart_loop_guard.rs
+ M src/security/hardline.rs
+ M src/security/normalize.rs
+ M src/security/tirith.rs
+ M src/storage/db.rs
+ M src/tools/mod.rs
+ M src/tools/skills.rs
+ M src/tools/terminal.rs
+ M tests/test_migrate.rs
+ M tests/test_omo_backend.rs
+?? .omo/evidence/hermes-parity-20260905/

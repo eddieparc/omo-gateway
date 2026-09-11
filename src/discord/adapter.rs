@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -10,7 +10,7 @@ use serenity::all::{
     ChannelId, ChannelType, Color, CreateAllowedMentions, CreateAttachment, CreateEmbed,
     CreateForumPost, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
     CreateThread, EditMessage, FullEvent, GatewayIntents, GetMessages, HttpBuilder, Interaction,
-    Message, MessageFlags, MessageId, Typing, UserId,
+    Message, MessageId, Typing, UserId,
 };
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
@@ -19,20 +19,66 @@ use uuid::Uuid;
 use super::approval::{
     approval_buttons, is_approval_custom_id, parse_custom_id, ApprovalDecision, SmartApprovalGuard,
 };
+pub use super::commands::is_channel_authorized;
 use super::commands::{self, is_user_authorized, CommandError, PoiseData};
+use super::pairing::PairingStore;
 use super::throttler::{
-    chunk_markdown, DiscordMessageTransport, LiveEditThrottler, SerenityMessageTransport,
-    DISCORD_MESSAGE_LIMIT,
+    bound_split_messages, chunk_markdown, DiscordMessageTransport, LiveEditThrottler,
+    SerenityMessageTransport, DISCORD_MESSAGE_LIMIT, MAX_SPLIT_MESSAGES,
 };
 use crate::{
     DeliveryLedgerService, InboundEvent, MessageAttachment, OmonError, OutboundAction,
     OutboundDispatcher, Result, SessionKey,
 };
+use chrono::{DateTime, Utc};
 
 static MEDIA_DIRECTIVE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"[`"']?MEDIA:\s*[`"']?([^`"'\r\n]+?)[`"']?(?:$|\s)"#)
-        .expect("valid media directive regex")
+    Regex::new(
+        r#"(?i)(?:[`"'])?MEDIA:\s*(?:"([^"\r\n]+)"|'([^'\r\n]+)'|`([^`\r\n]+)`|([^\s`"'\r\n]+))(?:[`"'])?"#,
+    )
+    .expect("valid media directive regex")
 });
+
+/// Validates that a media path exists and is located within an authorized directory
+/// (e.g. system temp directory or current working directory / workspace).
+pub fn validate_media_path(raw_path: &str) -> Result<PathBuf> {
+    let path = Path::new(raw_path);
+    if !path.exists() {
+        return Err(OmonError::Config(format!(
+            "media file does not exist: {raw_path}"
+        )));
+    }
+    let canonical = path.canonicalize().map_err(|e| {
+        OmonError::Config(format!("failed to canonicalize media path {raw_path}: {e}"))
+    })?;
+
+    let temp_dir = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let cwd = std::env::current_dir()
+        .and_then(|p| p.canonicalize())
+        .unwrap_or_else(|_| PathBuf::from("."));
+
+    let canonical_str = canonical.to_string_lossy();
+    let is_in_temp = canonical.starts_with(&temp_dir)
+        || canonical_str.starts_with("/tmp")
+        || canonical_str.starts_with("/private/tmp")
+        || canonical_str.starts_with("/var/tmp");
+    let is_in_cwd = canonical.starts_with(&cwd);
+
+    if canonical_str.starts_with("/etc")
+        || canonical_str.starts_with("/proc")
+        || canonical_str.starts_with("/sys")
+        || canonical_str.contains(".ssh")
+        || canonical_str.contains(".gnupg")
+        || (!is_in_temp && !is_in_cwd)
+    {
+        return Err(OmonError::Config(format!(
+            "media path outside authorized roots: {raw_path}"
+        )));
+    }
+    Ok(canonical)
+}
 
 /// Extracts `MEDIA:<path>` directives from text, returning `(text_without_media, paths)`.
 /// Directives like `[[audio_as_voice]]` and `[[as_document]]` are also stripped.
@@ -45,20 +91,22 @@ pub fn extract_media_directives(text: &str) -> (String, Vec<String>) {
         .replace("[[as_document]]", "");
 
     for line in preprocessed.lines() {
-        if !line.contains("MEDIA:") {
+        if !line.to_uppercase().contains("MEDIA:") {
             cleaned_lines.push(line.to_string());
             continue;
         }
 
         let mut line_paths = Vec::new();
         for caps in MEDIA_DIRECTIVE_RE.captures_iter(line) {
-            if let Some(matched) = caps.get(1) {
-                let raw_path = matched.as_str().trim();
-                let clean_path = raw_path
-                    .trim_matches(|c| c == '"' || c == '\'' || c == '`')
-                    .trim();
+            let path_opt = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .or_else(|| caps.get(3))
+                .or_else(|| caps.get(4))
+                .map(|m| m.as_str().trim().to_string());
+            if let Some(clean_path) = path_opt {
                 if !clean_path.is_empty() {
-                    line_paths.push(clean_path.to_string());
+                    line_paths.push(clean_path);
                 }
             }
         }
@@ -101,67 +149,9 @@ pub fn safe_allowed_mentions() -> CreateAllowedMentions {
         .replied_user(true)
 }
 
-const SILENCE_SENTINELS: &[&str] = &["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"];
-
-static SILENCE_NARRATION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)^[\s*_~`]*\(?\s*(silent|silence|no\s+response|no\s+reply)\s*\.?\)?[\\s*_~`]*$|^[\s*_~`]*[\x{1f507}\.\x{2026}]+[\s*_~`]*$",
-    )
-    .expect("valid silence narration regex")
-});
-
-fn strip_edge_silence_punctuation(text: &str) -> &str {
-    let trimmed = text.trim();
-    let start = trimmed
-        .char_indices()
-        .find(|&(_, c)| !c.is_ascii_punctuation() || c == '[' || c == ']')
-        .map(|(idx, _)| idx)
-        .unwrap_or(trimmed.len());
-    let end = trimmed
-        .char_indices()
-        .rfind(|&(_, c)| !c.is_ascii_punctuation() || c == '[' || c == ']')
-        .map(|(idx, c)| idx + c.len_utf8())
-        .unwrap_or(0);
-    if start >= end {
-        ""
-    } else {
-        &trimmed[start..end]
-    }
-}
-
-/// Returns `true` if `text` is an intentional silence response sentinel or anti-loop narration token.
-pub fn is_silence_response(text: &str) -> bool {
-    let stripped = text.trim();
-    if stripped.is_empty() {
-        return true;
-    }
-    if stripped.chars().count() > 64 {
-        return false;
-    }
-
-    let normalized: String = stripped
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_uppercase();
-    if SILENCE_SENTINELS.contains(&normalized.as_str()) {
-        return true;
-    }
-
-    let edge_stripped = strip_edge_silence_punctuation(stripped);
-    if !edge_stripped.is_empty() {
-        let normalized_edge: String = edge_stripped
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_uppercase();
-        if SILENCE_SENTINELS.contains(&normalized_edge.as_str()) {
-            return true;
-        }
-    }
-
-    SILENCE_NARRATION_RE.is_match(stripped)
-}
+pub use crate::models::{
+    filter_reasoning, is_explicit_silence, is_silence_response, SILENCE_SENTINELS,
+};
 
 /// Maximum character length for hydrated referenced message context.
 pub const REFERENCED_CONTENT_CAP: usize = 500;
@@ -428,6 +418,7 @@ pub struct InboundFilterConfig<'a> {
     pub allow_all_users: bool,
     pub thread_sessions_per_user: bool,
     pub active_threads: &'a [u64],
+    pub thread_owners: &'a [(u64, u64)],
     pub allowed_channels: &'a [u64],
     pub ignored_channels: &'a [u64],
     pub primary_bot_id: Option<u64>,
@@ -447,6 +438,7 @@ impl Default for InboundFilterConfig<'_> {
             allow_all_users: false,
             thread_sessions_per_user: true,
             active_threads: &[],
+            thread_owners: &[],
             allowed_channels: &[],
             ignored_channels: &[],
             primary_bot_id: None,
@@ -456,6 +448,18 @@ impl Default for InboundFilterConfig<'_> {
             parent_channel_id: None,
         }
     }
+}
+
+/// Determines if an incoming message satisfies all prerequisites for auto-thread creation.
+/// Auto-thread creation must NOT trigger for inline replies or channels already free of thread-forcing.
+pub fn should_auto_create_thread(
+    auto_thread_enabled: bool,
+    is_guild_text: bool,
+    is_explicit_mention: bool,
+    is_free_channel: bool,
+    is_reply: bool,
+) -> bool {
+    auto_thread_enabled && is_guild_text && is_explicit_mention && !is_free_channel && !is_reply
 }
 
 /// Composes reply context prefixing the user body with a quote block of the referenced message.
@@ -507,15 +511,35 @@ pub fn coalesce_inbound_events(events: Vec<InboundEvent>) -> Option<InboundEvent
     if events.is_empty() {
         return None;
     }
-    if events.len() == 1 {
-        return events.into_iter().next();
+
+    // Deduplicate constituent events BEFORE merge within the same batch
+    let mut unique_events = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for event in events {
+        let constituent_id = if !event.platform_message_id.is_empty() {
+            event.platform_message_id.clone()
+        } else if let Some(ref del_id) = event.delivery_id {
+            del_id.clone()
+        } else {
+            event.id.to_string()
+        };
+        if seen_ids.insert(constituent_id) {
+            unique_events.push(event);
+        }
     }
 
-    let first = &events[0];
-    let last = events.last().unwrap();
+    if unique_events.is_empty() {
+        return None;
+    }
+    if unique_events.len() == 1 {
+        return unique_events.into_iter().next();
+    }
+
+    let first = &unique_events[0];
+    let last = unique_events.last().unwrap();
     let session = first.session.clone();
 
-    let contents: Vec<&str> = events
+    let contents: Vec<&str> = unique_events
         .iter()
         .map(|e| e.content.as_str())
         .filter(|s| !s.trim().is_empty())
@@ -523,10 +547,10 @@ pub fn coalesce_inbound_events(events: Vec<InboundEvent>) -> Option<InboundEvent
     let content = contents.join("\n");
 
     let mut attachments = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
-    for event in &events {
+    let mut seen_att_ids = std::collections::HashSet::new();
+    for event in &unique_events {
         for attachment in &event.attachments {
-            if seen_ids.insert(attachment.id.clone()) {
+            if seen_att_ids.insert(attachment.id.clone()) {
                 attachments.push(attachment.clone());
             }
         }
@@ -546,9 +570,11 @@ pub fn coalesce_inbound_events(events: Vec<InboundEvent>) -> Option<InboundEvent
     Some(coalesced)
 }
 
+static NEXT_BATCH_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 struct DebounceBatch {
     events: Vec<InboundEvent>,
-    generation: u64,
+    token: u64,
 }
 
 #[derive(Clone)]
@@ -567,17 +593,18 @@ impl SplitMessageDebouncer {
 
     pub async fn enqueue(&self, event: InboundEvent, data: PoiseData) {
         let session = event.session.clone();
-        let (generation, delay) = {
+        let token = NEXT_BATCH_TOKEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay = {
             let mut lock = self.buffer.lock().await;
             let batch = lock
                 .entry(session.clone())
                 .or_insert_with(|| DebounceBatch {
                     events: Vec::new(),
-                    generation: 0,
+                    token,
                 });
             batch.events.push(event);
-            batch.generation += 1;
-            (batch.generation, self.duration)
+            batch.token = token;
+            self.duration
         };
 
         let buffer = self.buffer.clone();
@@ -586,7 +613,7 @@ impl SplitMessageDebouncer {
             let events_to_route = {
                 let mut lock = buffer.lock().await;
                 if let Some(batch) = lock.get(&session) {
-                    if batch.generation == generation {
+                    if batch.token == token {
                         lock.remove(&session).map(|b| b.events)
                     } else {
                         None
@@ -597,13 +624,28 @@ impl SplitMessageDebouncer {
             };
 
             if let Some(events) = events_to_route {
+                let mut constituent_ids: Vec<String> = Vec::new();
+                let mut seen_ids = std::collections::HashSet::new();
+                for e in &events {
+                    let c_id = e
+                        .delivery_id
+                        .clone()
+                        .unwrap_or_else(|| format!("discord:{}", e.platform_message_id));
+                    if seen_ids.insert(c_id.clone()) {
+                        constituent_ids.push(c_id);
+                    }
+                }
+
                 if let Some(coalesced) = coalesce_inbound_events(events) {
                     tracing::info!(
                         session = %coalesced.session,
                         delivery_id = ?coalesced.delivery_id,
                         "Flushing debounced/coalesced Discord message"
                     );
-                    if let Err(error) = route_claimed_event(&data, coalesced).await {
+                    if let Err(error) =
+                        route_claimed_event_with_constituents(&data, coalesced, &constituent_ids)
+                            .await
+                    {
                         tracing::error!(session = %session, %error, "failed to route debounced Discord event");
                     }
                 }
@@ -710,6 +752,7 @@ impl DiscordAdapter {
             allow_all_users: self.data.allow_all_users,
             thread_sessions_per_user: self.data.thread_sessions_per_user,
             active_threads: &active_threads,
+            thread_owners: &[],
             allowed_channels: &self.data.allowed_channels,
             ignored_channels: &self.data.ignored_channels,
             primary_bot_id: self.data.primary_bot_id,
@@ -758,7 +801,14 @@ async fn handle_event(
                         let parent_id = channel.parent_id.map(|id| id.get());
                         (Some(channel.kind), parent_id)
                     }
-                    _ => (None, None),
+                    _ => {
+                        tracing::warn!(
+                            channel = %new_message.channel_id,
+                            guild = ?new_message.guild_id,
+                            "Dropping message due to missing or failed guild channel metadata"
+                        );
+                        return Ok(());
+                    }
                 }
             } else {
                 (Some(ChannelType::Private), None)
@@ -777,10 +827,23 @@ async fn handle_event(
                 .map(|user| user.id)
                 .collect::<Vec<_>>();
             let is_explicit_mention = mentioned_bot_ids.contains(&bot_user_id);
-            let active_threads: Vec<u64> = data
+            let mut active_threads: Vec<u64> = data
                 .active_threads
                 .read()
                 .map(|set| set.iter().copied().collect())
+                .unwrap_or_default();
+            let thread_owner = if channel_type.is_some_and(is_thread) {
+                let tid = new_message.channel_id.get();
+                let owner = data.get_thread_owner_durable(tid).await;
+                if owner.is_some() && !active_threads.contains(&tid) {
+                    active_threads.push(tid);
+                }
+                owner
+            } else {
+                None
+            };
+            let thread_owners_buf: Vec<(u64, u64)> = thread_owner
+                .map(|owner| vec![(new_message.channel_id.get(), owner)])
                 .unwrap_or_default();
             let user_roles: Vec<u64> = if let Some(member) = &new_message.member {
                 member.roles.iter().map(|r| r.get()).collect()
@@ -801,6 +864,7 @@ async fn handle_event(
                 allow_all_users: data.allow_all_users,
                 thread_sessions_per_user: data.thread_sessions_per_user,
                 active_threads: &active_threads,
+                thread_owners: &thread_owners_buf,
                 allowed_channels: &data.allowed_channels,
                 ignored_channels: &data.ignored_channels,
                 primary_bot_id: data.primary_bot_id,
@@ -896,9 +960,26 @@ async fn handle_event(
                     }
                 }
 
+                let is_reply = new_message.kind
+                    == serenity::model::channel::MessageType::InlineReply
+                    || new_message.referenced_message.is_some();
+                let is_free_channel = data
+                    .free_response_channels
+                    .contains(&new_message.channel_id.get());
+
                 if channel_type.is_some_and(is_thread) {
-                    data.mark_thread_active(new_message.channel_id.get());
-                } else if data.auto_thread && is_guild_text && is_explicit_mention {
+                    if is_explicit_mention {
+                        data.mark_thread_owner(new_message.channel_id.get(), bot_user_id.get());
+                    } else {
+                        data.mark_thread_active(new_message.channel_id.get());
+                    }
+                } else if should_auto_create_thread(
+                    data.auto_thread,
+                    is_guild_text,
+                    is_explicit_mention,
+                    is_free_channel,
+                    is_reply,
+                ) {
                     let thread_name = derive_auto_thread_name(&new_message.content, bot_user_id);
                     let builder = CreateThread::new(thread_name);
                     match new_message
@@ -908,24 +989,42 @@ async fn handle_event(
                     {
                         Ok(thread_channel) => {
                             let thread_id_num = thread_channel.id.get();
-                            data.mark_thread_active(thread_id_num);
+                            data.mark_thread_owner(thread_id_num, bot_user_id.get());
                             tracing::info!(
                                 thread_id = %thread_id_num,
                                 parent_channel = %new_message.channel_id,
                                 "Auto-created thread on channel mention"
                             );
-                            if !data.thread_sessions_per_user {
-                                event.session.user_id = "shared".to_string();
-                            }
+                            event.session.user_id = String::new();
                             event.session.thread_id = Some(thread_channel.id.to_string());
-                            event.session.channel_id = thread_channel.id.to_string();
+                            event.session.channel_id = new_message.channel_id.to_string();
                         }
                         Err(error) => {
                             tracing::warn!(
                                 %error,
                                 channel = %new_message.channel_id,
-                                "Failed to auto-create thread from mention; falling back to in-channel reply"
+                                "Failed to auto-create thread from mention; aborting parent invocation"
                             );
+                            if data.processing_reactions {
+                                let _ = new_message
+                                    .channel_id
+                                    .create_reaction(
+                                        &ctx.http,
+                                        new_message.id,
+                                        serenity::all::ReactionType::Unicode(
+                                            crate::models::PROCESSING_FAILURE_EMOJI.to_string(),
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            let _ = new_message
+                                .channel_id
+                                .say(
+                                    &ctx.http,
+                                    format!("❌ Failed to create thread for conversation: {error}"),
+                                )
+                                .await;
+                            return Ok(());
                         }
                     }
                 }
@@ -939,24 +1038,26 @@ async fn handle_event(
                 }
             } else {
                 let is_dm = channel_type == Some(ChannelType::Private);
-                if is_dm
-                    && !data.allow_all_users
-                    && (!data.allowed_users.is_empty() || !data.allowed_roles.is_empty())
-                    && !new_message.author.bot
-                    && !data
-                        .pairing_store
-                        .is_user_paired(new_message.author.id.get())
-                        .await
+                if let Some(code) = decide_unauthorized_dm(
+                    is_dm,
+                    new_message.author.bot,
+                    new_message.author.id.get(),
+                    &data.pairing_store,
+                    data.allow_all_users,
+                    &data.allowed_users,
+                    &data.allowed_roles,
+                    Utc::now(),
+                )
+                .await
                 {
-                    if let Ok(code) = data
-                        .pairing_store
-                        .request_pairing_code(new_message.author.id.get())
-                        .await
-                    {
-                        let prompt = format!(
-                            "🔒 **Authorization Required**\nThis bot requires operator pairing. Your pairing code is `{code}`.\nAsk an administrator or operator to approve your access with `/pair {code}`."
-                        );
-                        let _ = new_message.channel_id.say(&ctx.http, prompt).await;
+                    let prompt = format!(
+                        "🔒 **Authorization Required**\nThis bot requires operator pairing. Your pairing code is `{code}`.\nAsk an administrator or operator to approve your access with `/pair {code}`."
+                    );
+                    if new_message.channel_id.say(&ctx.http, prompt).await.is_ok() {
+                        let _ = data
+                            .pairing_store
+                            .record_confirmed_delivery_at(new_message.author.id.get(), Utc::now())
+                            .await;
                     }
                 }
                 tracing::debug!(
@@ -1065,7 +1166,15 @@ async fn handle_event(
     Ok(())
 }
 
-async fn route_claimed_event(data: &PoiseData, mut event: InboundEvent) -> Result<bool> {
+pub async fn route_claimed_event(data: &PoiseData, event: InboundEvent) -> Result<bool> {
+    route_claimed_event_with_constituents(data, event, &[]).await
+}
+
+pub async fn route_claimed_event_with_constituents(
+    data: &PoiseData,
+    mut event: InboundEvent,
+    constituent_ids: &[String],
+) -> Result<bool> {
     if event.content.trim().eq_ignore_ascii_case("/stop") {
         let interrupted = data.multiplexer.stop(&event.session).await?;
         tracing::info!(session = %event.session, interrupted, "processed Discord text stop command");
@@ -1077,7 +1186,14 @@ async fn route_claimed_event(data: &PoiseData, mut event: InboundEvent) -> Resul
         .clone()
         .unwrap_or_else(|| format!("discord:{}", event.platform_message_id));
     let ledger = DeliveryLedgerService::new(data.pool.clone());
-    if !ledger.record_incoming_as(&event, &delivery_id).await? {
+    let recorded = if constituent_ids.is_empty() {
+        ledger.record_incoming_as(&event, &delivery_id).await?
+    } else {
+        ledger
+            .record_incoming_with_constituents(&event, &delivery_id, constituent_ids)
+            .await?
+    };
+    if !recorded {
         tracing::info!(delivery_id, "Ignoring duplicate Discord delivery");
         return Ok(false);
     }
@@ -1103,6 +1219,56 @@ async fn route_claimed_event(data: &PoiseData, mut event: InboundEvent) -> Resul
     Ok(true)
 }
 
+/// Claims and routes an event, resolving only once the turn reached a terminal outcome.
+///
+/// Returns `Ok(true)` when the turn completed durably, `Ok(false)` when the delivery was a
+/// duplicate, and `Err` when the turn itself failed so the caller can hold its cursor.
+pub async fn route_claimed_event_awaiting_turn(
+    data: &PoiseData,
+    mut event: InboundEvent,
+) -> Result<bool> {
+    let delivery_id = event
+        .delivery_id
+        .clone()
+        .unwrap_or_else(|| format!("discord:{}", event.platform_message_id));
+    let ledger = DeliveryLedgerService::new(data.pool.clone());
+    if !ledger.record_incoming_as(&event, &delivery_id).await? {
+        tracing::info!(delivery_id, "Ignoring duplicate Discord delivery");
+        return Ok(false);
+    }
+
+    if let Some(downloader) = &data.attachment_downloader {
+        for attachment in &mut event.attachments {
+            if let Err(error) = downloader.hydrate(attachment).await {
+                tracing::warn!(
+                    attachment_id = %attachment.id,
+                    filename = %attachment.filename,
+                    %error,
+                    "failed to download Discord attachment; routing remote metadata only"
+                );
+            }
+        }
+    }
+
+    event.delivery_id = Some(delivery_id.clone());
+    let session_storage_key = event.session.storage_key();
+    let platform_msg_id = event.platform_message_id.clone();
+    let event_id_str = event.id.to_string();
+    if let Err(error) = data.multiplexer.route_awaiting_turn(event).await {
+        ledger.mark_failed(&delivery_id, error.to_string()).await?;
+        let _ = sqlx::query(
+            "DELETE FROM messages WHERE session_key = ? AND (id = ? OR (platform_message_id != '' AND platform_message_id = ?))",
+        )
+        .bind(&session_storage_key)
+        .bind(&event_id_str)
+        .bind(&platform_msg_id)
+        .execute(&data.pool)
+        .await;
+        return Err(error);
+    }
+    Ok(true)
+}
+
 pub fn message_to_inbound(
     message: &Message,
     bot_user_id: serenity::UserId,
@@ -1113,6 +1279,64 @@ pub fn message_to_inbound(
         ..Default::default()
     };
     message_to_inbound_with_config(message, bot_user_id, channel_type, &config)
+}
+
+/// Determines if an unauthorized incoming DM message should trigger pairing code generation.
+/// Default unauthorized DM policy: ignore when explicit allowlist exists, pair when none.
+/// Paired users, bots, and allow_all configurations are never prompted.
+pub fn should_prompt_unauthorized_dm(
+    is_dm: bool,
+    is_bot: bool,
+    is_paired: bool,
+    allow_all_users: bool,
+    allowed_users: &[u64],
+    allowed_roles: &[u64],
+) -> bool {
+    if !is_dm || is_bot || allow_all_users || is_paired {
+        return false;
+    }
+    // Default unauthorized DM: ignore when explicit allowlist exists, pair when none
+    allowed_users.is_empty() && allowed_roles.is_empty()
+}
+
+/// Evaluates unauthorized DM admission and notification throttling, returning a pairing code prompt if eligible.
+#[allow(clippy::too_many_arguments)]
+pub async fn decide_unauthorized_dm(
+    is_dm: bool,
+    is_bot: bool,
+    user_id: u64,
+    pairing_store: &PairingStore,
+    allow_all_users: bool,
+    allowed_users: &[u64],
+    allowed_roles: &[u64],
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let is_paired = pairing_store.is_user_paired(user_id).await;
+    if !should_prompt_unauthorized_dm(
+        is_dm,
+        is_bot,
+        is_paired,
+        allow_all_users,
+        allowed_users,
+        allowed_roles,
+    ) {
+        return None;
+    }
+    match pairing_store
+        .check_and_record_notification_at(user_id, now)
+        .await
+    {
+        Ok(Some(code)) => Some(code),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(
+                %user_id,
+                %e,
+                "Failed to evaluate unauthorized DM pairing notification due to database error"
+            );
+            None
+        }
+    }
 }
 
 pub fn message_to_inbound_with_config(
@@ -1156,19 +1380,21 @@ pub fn message_to_inbound_with_config(
         return None;
     }
 
-    let is_dm = message.guild_id.is_none() || channel_type == Some(ChannelType::Private);
-    let channel_id_u64 = message.channel_id.get();
-
-    // Channel blacklist: if ignored_channels contains the channel id -> return None
-    if config.ignored_channels.contains(&channel_id_u64) {
+    // Missing/failed required guild metadata must not silently authorize.
+    if message.guild_id.is_some() && channel_type.is_none() {
         return None;
     }
 
-    // Channel whitelist: if allowed_channels is non-empty, guild channels must be in allowed_channels (DMs exempt)
-    if !is_dm
-        && !config.allowed_channels.is_empty()
-        && !config.allowed_channels.contains(&channel_id_u64)
-    {
+    let is_dm = message.guild_id.is_none() || channel_type == Some(ChannelType::Private);
+    let channel_id_u64 = message.channel_id.get();
+
+    if !is_channel_authorized(
+        channel_id_u64,
+        config.parent_channel_id,
+        config.allowed_channels,
+        config.ignored_channels,
+        is_dm,
+    ) {
         return None;
     }
 
@@ -1212,19 +1438,38 @@ pub fn message_to_inbound_with_config(
                 .parent_channel_id
                 .map(|pid| config.free_response_channels.contains(&pid))
                 .unwrap_or(false);
+        let thread_owner = is_thread
+            .then(|| {
+                config
+                    .thread_owners
+                    .iter()
+                    .find(|(tid, _)| *tid == message.channel_id.get())
+                    .map(|(_, bid)| *bid)
+            })
+            .flatten();
         let is_active_thread = is_thread
             && !config.thread_require_mention
             && (is_parent_free_channel
+                || thread_owner.is_some()
                 || config.active_threads.contains(&message.channel_id.get()));
         let is_implicit_response_channel = is_dm || is_active_thread || is_free_channel;
         if !is_implicit_response_channel {
             return None;
         }
-        // Guild threads and free-response channels are visible to every bot, so only
-        // the primary bot auto-responds there to avoid duplicate replies. DMs are 1:1
-        // per bot, so each bot must always answer its own DMs.
-        if !is_dm && config.primary_bot_id != Some(bot_user_id.get()) {
-            return None;
+
+        if !is_dm {
+            if is_thread {
+                if let Some(owner) = thread_owner {
+                    // Durable bot-specific thread ownership: only the engaged owner answers unmentioned followups
+                    if owner != bot_user_id.get() {
+                        return None;
+                    }
+                } else if config.primary_bot_id != Some(bot_user_id.get()) {
+                    return None;
+                }
+            } else if config.primary_bot_id != Some(bot_user_id.get()) {
+                return None;
+            }
         }
     }
 
@@ -1255,6 +1500,25 @@ pub fn message_to_inbound_with_config(
         .collect();
     attachments.extend(forwarded_attachments);
 
+    // D04: Union referenced parent attachments by ID before empty check so image replies
+    // ("analyze this") and attachment-only replies reach downloader and prompt rendering.
+    if let Some(parent) = &message.referenced_message {
+        for attachment in &parent.attachments {
+            let att_id = attachment.id.to_string();
+            if !attachments.iter().any(|existing| existing.id == att_id) {
+                attachments.push(MessageAttachment {
+                    id: att_id,
+                    filename: attachment.filename.clone(),
+                    url: attachment.url.clone(),
+                    content_type: attachment.content_type.clone(),
+                    size_bytes: Some(u64::from(attachment.size)),
+                    local_path: None,
+                    text_content: None,
+                });
+            }
+        }
+    }
+
     if raw_content.trim().is_empty() && attachments.is_empty() {
         return None; // Do NOT auto-inject "Hello!" for empty/system messages
     }
@@ -1281,12 +1545,19 @@ pub fn message_to_inbound_with_config(
     } else {
         raw_content
     };
-    let user_id = if is_thread && !config.thread_sessions_per_user {
-        "shared".to_string()
-    } else {
+    let user_id = if is_dm {
         message.author.id.to_string()
+    } else {
+        String::new()
     };
-    let channel_id = message.channel_id.to_string();
+    let channel_id = if is_thread {
+        config
+            .parent_channel_id
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| message.channel_id.to_string())
+    } else {
+        message.channel_id.to_string()
+    };
     let session = SessionKey::new(
         "discord",
         if is_dm {
@@ -1294,13 +1565,18 @@ pub fn message_to_inbound_with_config(
         } else {
             message.guild_id.map(|id| id.to_string())
         },
-        channel_id.clone(),
-        is_thread.then_some(channel_id),
+        channel_id,
+        is_thread.then(|| message.channel_id.to_string()),
         user_id,
     )
     .with_bot_id(bot_user_id.to_string());
     let mut event = InboundEvent::message(session, message.id.to_string(), content)
-        .with_attachments(attachments);
+        .with_attachments(attachments)
+        .with_received_at(
+            chrono::DateTime::parse_from_rfc3339(&message.timestamp.to_string())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+        );
     let delivery_id = if mentioned_bot_ids.len() > 1 {
         format!("discord:{}:{}", message.id, bot_user_id.get())
     } else {
@@ -1386,22 +1662,177 @@ pub fn build_voice_metadata(audio_bytes: &[u8], duration_hint: Option<f64>) -> V
 pub fn is_voice_audio_file(filename: &str, content_type: Option<&str>) -> bool {
     if let Some(ct) = content_type {
         let ct_lower = ct.to_ascii_lowercase();
-        if ct_lower.starts_with("audio/ogg")
-            || ct_lower.starts_with("audio/opus")
-            || ct_lower.contains("voice")
+        if ct_lower.contains("voice")
+            || ct_lower.starts_with("audio/ogg; codecs=opus")
+            || ct_lower.starts_with("audio/opus; voice=true")
         {
             return true;
         }
     }
     let lower = filename.to_ascii_lowercase();
-    lower.ends_with(".ogg")
-        || lower.ends_with(".opus")
-        || lower.contains("voice-message")
+    lower.contains("voice-message")
         || lower.contains("voice_message")
+        || lower.contains("voice-note")
+        || lower.contains("voice_note")
+        || lower.ends_with(".voice.ogg")
+        || lower.ends_with(".voice.opus")
 }
 
+#[derive(Clone)]
+pub struct SerenityFileUploader {
+    transport: Arc<dyn DiscordUploadTransport>,
+}
+
+impl Default for SerenityFileUploader {
+    fn default() -> Self {
+        Self {
+            transport: Arc::new(DefaultDiscordUploadTransport),
+        }
+    }
+}
+
+impl SerenityFileUploader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_transport(mut self, transport: Arc<dyn DiscordUploadTransport>) -> Self {
+        self.transport = transport;
+        self
+    }
+}
+
+#[async_trait]
+pub trait DiscordUploadTransport: Send + Sync {
+    async fn send_voice_file(
+        &self,
+        http: &serenity::all::Http,
+        channel: ChannelId,
+        filename: &str,
+        bytes: Vec<u8>,
+        meta: &VoiceMetadata,
+    ) -> Result<()>;
+
+    async fn send_ordinary_file(
+        &self,
+        http: &serenity::all::Http,
+        channel: ChannelId,
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()>;
+
+    async fn send_forum_file(
+        &self,
+        http: &serenity::all::Http,
+        channel: ChannelId,
+        filename: &str,
+        bytes: Vec<u8>,
+        is_voice: bool,
+    ) -> Result<()>;
+
+    async fn send_attachments(
+        &self,
+        http: &serenity::all::Http,
+        channel: ChannelId,
+        attachments: Vec<CreateAttachment>,
+    ) -> Result<()>;
+}
+
+pub const DISCORD_ATTACHMENT_LIMIT: usize = 10;
+
 #[derive(Clone, Default)]
-pub struct SerenityFileUploader;
+pub struct DefaultDiscordUploadTransport;
+
+#[async_trait]
+impl DiscordUploadTransport for DefaultDiscordUploadTransport {
+    async fn send_voice_file(
+        &self,
+        http: &serenity::all::Http,
+        channel: ChannelId,
+        filename: &str,
+        bytes: Vec<u8>,
+        meta: &VoiceMetadata,
+    ) -> Result<()> {
+        let attachment = CreateAttachment::bytes(bytes, filename);
+        let payload = serde_json::json!({
+            "flags": DISCORD_VOICE_MESSAGE_FLAG,
+            "attachments": [{
+                "id": 0,
+                "filename": filename,
+                "duration_secs": meta.duration_secs,
+                "waveform": meta.waveform,
+            }],
+            "allowed_mentions": safe_allowed_mentions(),
+        });
+
+        let multipart = serenity::http::Multipart {
+            upload: serenity::http::MultipartUpload::Attachments(vec![attachment]),
+            payload_json: Some(
+                serde_json::to_string(&payload).map_err(|e| OmonError::Config(e.to_string()))?,
+            ),
+            fields: vec![],
+        };
+
+        let request = serenity::http::Request::new(
+            serenity::http::Route::ChannelMessages {
+                channel_id: channel,
+            },
+            serenity::http::LightMethod::Post,
+        )
+        .multipart(Some(multipart));
+
+        let _: serenity::all::Message = http.fire(request).await?;
+        Ok(())
+    }
+
+    async fn send_ordinary_file(
+        &self,
+        http: &serenity::all::Http,
+        channel: ChannelId,
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let attachment = CreateAttachment::bytes(bytes, filename);
+        let create_msg = CreateMessage::new().allowed_mentions(safe_allowed_mentions());
+        channel
+            .send_files(http, vec![attachment], create_msg)
+            .await?;
+        Ok(())
+    }
+
+    async fn send_forum_file(
+        &self,
+        http: &serenity::all::Http,
+        channel: ChannelId,
+        filename: &str,
+        bytes: Vec<u8>,
+        is_voice: bool,
+    ) -> Result<()> {
+        let title = if is_voice {
+            format!("Voice Note: {filename}")
+        } else {
+            format!("Upload: {filename}")
+        };
+        let attachment = CreateAttachment::bytes(bytes, filename);
+        let create_msg = CreateMessage::new()
+            .add_file(attachment)
+            .allowed_mentions(safe_allowed_mentions());
+        let builder = CreateForumPost::new(title, create_msg);
+        channel.create_forum_post(http, builder).await?;
+        Ok(())
+    }
+
+    async fn send_attachments(
+        &self,
+        http: &serenity::all::Http,
+        channel: ChannelId,
+        attachments: Vec<CreateAttachment>,
+    ) -> Result<()> {
+        let create_msg = CreateMessage::new().allowed_mentions(safe_allowed_mentions());
+        channel.send_files(http, attachments, create_msg).await?;
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl DiscordFileUploader for SerenityFileUploader {
@@ -1435,39 +1866,36 @@ impl DiscordFileUploader for SerenityFileUploader {
         };
 
         if is_forum {
-            let title = if is_voice {
-                format!("Voice Note: {filename}")
-            } else {
-                format!("Upload: {filename}")
-            };
-            let attachment = CreateAttachment::bytes(bytes, filename);
-            let mut create_msg = CreateMessage::new()
-                .add_file(attachment)
-                .allowed_mentions(safe_allowed_mentions());
-            if is_voice {
-                create_msg =
-                    create_msg.flags(MessageFlags::from_bits_truncate(DISCORD_VOICE_MESSAGE_FLAG));
-            }
-            let builder = CreateForumPost::new(title, create_msg);
-            channel.create_forum_post(&http, builder).await?;
-            return Ok(());
+            return self
+                .transport
+                .send_forum_file(&http, channel, &filename, bytes, is_voice)
+                .await;
         }
 
-        let attachment = CreateAttachment::bytes(bytes, filename);
-        let mut create_msg = CreateMessage::new().allowed_mentions(safe_allowed_mentions());
         if is_voice {
-            create_msg =
-                create_msg.flags(MessageFlags::from_bits_truncate(DISCORD_VOICE_MESSAGE_FLAG));
+            let meta = build_voice_metadata(&bytes, None);
+            match self
+                .transport
+                .send_voice_file(&http, channel, &filename, bytes.clone(), &meta)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(
+                        "Native voice note send failed ({error:?}), falling back to ordinary file send"
+                    );
+                }
+            }
         }
-        channel
-            .send_files(&http, vec![attachment], create_msg)
-            .await?;
-        Ok(())
+
+        self.transport
+            .send_ordinary_file(&http, channel, &filename, bytes)
+            .await
     }
 }
 
 struct ActiveDiscordStream {
-    throttler: Arc<LiveEditThrottler<SerenityMessageTransport>>,
+    throttler: Arc<LiveEditThrottler<dyn DiscordMessageTransport>>,
     last_sequence: Mutex<Option<u64>>,
 }
 
@@ -1571,6 +1999,11 @@ pub struct DiscordEgress {
     approval_mentions: bool,
     dead_targets: Arc<DeadTargetRegistry>,
     typing_refresh: Arc<Mutex<HashMap<u64, std::time::Instant>>>,
+    message_transport: Option<Arc<dyn DiscordMessageTransport>>,
+    upload_transport: Arc<dyn DiscordUploadTransport>,
+    pub runtime_footer: bool,
+    pub default_model: Option<String>,
+    pub workspace_root: Option<PathBuf>,
 }
 
 const TYPING_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1592,20 +2025,26 @@ fn should_refresh_typing(
 
 #[derive(Clone, Debug)]
 pub struct DeadTargetEntry {
+    pub bot_id: String,
     pub channel_id: u64,
+    pub status_code: u16,
     pub reason: String,
     pub marked_at: chrono::DateTime<chrono::Utc>,
+    pub probed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// In-memory registry of confirmed-dead Discord channels (403 Forbidden / 404 Not Found).
 ///
 /// Prevents repeated API errors, wasted delivery attempts, and rate-limit burn
 /// when a channel is deleted or the bot is kicked/lacks permissions.
-/// Self-healing: a successful send or explicit clear removes the channel from the registry.
+/// Scoped by bot identity and channel ID, persistent in SQLite when pool is provided.
+/// Self-healing: a successful send, probe, or explicit clear removes the channel.
 #[derive(Clone, Debug)]
 pub struct DeadTargetRegistry {
-    inner: Arc<parking_lot::Mutex<HashMap<u64, DeadTargetEntry>>>,
+    inner: Arc<parking_lot::Mutex<HashMap<(String, u64), DeadTargetEntry>>>,
     ttl: Option<std::time::Duration>,
+    probe_interval: Option<std::time::Duration>,
+    pool: Option<sqlx::SqlitePool>,
 }
 
 impl Default for DeadTargetRegistry {
@@ -1619,6 +2058,8 @@ impl DeadTargetRegistry {
         Self {
             inner: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             ttl: None,
+            probe_interval: None,
+            pool: None,
         }
     }
 
@@ -1626,19 +2067,61 @@ impl DeadTargetRegistry {
         Self {
             inner: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             ttl: Some(ttl),
+            probe_interval: None,
+            pool: None,
         }
     }
 
+    pub fn with_probe_interval(mut self, probe_interval: std::time::Duration) -> Self {
+        self.probe_interval = Some(probe_interval);
+        self
+    }
+
+    pub fn with_pool(mut self, pool: sqlx::SqlitePool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    pub fn set_pool(&mut self, pool: sqlx::SqlitePool) {
+        self.pool = Some(pool);
+    }
+
     pub fn is_dead(&self, channel_id: u64) -> bool {
+        self.is_dead_for_bot("default", channel_id)
+    }
+
+    pub fn is_dead_for_bot(&self, bot_id: &str, channel_id: u64) -> bool {
+        let key = (bot_id.to_string(), channel_id);
         let mut map = self.inner.lock();
-        if let Some(entry) = map.get(&channel_id) {
+        if let Some(entry) = map.get_mut(&key) {
+            let now = chrono::Utc::now();
             if let Some(ttl) = self.ttl {
-                let elapsed = (chrono::Utc::now() - entry.marked_at)
+                let elapsed = (now - entry.marked_at)
                     .to_std()
                     .unwrap_or(std::time::Duration::ZERO);
                 if elapsed > ttl {
-                    map.remove(&channel_id);
+                    map.remove(&key);
                     return false;
+                }
+            }
+            if let Some(probe_interval) = self.probe_interval {
+                match entry.probed_at {
+                    None => {
+                        let elapsed = (now - entry.marked_at)
+                            .to_std()
+                            .unwrap_or(std::time::Duration::ZERO);
+                        if elapsed >= probe_interval {
+                            entry.probed_at = Some(now);
+                            return false;
+                        }
+                    }
+                    Some(last) => {
+                        let elapsed = (now - last).to_std().unwrap_or(std::time::Duration::ZERO);
+                        if probe_interval > std::time::Duration::ZERO && elapsed >= probe_interval {
+                            entry.probed_at = Some(now);
+                            return false;
+                        }
+                    }
                 }
             }
             return true;
@@ -1646,28 +2129,140 @@ impl DeadTargetRegistry {
         false
     }
 
-    pub fn mark_dead(&self, channel_id: u64, reason: impl Into<String>) -> bool {
+    pub fn mark_dead_for_bot(
+        &self,
+        bot_id: &str,
+        channel_id: u64,
+        status_code: u16,
+        reason: impl Into<String>,
+    ) -> bool {
+        let reason_str = reason.into();
+        let key = (bot_id.to_string(), channel_id);
         let mut map = self.inner.lock();
-        let existed = map.contains_key(&channel_id);
+        let existed = map.contains_key(&key);
         map.insert(
-            channel_id,
+            key,
             DeadTargetEntry {
+                bot_id: bot_id.to_string(),
                 channel_id,
-                reason: reason.into(),
+                status_code,
+                reason: reason_str.clone(),
                 marked_at: chrono::Utc::now(),
+                probed_at: None,
             },
         );
+        drop(map);
+
+        if let Some(pool) = &self.pool {
+            let pool_clone = pool.clone();
+            let bot_clone = bot_id.to_string();
+            tokio::spawn(async move {
+                let _ = crate::storage::persist_dead_target(
+                    &pool_clone,
+                    &bot_clone,
+                    channel_id,
+                    status_code,
+                    &reason_str,
+                )
+                .await;
+            });
+        }
         !existed
+    }
+
+    pub fn mark_dead(&self, channel_id: u64, reason: impl Into<String>) -> bool {
+        self.mark_dead_for_bot("default", channel_id, 404, reason)
+    }
+
+    pub fn clear_for_bot(&self, bot_id: &str, channel_id: u64) -> bool {
+        let key = (bot_id.to_string(), channel_id);
+        let mut map = self.inner.lock();
+        let removed = map.remove(&key).is_some();
+        drop(map);
+
+        if let Some(pool) = &self.pool {
+            let pool_clone = pool.clone();
+            let bot_clone = bot_id.to_string();
+            tokio::spawn(async move {
+                let _ =
+                    crate::storage::remove_dead_target(&pool_clone, &bot_clone, channel_id).await;
+            });
+        }
+        removed
     }
 
     pub fn clear(&self, channel_id: u64) -> bool {
         let mut map = self.inner.lock();
-        map.remove(&channel_id).is_some()
+        let keys_to_remove: Vec<(String, u64)> = map
+            .keys()
+            .filter(|(_, chan)| *chan == channel_id)
+            .cloned()
+            .collect();
+        let removed = !keys_to_remove.is_empty();
+        for key in &keys_to_remove {
+            map.remove(key);
+        }
+        drop(map);
+
+        if let Some(pool) = &self.pool {
+            let pool_clone = pool.clone();
+            tokio::spawn(async move {
+                let _ =
+                    crate::storage::remove_dead_targets_for_channel(&pool_clone, channel_id).await;
+            });
+        }
+        removed
     }
 
     pub fn clear_all(&self) {
         let mut map = self.inner.lock();
         map.clear();
+    }
+
+    pub async fn mark_dead_and_persist(
+        &self,
+        bot_id: &str,
+        channel_id: u64,
+        status_code: u16,
+        reason: impl Into<String>,
+    ) -> Result<bool> {
+        let reason_str = reason.into();
+        let existed = {
+            let key = (bot_id.to_string(), channel_id);
+            let mut map = self.inner.lock();
+            let existed = map.contains_key(&key);
+            map.insert(
+                key,
+                DeadTargetEntry {
+                    bot_id: bot_id.to_string(),
+                    channel_id,
+                    status_code,
+                    reason: reason_str.clone(),
+                    marked_at: chrono::Utc::now(),
+                    probed_at: None,
+                },
+            );
+            existed
+        };
+
+        if let Some(pool) = &self.pool {
+            crate::storage::persist_dead_target(pool, bot_id, channel_id, status_code, &reason_str)
+                .await?;
+        }
+        Ok(!existed)
+    }
+
+    pub async fn clear_and_persist(&self, bot_id: &str, channel_id: u64) -> Result<bool> {
+        let removed = {
+            let key = (bot_id.to_string(), channel_id);
+            let mut map = self.inner.lock();
+            map.remove(&key).is_some()
+        };
+
+        if let Some(pool) = &self.pool {
+            crate::storage::remove_dead_target(pool, bot_id, channel_id).await?;
+        }
+        Ok(removed)
     }
 
     pub fn count(&self) -> usize {
@@ -1677,7 +2272,40 @@ impl DeadTargetRegistry {
 
     pub fn get(&self, channel_id: u64) -> Option<DeadTargetEntry> {
         let map = self.inner.lock();
-        map.get(&channel_id).cloned()
+        map.get(&("default".to_string(), channel_id))
+            .or_else(|| {
+                map.iter()
+                    .find(|((_, chan), _)| *chan == channel_id)
+                    .map(|(_, v)| v)
+            })
+            .cloned()
+    }
+
+    pub fn get_for_bot(&self, bot_id: &str, channel_id: u64) -> Option<DeadTargetEntry> {
+        let map = self.inner.lock();
+        map.get(&(bot_id.to_string(), channel_id)).cloned()
+    }
+
+    pub async fn load_from_db(&self, pool: &sqlx::SqlitePool) -> Result<()> {
+        let rows = crate::storage::load_dead_targets(pool).await?;
+        let mut map = self.inner.lock();
+        for (bot, chan, code, msg, since_str) in rows {
+            let marked_at = chrono::DateTime::parse_from_rfc3339(&since_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            map.insert(
+                (bot.clone(), chan),
+                DeadTargetEntry {
+                    bot_id: bot,
+                    channel_id: chan,
+                    status_code: code,
+                    reason: msg,
+                    marked_at,
+                    probed_at: None,
+                },
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1686,7 +2314,28 @@ impl DeadTargetRegistry {
 pub fn is_discord_dead_target_error(error: &serenity::Error) -> Option<(u16, String)> {
     if let serenity::Error::Http(serenity::all::HttpError::UnsuccessfulRequest(resp)) = error {
         let code = resp.status_code.as_u16();
-        if code == 403 || code == 404 {
+        let discord_code = resp.error.code;
+        let msg = resp.error.message.as_str();
+
+        // 10008 is Unknown Message (missing referenced message / edit target).
+        // It is a message-specific error, NOT channel death!
+        if discord_code == 10008 || msg.to_lowercase().contains("unknown message") {
+            return None;
+        }
+
+        // 404 with Unknown Channel (10003) or generic channel 404 is a dead channel
+        if code == 404 {
+            if discord_code == 10003
+                || msg.to_lowercase().contains("unknown channel")
+                || discord_code == 0
+            {
+                return Some((code, resp.error.message.clone()));
+            }
+            return None;
+        }
+
+        // 403 Forbidden (50001 Missing Access, 50013 Missing Permissions, etc.)
+        if code == 403 {
             return Some((code, resp.error.message.clone()));
         }
     }
@@ -1705,12 +2354,17 @@ impl DiscordEgress {
             default_bot_id,
             streams: Arc::new(Mutex::new(HashMap::new())),
             typing: Arc::new(Mutex::new(HashMap::new())),
-            file_uploader: Arc::new(SerenityFileUploader),
+            file_uploader: Arc::new(SerenityFileUploader::default()),
             approval_messages: Arc::new(Mutex::new(HashMap::new())),
             allowed_users: Vec::new(),
             approval_mentions: false,
             dead_targets: Arc::new(DeadTargetRegistry::new()),
             typing_refresh: Arc::new(Mutex::new(HashMap::new())),
+            message_transport: None,
+            upload_transport: Arc::new(DefaultDiscordUploadTransport),
+            runtime_footer: false,
+            default_model: None,
+            workspace_root: None,
         }
     }
 
@@ -1729,13 +2383,66 @@ impl DiscordEgress {
             default_bot_id,
             streams: Arc::new(Mutex::new(HashMap::new())),
             typing: Arc::new(Mutex::new(HashMap::new())),
-            file_uploader: Arc::new(SerenityFileUploader),
+            file_uploader: Arc::new(SerenityFileUploader::default()),
             approval_messages: Arc::new(Mutex::new(HashMap::new())),
             allowed_users: Vec::new(),
             approval_mentions: false,
             dead_targets: Arc::new(DeadTargetRegistry::new()),
             typing_refresh: Arc::new(Mutex::new(HashMap::new())),
+            message_transport: None,
+            upload_transport: Arc::new(DefaultDiscordUploadTransport),
+            runtime_footer: false,
+            default_model: None,
+            workspace_root: None,
         })
+    }
+
+    pub fn with_upload_transport(mut self, transport: Arc<dyn DiscordUploadTransport>) -> Self {
+        self.upload_transport = transport;
+        self
+    }
+
+    pub fn with_runtime_footer(mut self, enabled: bool) -> Self {
+        self.runtime_footer = enabled;
+        self
+    }
+
+    pub fn with_default_model(mut self, model: String) -> Self {
+        self.default_model = Some(model);
+        self
+    }
+
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        self.workspace_root = Some(root);
+        self
+    }
+
+    async fn dispatch_rendered_tables(
+        &self,
+        http: &Arc<serenity::Http>,
+        channel: ChannelId,
+        rendered_tables: Vec<crate::discord::table_render::RenderedTable>,
+    ) -> Result<()> {
+        if rendered_tables.is_empty() {
+            return Ok(());
+        }
+        for chunk in rendered_tables.chunks(DISCORD_ATTACHMENT_LIMIT) {
+            let attachments: Vec<CreateAttachment> = chunk
+                .iter()
+                .map(|table| {
+                    CreateAttachment::bytes(table.png_bytes.clone(), table.filename.clone())
+                })
+                .collect();
+            self.upload_transport
+                .send_attachments(http, channel, attachments)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub fn with_message_transport(mut self, transport: Arc<dyn DiscordMessageTransport>) -> Self {
+        self.message_transport = Some(transport);
+        self
     }
 
     pub fn dead_targets(&self) -> Arc<DeadTargetRegistry> {
@@ -1745,6 +2452,48 @@ impl DiscordEgress {
     pub fn with_dead_targets(mut self, dead_targets: Arc<DeadTargetRegistry>) -> Self {
         self.dead_targets = dead_targets;
         self
+    }
+
+    /// Replays owned failed obligations for `bot_id` after a transport reconnection.
+    pub async fn replay_failed_transport_obligations(
+        &self,
+        bot_id: &str,
+        pool: &SqlitePool,
+    ) -> Result<usize> {
+        let ledger = DeliveryLedgerService::new(pool.clone());
+        let claimed = ledger.sweep_failed_for_runtime(bot_id, 3, 86400).await?;
+        let count = claimed.len();
+
+        for obl in claimed {
+            let session = match SessionKey::from_storage_key(&obl.session_key) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = ledger
+                        .mark_obligation_failed(&obl.id, "invalid session_key")
+                        .await;
+                    continue;
+                }
+            };
+
+            let send_result = self
+                .dispatch(OutboundAction::SendMessage {
+                    session,
+                    content: obl.content.clone(),
+                    reply_to: None,
+                })
+                .await;
+
+            match send_result {
+                Ok(_) => {
+                    let _ = ledger.mark_obligation_delivered(&obl.id).await;
+                }
+                Err(ref e) => {
+                    let _ = ledger.mark_obligation_failed(&obl.id, &e.to_string()).await;
+                }
+            }
+        }
+
+        Ok(count)
     }
 
     pub fn with_approval_mentions(mut self, allowed_users: Vec<u64>, enabled: bool) -> Self {
@@ -1785,6 +2534,10 @@ impl DiscordEgress {
         map.len()
     }
 
+    pub async fn active_typing_count(&self) -> usize {
+        self.typing.lock().await.len()
+    }
+
     pub fn with_file_uploader(mut self, uploader: Arc<dyn DiscordFileUploader>) -> Self {
         self.file_uploader = uploader;
         self
@@ -1816,7 +2569,8 @@ impl DiscordEgress {
             return;
         };
         let channel_id = channel.get();
-        if self.dead_targets.is_dead(channel_id) {
+        let bot_id = self.identity(session);
+        if self.dead_targets.is_dead_for_bot(bot_id, channel_id) {
             return;
         }
         let should = {
@@ -1844,19 +2598,44 @@ impl DiscordEgress {
             self.keep_typing(&session).await;
             return Ok(());
         };
+        let filtered_content = filter_reasoning(content);
         let identity = self.identity(&session).to_owned();
-        let key = (identity, chunk.stream_id);
+        let key = (identity.clone(), chunk.stream_id);
         let channel = Self::target(&session)?;
+        let channel_id = channel.get();
         let http = self.http_for(&session)?;
+
+        if self.dead_targets.is_dead_for_bot(&identity, channel_id) {
+            return Err(OmonError::Multiplexer(format!(
+                "dead target short-circuited: bot={identity}, channel={channel_id}"
+            )));
+        }
+
+        if is_explicit_silence(&filtered_content) {
+            let mut streams = self.streams.lock().await;
+            streams.remove(&key);
+            drop(streams);
+            self.typing_refresh.lock().await.remove(&channel.get());
+            self.typing.lock().await.remove(&session.storage_key());
+            return Ok(());
+        }
 
         let active = {
             let mut streams = self.streams.lock().await;
             if let Some(active) = streams.get(&key) {
                 active.clone()
             } else {
-                let transport = Arc::new(SerenityMessageTransport::new(http.clone()));
+                let reference_id = chunk
+                    .reply_to
+                    .as_deref()
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .map(MessageId::new);
+                let transport: Arc<dyn DiscordMessageTransport> = self
+                    .message_transport
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(SerenityMessageTransport::new(http.clone())));
                 let message_id = transport
-                    .send_message(channel, "\u{200b}".to_owned())
+                    .send_message_with_reference(channel, "\u{200b}".to_owned(), reference_id)
                     .await?;
                 let active = Arc::new(ActiveDiscordStream {
                     throttler: Arc::new(LiveEditThrottler::new(transport, channel, message_id)),
@@ -1872,9 +2651,16 @@ impl DiscordEgress {
             return Ok(());
         }
         let (processed_content, rendered_tables) = if chunk.is_final {
-            crate::discord::table_render::transform_markdown_tables_to_images(content)
+            let (without_media, media_paths) = extract_media_directives(&filtered_content);
+            for media_path in &media_paths {
+                let valid_path = validate_media_path(media_path)?;
+                self.file_uploader
+                    .upload(http.clone(), channel, &valid_path)
+                    .await?;
+            }
+            crate::discord::table_render::transform_markdown_tables_to_images(&without_media)
         } else {
-            (content.to_string(), Vec::new())
+            (filtered_content, Vec::new())
         };
 
         active.throttler.update(&processed_content, true).await?;
@@ -1882,16 +2668,8 @@ impl DiscordEgress {
         drop(last_sequence);
 
         if chunk.is_final {
-            if !rendered_tables.is_empty() {
-                let attachments: Vec<CreateAttachment> = rendered_tables
-                    .into_iter()
-                    .map(|table| CreateAttachment::bytes(table.png_bytes, table.filename))
-                    .collect();
-                let create_msg = CreateMessage::new().allowed_mentions(safe_allowed_mentions());
-                if let Err(error) = channel.send_files(&http, attachments, create_msg).await {
-                    tracing::error!(%error, "failed to attach rendered table images to Discord channel");
-                }
-            }
+            self.dispatch_rendered_tables(&http, channel, rendered_tables)
+                .await?;
 
             let mut streams = self.streams.lock().await;
             if streams
@@ -1920,16 +2698,26 @@ impl OutboundDispatcher for DiscordEgress {
                 content,
                 reply_to,
             } => {
+                let filtered_content = filter_reasoning(&content);
+                if is_explicit_silence(&filtered_content) {
+                    self.typing.lock().await.remove(&session.storage_key());
+                    return Ok(());
+                }
+
+                let bot_id = self.identity(&session).to_owned();
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
                 let channel_id = channel.get();
 
-                if self.dead_targets.is_dead(channel_id) {
+                if self.dead_targets.is_dead_for_bot(&bot_id, channel_id) {
                     tracing::warn!(
+                        %bot_id,
                         channel_id,
                         "skipping message send to dead target (403/404 short-circuit)"
                     );
-                    return Ok(());
+                    return Err(OmonError::Multiplexer(format!(
+                        "dead target short-circuited: bot={bot_id}, channel={channel_id}"
+                    )));
                 }
 
                 let reply_id = reply_to
@@ -1937,10 +2725,40 @@ impl OutboundDispatcher for DiscordEgress {
                     .and_then(|id| id.parse::<u64>().ok())
                     .map(MessageId::new);
 
-                let (processed_content, rendered_tables) =
-                    crate::discord::table_render::transform_markdown_tables_to_images(&content);
+                let (processed_content, rendered_tables) = {
+                    let decorated = if self.runtime_footer {
+                        let model = self.default_model.as_deref();
+                        let cwd = self.workspace_root.as_deref();
+                        append_runtime_footer(&content, model, None, cwd)
+                    } else {
+                        content.clone()
+                    };
+                    let (without_media, media_paths) = extract_media_directives(&decorated);
+                    for media_path in &media_paths {
+                        let valid_path = validate_media_path(media_path)?;
+                        self.file_uploader
+                            .upload(http.clone(), channel, &valid_path)
+                            .await?;
+                    }
+                    crate::discord::table_render::transform_markdown_tables_to_images(
+                        &without_media,
+                    )
+                };
 
-                let chunks = chunk_markdown(&processed_content, DISCORD_MESSAGE_LIMIT);
+                let chunks = bound_split_messages(
+                    chunk_markdown(&processed_content, DISCORD_MESSAGE_LIMIT),
+                    MAX_SPLIT_MESSAGES,
+                );
+
+                if let Some(ref transport) = self.message_transport {
+                    self.dead_targets.clear_for_bot(&bot_id, channel_id);
+                    for chunk in chunks {
+                        transport.send_message(channel, chunk).await?;
+                    }
+                    self.dispatch_rendered_tables(&http, channel, rendered_tables)
+                        .await?;
+                    return Ok(());
+                }
 
                 let is_forum = match channel.to_channel(&http).await {
                     Ok(serenity::Channel::Guild(guild_channel)) => {
@@ -1963,7 +2781,7 @@ impl OutboundDispatcher for DiscordEgress {
                     );
                     match channel.create_forum_post(&http, builder).await {
                         Ok(post_channel) => {
-                            self.dead_targets.clear(channel_id);
+                            self.dead_targets.clear_for_bot(&bot_id, channel_id);
                             for chunk in chunks.into_iter().skip(1) {
                                 if let Err(error) = post_channel
                                     .id
@@ -1978,20 +2796,28 @@ impl OutboundDispatcher for DiscordEgress {
                                     if let Some((code, reason)) =
                                         is_discord_dead_target_error(&error)
                                     {
-                                        self.dead_targets.mark_dead(
+                                        self.dead_targets.mark_dead_for_bot(
+                                            &bot_id,
                                             channel_id,
+                                            code,
                                             format!("HTTP {code}: {reason}"),
                                         );
                                     }
                                     return Err(error.into());
                                 }
                             }
+                            self.dispatch_rendered_tables(&http, post_channel.id, rendered_tables)
+                                .await?;
                             return Ok(());
                         }
                         Err(error) => {
                             if let Some((code, reason)) = is_discord_dead_target_error(&error) {
-                                self.dead_targets
-                                    .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                                self.dead_targets.mark_dead_for_bot(
+                                    &bot_id,
+                                    channel_id,
+                                    code,
+                                    format!("HTTP {code}: {reason}"),
+                                );
                             }
                             return Err(error.into());
                         }
@@ -2009,8 +2835,12 @@ impl OutboundDispatcher for DiscordEgress {
                             Ok(msg) => Ok(msg),
                             Err(error) => {
                                 if let Some((code, reason)) = is_discord_dead_target_error(&error) {
-                                    self.dead_targets
-                                        .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                                    self.dead_targets.mark_dead_for_bot(
+                                        &bot_id,
+                                        channel_id,
+                                        code,
+                                        format!("HTTP {code}: {reason}"),
+                                    );
                                     tracing::warn!(
                                         channel_id,
                                         code,
@@ -2047,12 +2877,16 @@ impl OutboundDispatcher for DiscordEgress {
 
                     match send_result {
                         Ok(_) => {
-                            self.dead_targets.clear(channel_id);
+                            self.dead_targets.clear_for_bot(&bot_id, channel_id);
                         }
                         Err(error) => {
                             if let Some((code, reason)) = is_discord_dead_target_error(&error) {
-                                self.dead_targets
-                                    .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                                self.dead_targets.mark_dead_for_bot(
+                                    &bot_id,
+                                    channel_id,
+                                    code,
+                                    format!("HTTP {code}: {reason}"),
+                                );
                                 tracing::warn!(
                                     channel_id,
                                     code,
@@ -2065,32 +2899,34 @@ impl OutboundDispatcher for DiscordEgress {
                     }
                 }
 
-                if !rendered_tables.is_empty() {
-                    let attachments: Vec<CreateAttachment> = rendered_tables
-                        .into_iter()
-                        .map(|table| CreateAttachment::bytes(table.png_bytes, table.filename))
-                        .collect();
-                    let create_msg = CreateMessage::new().allowed_mentions(safe_allowed_mentions());
-                    if let Err(error) = channel.send_files(&http, attachments, create_msg).await {
-                        tracing::error!(%error, "failed to attach rendered table images in SendMessage");
-                    }
-                }
+                self.dispatch_rendered_tables(&http, channel, rendered_tables)
+                    .await?;
             }
             OutboundAction::EditMessage {
                 session,
                 platform_message_id,
                 content,
             } => {
+                let filtered_content = filter_reasoning(&content);
+                if is_explicit_silence(&filtered_content) {
+                    self.typing.lock().await.remove(&session.storage_key());
+                    return Ok(());
+                }
+
+                let bot_id = self.identity(&session).to_owned();
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
                 let channel_id = channel.get();
 
-                if self.dead_targets.is_dead(channel_id) {
+                if self.dead_targets.is_dead_for_bot(&bot_id, channel_id) {
                     tracing::warn!(
+                        %bot_id,
                         channel_id,
                         "skipping message edit to dead target (403/404 short-circuit)"
                     );
-                    return Ok(());
+                    return Err(OmonError::Multiplexer(format!(
+                        "dead target short-circuited: bot={bot_id}, channel={channel_id}"
+                    )));
                 }
 
                 let message_id = platform_message_id
@@ -2112,12 +2948,16 @@ impl OutboundDispatcher for DiscordEgress {
                     .await
                 {
                     Ok(_) => {
-                        self.dead_targets.clear(channel_id);
+                        self.dead_targets.clear_for_bot(&bot_id, channel_id);
                     }
                     Err(error) => {
                         if let Some((code, reason)) = is_discord_dead_target_error(&error) {
-                            self.dead_targets
-                                .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                            self.dead_targets.mark_dead_for_bot(
+                                &bot_id,
+                                channel_id,
+                                code,
+                                format!("HTTP {code}: {reason}"),
+                            );
                             tracing::warn!(
                                 channel_id,
                                 code,
@@ -2133,12 +2973,15 @@ impl OutboundDispatcher for DiscordEgress {
                 session,
                 platform_message_id,
             } => {
+                let bot_id = self.identity(&session).to_owned();
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
                 let channel_id = channel.get();
 
-                if self.dead_targets.is_dead(channel_id) {
-                    return Ok(());
+                if self.dead_targets.is_dead_for_bot(&bot_id, channel_id) {
+                    return Err(OmonError::Multiplexer(format!(
+                        "dead target short-circuited: bot={bot_id}, channel={channel_id}"
+                    )));
                 }
 
                 let message_id = platform_message_id
@@ -2151,39 +2994,50 @@ impl OutboundDispatcher for DiscordEgress {
                     })?;
                 match channel.delete_message(&http, message_id).await {
                     Ok(_) => {
-                        self.dead_targets.clear(channel_id);
+                        self.dead_targets.clear_for_bot(&bot_id, channel_id);
                     }
                     Err(error) => {
                         if let Some((code, reason)) = is_discord_dead_target_error(&error) {
-                            self.dead_targets
-                                .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                            self.dead_targets.mark_dead_for_bot(
+                                &bot_id,
+                                channel_id,
+                                code,
+                                format!("HTTP {code}: {reason}"),
+                            );
                         }
                         return Err(error.into());
                     }
                 }
             }
             OutboundAction::UploadFile { session, path } => {
+                let bot_id = self.identity(&session).to_owned();
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
                 let channel_id = channel.get();
 
-                if self.dead_targets.is_dead(channel_id) {
+                if self.dead_targets.is_dead_for_bot(&bot_id, channel_id) {
                     tracing::warn!(
                         channel_id,
                         "skipping file upload to dead target (403/404 short-circuit)"
                     );
-                    return Ok(());
+                    return Err(OmonError::Multiplexer(format!(
+                        "dead target short-circuited: bot={bot_id}, channel={channel_id}"
+                    )));
                 }
 
                 match self.file_uploader.upload(http, channel, &path).await {
                     Ok(()) => {
-                        self.dead_targets.clear(channel_id);
+                        self.dead_targets.clear_for_bot(&bot_id, channel_id);
                     }
                     Err(err) => {
                         if let OmonError::Discord(boxed) = &err {
                             if let Some((code, reason)) = is_discord_dead_target_error(boxed) {
-                                self.dead_targets
-                                    .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                                self.dead_targets.mark_dead_for_bot(
+                                    &bot_id,
+                                    channel_id,
+                                    code,
+                                    format!("HTTP {code}: {reason}"),
+                                );
                                 tracing::warn!(
                                     channel_id,
                                     code,
@@ -2200,9 +3054,10 @@ impl OutboundDispatcher for DiscordEgress {
                 self.stream(session, chunk).await?;
             }
             OutboundAction::Typing { session, active } => {
+                let bot_id = self.identity(&session).to_owned();
                 let channel = Self::target(&session)?;
                 let channel_id = channel.get();
-                if self.dead_targets.is_dead(channel_id) {
+                if self.dead_targets.is_dead_for_bot(&bot_id, channel_id) {
                     return Ok(());
                 }
 
@@ -2224,10 +3079,19 @@ impl OutboundDispatcher for DiscordEgress {
                 emoji,
                 remove_others,
             } => {
-                let channel = Self::target(&session)?;
+                let bot_id = self.identity(&session).to_owned();
+                // Reactions target the channel where the message was posted (session.channel_id),
+                // not the thread_id where the session was routed!
+                let channel = session
+                    .channel_id
+                    .parse::<u64>()
+                    .map(ChannelId::new)
+                    .unwrap_or_else(|_| Self::target(&session).unwrap_or(ChannelId::new(0)));
                 let channel_id = channel.get();
-                if self.dead_targets.is_dead(channel_id) {
-                    return Ok(());
+                if self.dead_targets.is_dead_for_bot(&bot_id, channel_id) {
+                    return Err(OmonError::Multiplexer(format!(
+                        "dead target short-circuited: bot={bot_id}, channel={channel_id}"
+                    )));
                 }
 
                 let http = self.http_for(&session)?;
@@ -2270,16 +3134,20 @@ impl OutboundDispatcher for DiscordEgress {
                 command,
                 reason,
             } => {
+                let bot_id = self.identity(&session);
                 let http = self.http_for(&session)?;
                 let channel = Self::target(&session)?;
                 let channel_id = channel.get();
 
-                if self.dead_targets.is_dead(channel_id) {
+                if self.dead_targets.is_dead_for_bot(bot_id, channel_id) {
                     tracing::warn!(
+                        %bot_id,
                         channel_id,
                         "skipping approval request to dead target (403/404 short-circuit)"
                     );
-                    return Ok(());
+                    return Err(OmonError::Approval(format!(
+                        "approval target {channel_id} is unavailable"
+                    )));
                 }
 
                 let content = build_approval_content_with_mentions(
@@ -2301,15 +3169,20 @@ impl OutboundDispatcher for DiscordEgress {
                     .await
                 {
                     Ok(msg) => {
-                        self.dead_targets.clear(channel_id);
+                        self.dead_targets.clear_for_bot(bot_id, channel_id);
                         self.record_approval_message(request_id, session, channel, msg.id)
                             .await;
                     }
                     Err(error) => {
                         if let Some((code, reason)) = is_discord_dead_target_error(&error) {
-                            self.dead_targets
-                                .mark_dead(channel_id, format!("HTTP {code}: {reason}"));
+                            self.dead_targets.mark_dead_for_bot(
+                                bot_id,
+                                channel_id,
+                                code,
+                                format!("HTTP {code}: {reason}"),
+                            );
                             tracing::warn!(
+                                %bot_id,
                                 channel_id,
                                 code,
                                 %reason,
@@ -2324,20 +3197,21 @@ impl OutboundDispatcher for DiscordEgress {
                 if let Some((session, channel, message_id)) =
                     self.remove_approval_message(&request_id).await
                 {
+                    let bot_id = self.identity(&session);
                     let channel_id = channel.get();
-                    if !self.dead_targets.is_dead(channel_id) {
-                        if let Ok(http) = self.http_for(&session) {
-                            let _ = channel
-                                .edit_message(
-                                    &http,
-                                    message_id,
-                                    EditMessage::new()
-                                        .components(Vec::new())
-                                        .content("⏱ Approval request expired")
-                                        .allowed_mentions(safe_allowed_mentions()),
-                                )
-                                .await;
-                        }
+                    if !self.dead_targets.is_dead_for_bot(bot_id, channel_id) {
+                        let http = self.http_for(&session)?;
+                        // Shared terminal cleanup must not overwrite a button
+                        // interaction's decision with an expiry label.
+                        channel
+                            .edit_message(
+                                &http,
+                                message_id,
+                                EditMessage::new()
+                                    .components(Vec::new())
+                                    .allowed_mentions(safe_allowed_mentions()),
+                            )
+                            .await?;
                     }
                 }
             }
@@ -2493,6 +3367,162 @@ pub async fn get_channel_cursor(pool: &SqlitePool, channel_id: &str) -> Result<O
     Ok(row.map(|(id,)| id))
 }
 
+/// Updates the durable last-seen message ID cursor for a bot and channel if `message_id` is newer.
+pub async fn update_bot_channel_cursor(
+    pool: &SqlitePool,
+    bot_id: &str,
+    channel_id: &str,
+    message_id: &str,
+) -> Result<bool> {
+    if channel_id.trim().is_empty() || message_id.trim().is_empty() {
+        return Ok(false);
+    }
+    if message_id.trim().parse::<u64>().is_err() {
+        return Ok(false);
+    }
+
+    let mut tx = pool.begin().await?;
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT last_message_id FROM discord_bot_cursors WHERE bot_id = ? AND channel_id = ?",
+    )
+    .bind(bot_id)
+    .bind(channel_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let should_update = match existing {
+        Some((ref current_id,)) => should_advance_cursor(Some(current_id), message_id),
+        None => true,
+    };
+
+    if should_update {
+        sqlx::query(
+            "INSERT INTO discord_bot_cursors (bot_id, channel_id, last_message_id, updated_at)
+             VALUES (?, ?, ?, (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+             ON CONFLICT(bot_id, channel_id) DO UPDATE SET
+                last_message_id = excluded.last_message_id,
+                updated_at = excluded.updated_at",
+        )
+        .bind(bot_id)
+        .bind(channel_id)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if bot_id.is_empty() {
+            let _ = sqlx::query(
+                "INSERT INTO discord_channel_cursors (channel_id, last_message_id, updated_at)
+                 VALUES (?, ?, (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+                 ON CONFLICT(channel_id) DO UPDATE SET
+                    last_message_id = excluded.last_message_id,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(channel_id)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await;
+        }
+
+        tx.commit().await?;
+        Ok(true)
+    } else {
+        tx.commit().await?;
+        Ok(false)
+    }
+}
+
+/// Fetches the stored last-seen message ID for a bot and channel.
+pub async fn get_bot_channel_cursor(
+    pool: &SqlitePool,
+    bot_id: &str,
+    channel_id: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT last_message_id FROM discord_bot_cursors WHERE bot_id = ? AND channel_id = ?",
+    )
+    .bind(bot_id)
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if row.is_none() && bot_id.is_empty() {
+        let legacy: Option<(String,)> = sqlx::query_as(
+            "SELECT last_message_id FROM discord_channel_cursors WHERE channel_id = ?",
+        )
+        .bind(channel_id)
+        .fetch_optional(pool)
+        .await?;
+        return Ok(legacy.map(|(id,)| id));
+    }
+
+    Ok(row.map(|(id,)| id))
+}
+
+#[async_trait]
+pub trait DiscordHistoryFetcher: Send + Sync {
+    async fn fetch_messages(
+        &self,
+        channel_id: ChannelId,
+        after: Option<MessageId>,
+        limit: u8,
+    ) -> Result<Vec<Message>>;
+
+    async fn get_channel(&self, channel_id: ChannelId) -> Result<Option<serenity::Channel>>;
+
+    async fn get_member_roles(
+        &self,
+        guild_id: serenity::GuildId,
+        user_id: UserId,
+    ) -> Result<Vec<u64>>;
+}
+
+pub struct SerenityHistoryFetcher {
+    http: Arc<serenity::http::Http>,
+}
+
+impl SerenityHistoryFetcher {
+    pub fn new(http: Arc<serenity::http::Http>) -> Self {
+        Self { http }
+    }
+}
+
+#[async_trait]
+impl DiscordHistoryFetcher for SerenityHistoryFetcher {
+    async fn fetch_messages(
+        &self,
+        channel_id: ChannelId,
+        after: Option<MessageId>,
+        limit: u8,
+    ) -> Result<Vec<Message>> {
+        let mut builder = serenity::builder::GetMessages::new().limit(limit);
+        if let Some(after_id) = after {
+            builder = builder.after(after_id);
+        }
+        channel_id
+            .messages(&self.http, builder)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_channel(&self, channel_id: ChannelId) -> Result<Option<serenity::Channel>> {
+        match channel_id.to_channel(&self.http).await {
+            Ok(c) => Ok(Some(c)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn get_member_roles(
+        &self,
+        guild_id: serenity::GuildId,
+        user_id: UserId,
+    ) -> Result<Vec<u64>> {
+        match self.http.get_member(guild_id, user_id).await {
+            Ok(member) => Ok(member.roles.iter().map(|r| r.get()).collect()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 /// Scans recent channel history for messages missed while the gateway was offline.
 pub async fn run_missed_message_backfill(
     pool: &SqlitePool,
@@ -2500,104 +3530,234 @@ pub async fn run_missed_message_backfill(
     data: &PoiseData,
     bot_user_id: UserId,
 ) -> Result<usize> {
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT channel_id, last_message_id FROM discord_channel_cursors")
-            .fetch_all(pool)
-            .await?;
+    let fetcher = SerenityHistoryFetcher::new(http.clone());
+    run_missed_message_backfill_with_fetcher(pool, &fetcher, data, bot_user_id).await
+}
 
-    let mut total_backfilled = 0;
+pub async fn run_missed_message_backfill_with_fetcher(
+    pool: &SqlitePool,
+    fetcher: &dyn DiscordHistoryFetcher,
+    data: &PoiseData,
+    bot_user_id: UserId,
+) -> Result<usize> {
+    let bot_id_str = bot_user_id.to_string();
 
-    for (channel_id_str, last_msg_id_str) in rows {
-        let Ok(channel_id_num) = channel_id_str.parse::<u64>() else {
-            continue;
-        };
-        let Ok(last_msg_id_num) = last_msg_id_str.parse::<u64>() else {
-            continue;
-        };
+    let mut channel_ids_to_scan = std::collections::BTreeSet::new();
 
-        let channel_id = ChannelId::new(channel_id_num);
-        let after_id = MessageId::new(last_msg_id_num);
+    let stored_cursor_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT channel_id, last_message_id FROM discord_bot_cursors WHERE bot_id = ?",
+    )
+    .bind(&bot_id_str)
+    .fetch_all(pool)
+    .await?;
+    for (cid, _) in stored_cursor_rows {
+        if let Ok(c_num) = cid.parse::<u64>() {
+            channel_ids_to_scan.insert(c_num);
+        }
+    }
 
-        let builder = serenity::builder::GetMessages::new()
-            .after(after_id)
-            .limit(50);
-        let messages = match channel_id.messages(http, builder).await {
-            Ok(msgs) => msgs,
-            Err(err) => {
-                tracing::warn!(
-                    channel_id = %channel_id_str,
-                    %err,
-                    "failed to fetch messages for missed-message backfill"
-                );
-                continue;
-            }
-        };
-
-        let mut max_seen_id = last_msg_id_num;
-
-        let mut sorted_messages = messages;
-        sorted_messages.sort_by_key(|m| m.id.get());
-
-        for msg in sorted_messages {
-            let msg_id_num = msg.id.get();
-            if msg_id_num > max_seen_id {
-                max_seen_id = msg_id_num;
-            }
-
-            if msg.author.bot {
-                continue;
-            }
-
-            let (channel_type, parent_channel_id) = match msg.channel_id.to_channel(http).await {
-                Ok(serenity::Channel::Guild(channel)) => {
-                    let parent_id = channel.parent_id.map(|id| id.get());
-                    (Some(channel.kind), parent_id)
-                }
-                _ => (Some(ChannelType::Private), None),
-            };
-
-            let paired_users = data.pairing_store.get_paired_user_ids().await;
-            let active_threads: Vec<u64> = data
-                .active_threads
-                .read()
-                .map(|set| set.iter().copied().collect())
-                .unwrap_or_default();
-
-            let config = InboundFilterConfig {
-                free_response_channels: &data.free_response_channels,
-                allowed_users: &data.allowed_users,
-                allowed_roles: &data.allowed_roles,
-                user_roles: &[],
-                allow_all_users: data.allow_all_users,
-                thread_sessions_per_user: data.thread_sessions_per_user,
-                active_threads: &active_threads,
-                allowed_channels: &data.allowed_channels,
-                ignored_channels: &data.ignored_channels,
-                primary_bot_id: data.primary_bot_id,
-                thread_require_mention: data.thread_require_mention,
-                allow_bots: data.allow_bots,
-                paired_users: &paired_users,
-                parent_channel_id,
-            };
-
-            if let Some(event) =
-                message_to_inbound_with_config(&msg, bot_user_id, channel_type, &config)
-            {
-                tracing::info!(
-                    message_id = %msg.id,
-                    channel = %msg.channel_id,
-                    "backfilling missed Discord message from offline window"
-                );
-                if let Ok(routed) = route_claimed_event(data, event).await {
-                    if routed {
-                        total_backfilled += 1;
-                    }
-                }
+    for &cid in &data.allowed_channels {
+        channel_ids_to_scan.insert(cid);
+    }
+    for &cid in &data.free_response_channels {
+        channel_ids_to_scan.insert(cid);
+    }
+    if let Ok(active) = data.active_threads.read() {
+        for &tid in active.iter() {
+            channel_ids_to_scan.insert(tid);
+        }
+    }
+    if let Ok(owners) = data.thread_owners.read() {
+        for (&tid, &owner_bot) in owners.iter() {
+            if owner_bot == bot_user_id.get() {
+                channel_ids_to_scan.insert(tid);
             }
         }
+    }
 
-        if max_seen_id > last_msg_id_num {
-            let _ = update_channel_cursor(pool, &channel_id_str, &max_seen_id.to_string()).await;
+    for &ignored in &data.ignored_channels {
+        channel_ids_to_scan.remove(&ignored);
+    }
+
+    let mut total_backfilled = 0;
+    const PAGE_LIMIT: u8 = 50;
+
+    for channel_id_num in channel_ids_to_scan {
+        let channel_id = ChannelId::new(channel_id_num);
+        let channel_id_str = channel_id_num.to_string();
+
+        let mut current_cursor_str = get_bot_channel_cursor(pool, &bot_id_str, &channel_id_str)
+            .await?
+            .filter(|s| !s.trim().is_empty());
+
+        let mut channel_stopped = false;
+
+        loop {
+            if channel_stopped {
+                break;
+            }
+
+            let after_id = current_cursor_str
+                .as_ref()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(MessageId::new);
+
+            let messages = match fetcher
+                .fetch_messages(channel_id, after_id, PAGE_LIMIT)
+                .await
+            {
+                Ok(msgs) => msgs,
+                Err(err) => {
+                    tracing::warn!(
+                        channel_id = %channel_id_str,
+                        %err,
+                        "failed to fetch messages for missed-message backfill"
+                    );
+                    break;
+                }
+            };
+
+            if messages.is_empty() {
+                break;
+            }
+            let batch_size = messages.len();
+
+            let mut sorted_messages = messages;
+            sorted_messages.sort_by_key(|m| m.id.get());
+
+            for msg in sorted_messages {
+                let msg_id_str = msg.id.to_string();
+
+                let (channel_type, parent_channel_id, guild_id) = match fetcher
+                    .get_channel(msg.channel_id)
+                    .await
+                {
+                    Ok(Some(serenity::Channel::Guild(channel))) => {
+                        let parent_id = channel.parent_id.map(|id| id.get());
+                        (Some(channel.kind), parent_id, Some(channel.guild_id))
+                    }
+                    Ok(Some(serenity::Channel::Private(_))) => {
+                        (Some(ChannelType::Private), None, None)
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            channel_id = %channel_id_str,
+                            message_id = %msg_id_str,
+                            "Channel not found; stopping scan and failing closed"
+                        );
+                        channel_stopped = true;
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            channel_id = %channel_id_str,
+                            message_id = %msg_id_str,
+                            %err,
+                            "Guild channel metadata lookup failed; failing closed without DM bypass"
+                        );
+                        channel_stopped = true;
+                        break;
+                    }
+                    Ok(Some(_)) => {
+                        tracing::warn!(
+                            channel_id = %channel_id_str,
+                            message_id = %msg_id_str,
+                            "Unsupported channel kind; stopping scan and failing closed"
+                        );
+                        channel_stopped = true;
+                        break;
+                    }
+                };
+
+                let user_roles: Vec<u64> = if let Some(gid) = guild_id {
+                    match fetcher.get_member_roles(gid, msg.author.id).await {
+                        Ok(roles) => roles,
+                        Err(_) => msg
+                            .member
+                            .as_ref()
+                            .map(|m| m.roles.iter().map(|r| r.get()).collect())
+                            .unwrap_or_default(),
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                let paired_users = data.pairing_store.get_paired_user_ids().await;
+                let active_threads: Vec<u64> = data
+                    .active_threads
+                    .read()
+                    .map(|set| set.iter().copied().collect())
+                    .unwrap_or_default();
+
+                let thread_owners_buf: Vec<(u64, u64)> = data
+                    .thread_owners
+                    .read()
+                    .map(|map| map.iter().map(|(&k, &v)| (k, v)).collect())
+                    .unwrap_or_default();
+
+                let config = InboundFilterConfig {
+                    free_response_channels: &data.free_response_channels,
+                    allowed_users: &data.allowed_users,
+                    allowed_roles: &data.allowed_roles,
+                    user_roles: &user_roles,
+                    allow_all_users: data.allow_all_users,
+                    thread_sessions_per_user: data.thread_sessions_per_user,
+                    active_threads: &active_threads,
+                    thread_owners: &thread_owners_buf,
+                    allowed_channels: &data.allowed_channels,
+                    ignored_channels: &data.ignored_channels,
+                    primary_bot_id: data.primary_bot_id,
+                    thread_require_mention: data.thread_require_mention,
+                    allow_bots: data.allow_bots,
+                    paired_users: &paired_users,
+                    parent_channel_id,
+                };
+
+                let inbound_opt =
+                    message_to_inbound_with_config(&msg, bot_user_id, channel_type, &config);
+
+                if let Some(event) = inbound_opt {
+                    tracing::info!(
+                        message_id = %msg.id,
+                        channel = %msg.channel_id,
+                        "backfilling missed Discord message from offline window"
+                    );
+
+                    // The cursor is a durability marker: it may only move past a message whose
+                    // replayed turn actually completed, so backfill awaits the turn outcome.
+                    match route_claimed_event_awaiting_turn(data, event).await {
+                        Ok(routed) => {
+                            if routed {
+                                total_backfilled += 1;
+                            }
+                            let _ = update_bot_channel_cursor(
+                                pool,
+                                &bot_id_str,
+                                &channel_id_str,
+                                &msg_id_str,
+                            )
+                            .await;
+                            current_cursor_str = Some(msg_id_str);
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                message_id = %msg.id,
+                                channel = %msg.channel_id,
+                                %err,
+                                "failed to route backfilled message; halting channel backfill for retry"
+                            );
+                            channel_stopped = true;
+                            break;
+                        }
+                    }
+                } else {
+                    current_cursor_str = Some(msg_id_str);
+                }
+            }
+
+            if batch_size < PAGE_LIMIT as usize {
+                break;
+            }
         }
     }
 
@@ -2606,6 +3766,29 @@ pub async fn run_missed_message_backfill(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn approval_dead_target_refuses_delivery() {
+        use crate::OutboundDispatcher;
+        let egress =
+            super::DiscordEgress::new(std::sync::Arc::new(serenity::Http::new("local-test")));
+        egress.dead_targets().mark_dead(42, "fixture");
+        let result = egress
+            .dispatch(crate::OutboundAction::ApprovalRequest {
+                session: crate::SessionKey::new(
+                    "discord",
+                    None::<String>,
+                    "42",
+                    None::<String>,
+                    "7",
+                ),
+                request_id: uuid::Uuid::new_v4(),
+                command: "display-only".into(),
+                reason: "fixture".into(),
+            })
+            .await;
+        println!("AP08 dead target refused={}", result.is_err());
+        assert!(result.is_err());
+    }
     use super::*;
     use crate::Database;
     use std::time::Duration;
@@ -2788,16 +3971,20 @@ mod tests {
 
     #[test]
     fn test_is_voice_audio_file() {
-        assert!(is_voice_audio_file("recording.ogg", None));
-        assert!(is_voice_audio_file("speech.opus", None));
         assert!(is_voice_audio_file("voice-message.ogg", None));
-        assert!(is_voice_audio_file("test.mp3", Some("audio/ogg")));
-        assert!(is_voice_audio_file("audio.bin", Some("audio/opus")));
+        assert!(is_voice_audio_file("voice_note.opus", None));
+        assert!(is_voice_audio_file("my-note.voice.ogg", None));
         assert!(is_voice_audio_file(
             "attachment",
             Some("audio/ogg; codecs=opus")
         ));
+        assert!(is_voice_audio_file(
+            "audio.bin",
+            Some("audio/opus; voice=true")
+        ));
 
+        assert!(!is_voice_audio_file("recording.ogg", None));
+        assert!(!is_voice_audio_file("speech.opus", None));
         assert!(!is_voice_audio_file("document.pdf", None));
         assert!(!is_voice_audio_file("image.png", Some("image/png")));
         assert!(!is_voice_audio_file("song.mp3", Some("audio/mpeg")));
@@ -3393,6 +4580,105 @@ mod tests {
         assert!(!registry.is_dead(111));
         assert!(!registry.is_dead(222));
         assert!(!registry.is_dead(333));
+    }
+
+    #[test]
+    fn test_unauthorized_dm_allowlist_default_matrix() {
+        // Case 1: No allowlist configured -> prompt pairing
+        assert!(should_prompt_unauthorized_dm(
+            true,  // is_dm
+            false, // is_bot
+            false, // is_paired
+            false, // allow_all_users
+            &[],   // allowed_users
+            &[],   // allowed_roles
+        ));
+
+        // Case 2: Explicit allowed_users configured -> ignore unauthorized DM
+        assert!(!should_prompt_unauthorized_dm(
+            true,
+            false,
+            false,
+            false,
+            &[100, 200],
+            &[],
+        ));
+
+        // Case 3: Explicit allowed_roles configured -> ignore unauthorized DM
+        assert!(!should_prompt_unauthorized_dm(
+            true,
+            false,
+            false,
+            false,
+            &[],
+            &[300],
+        ));
+
+        // Case 4: Bot author -> ignore
+        assert!(!should_prompt_unauthorized_dm(
+            true,
+            true, // is_bot
+            false,
+            false,
+            &[],
+            &[],
+        ));
+
+        // Case 5: Non-DM channel -> ignore
+        assert!(!should_prompt_unauthorized_dm(
+            false, // is_dm
+            false,
+            false,
+            false,
+            &[],
+            &[],
+        ));
+
+        // Case 6: Already paired -> ignore
+        assert!(!should_prompt_unauthorized_dm(
+            true,
+            false,
+            true, // is_paired
+            false,
+            &[],
+            &[],
+        ));
+
+        // Case 7: allow_all_users active -> ignore (already admitted)
+        assert!(!should_prompt_unauthorized_dm(
+            true,
+            false,
+            false,
+            true, // allow_all_users
+            &[],
+            &[],
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_decide_unauthorized_dm_throttling() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = PairingStore::new(pool);
+        store.init_cache().await.unwrap();
+
+        let user_id = 888777666_u64;
+        let t0 = Utc::now();
+
+        // No allowlist configured: first message yields code
+        let decision1 =
+            decide_unauthorized_dm(true, false, user_id, &store, false, &[], &[], t0).await;
+        assert!(decision1.is_some());
+
+        // Repeated message at same injected timestamp is throttled
+        let decision2 =
+            decide_unauthorized_dm(true, false, user_id, &store, false, &[], &[], t0).await;
+        assert_eq!(decision2, None);
+
+        // Explicit allowlist configured: ignored completely
+        let other_user = 111222333_u64;
+        let decision_allowlist =
+            decide_unauthorized_dm(true, false, other_user, &store, false, &[999], &[], t0).await;
+        assert_eq!(decision_allowlist, None);
     }
 }
 

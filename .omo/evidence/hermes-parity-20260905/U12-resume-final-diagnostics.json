@@ -1,0 +1,8 @@
+{
+  "phase": "after whitespace-only positive-witness formatting",
+  "tool": "functions.lsp_diagnostics",
+  "severity": "all",
+  "src/agent/omo_backend.rs": "Timed out waiting for fresh diagnostics within 3000ms",
+  "tests/test_omo_backend.rs": "Timed out waiting for fresh diagnostics within 3000ms",
+  "clean_result_claimed": false
+}

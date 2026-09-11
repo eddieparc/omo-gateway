@@ -5,7 +5,7 @@ mod omo_activity;
 mod omo_backend;
 mod omo_config;
 mod omo_daemon;
-mod omo_protocol;
+pub mod omo_protocol;
 pub mod workspace_migration;
 
 pub use backend::AgentBackend;

@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serenity::all::{ButtonStyle, CreateActionRow, CreateButton};
 use sqlx::SqlitePool;
 use thiserror::Error;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{oneshot, RwLock};
 use uuid::Uuid;
 
 use crate::{OutboundAction, OutboundDispatcher, SessionKey};
@@ -52,10 +53,24 @@ pub struct ApprovalPrompt {
     pub request_id: Uuid,
     pub components: Vec<CreateActionRow>,
     receiver: oneshot::Receiver<ApprovalDecision>,
+    lease: PendingLease,
+}
+
+#[derive(Debug)]
+struct PendingLease {
+    request_id: Uuid,
+    pending: Arc<Mutex<HashMap<Uuid, PendingApprovalEntry>>>,
+}
+
+impl Drop for PendingLease {
+    fn drop(&mut self) {
+        self.pending.lock().remove(&self.request_id);
+    }
 }
 
 impl ApprovalPrompt {
     pub async fn wait(self, timeout: Duration) -> Result<ApprovalDecision, ApprovalError> {
+        let _lease = self.lease;
         match tokio::time::timeout(timeout, self.receiver).await {
             Ok(Ok(decision)) => Ok(decision),
             Ok(Err(_)) => Err(ApprovalError::Cancelled),
@@ -73,6 +88,7 @@ impl ApprovalPrompt {
         F: FnMut() + Send,
     {
         let deadline = tokio::time::Instant::now() + timeout;
+        let _lease = self.lease;
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
@@ -98,6 +114,7 @@ impl ApprovalPrompt {
     }
 }
 
+#[derive(Debug)]
 struct PendingApprovalEntry {
     session: Option<SessionKey>,
     sender: oneshot::Sender<ApprovalDecision>,
@@ -110,7 +127,7 @@ struct PendingApprovalEntry {
 pub struct SmartApprovalGuard {
     pending: Arc<Mutex<HashMap<Uuid, PendingApprovalEntry>>>,
     session_cache: Arc<RwLock<HashMap<SessionKey, HashSet<String>>>>,
-    yolo_sessions: Arc<RwLock<HashSet<SessionKey>>>,
+    yolo_sessions: Arc<RwLock<HashSet<String>>>,
     always_cache: Arc<RwLock<HashSet<String>>>,
     pool: Arc<RwLock<Option<SqlitePool>>>,
 }
@@ -124,8 +141,52 @@ pub trait ApprovalRequester: Send + Sync {
         reason: &str,
     ) -> Result<ApprovalDecision, ApprovalError>;
 
+    /// Request a tool rule independently of its human-readable display target.
+    /// Requesters without remembered grants can retain the original interface.
+    async fn request_approval_scoped(
+        &self,
+        session: &SessionKey,
+        command: &str,
+        reason: &str,
+        _pattern_key: &str,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        self.request_approval(session, command, reason).await
+    }
+
+    /// Requesters that remember grants must override this and cap before caching.
+    async fn request_approval_with_max_scope(
+        &self,
+        session: &SessionKey,
+        command: &str,
+        reason: &str,
+        max_scope: ApprovalScope,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        self.request_approval(session, command, reason)
+            .await
+            .map(|decision| max_scope.cap(decision))
+    }
+
     async fn is_yolo(&self, _session: &SessionKey) -> bool {
         false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalScope {
+    Once,
+    Session,
+    Always,
+}
+
+impl ApprovalScope {
+    fn cap(self, decision: ApprovalDecision) -> ApprovalDecision {
+        match (self, decision) {
+            (Self::Once, ApprovalDecision::Session | ApprovalDecision::Always) => {
+                ApprovalDecision::Once
+            }
+            (Self::Session, ApprovalDecision::Always) => ApprovalDecision::Session,
+            (_, decision) => decision,
+        }
     }
 }
 
@@ -184,12 +245,68 @@ impl ApprovalRequester for DiscordApprovalRequester {
         command: &str,
         reason: &str,
     ) -> Result<ApprovalDecision, ApprovalError> {
+        let pattern_key = crate::security::derive_pattern_key(command);
+        self.request_approval_scoped(session, command, reason, &pattern_key)
+            .await
+    }
+
+    async fn request_approval_scoped(
+        &self,
+        session: &SessionKey,
+        command: &str,
+        reason: &str,
+        pattern_key: &str,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        self.request_with_scope(session, command, reason, pattern_key, ApprovalScope::Always)
+            .await
+    }
+
+    async fn request_approval_with_max_scope(
+        &self,
+        session: &SessionKey,
+        command: &str,
+        reason: &str,
+        max_scope: ApprovalScope,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        if max_scope == ApprovalScope::Always {
+            return self.request_approval(session, command, reason).await;
+        }
+        // Scanner grants are distinct from broad terminal category grants and
+        // from findings on another command. Nothing capped is persisted globally.
+        let key = format!(
+            "tirith:{max_scope:?}:{}",
+            serde_json::json!([command, reason])
+        );
+        self.request_with_scope(session, command, reason, &key, max_scope)
+            .await
+    }
+}
+
+impl DiscordApprovalRequester {
+    async fn request_with_scope(
+        &self,
+        session: &SessionKey,
+        command: &str,
+        reason: &str,
+        pattern_key: &str,
+        max_scope: ApprovalScope,
+    ) -> Result<ApprovalDecision, ApprovalError> {
         if self.guard.is_yolo(session).await {
             return Ok(ApprovalDecision::Once);
         }
 
-        let pattern_key = crate::security::derive_pattern_key(command);
-        if self.guard.is_approved(session, &pattern_key).await {
+        let remembered = match max_scope {
+            ApprovalScope::Once => false,
+            ApprovalScope::Session => self
+                .guard
+                .session_cache
+                .read()
+                .await
+                .get(session)
+                .is_some_and(|keys| keys.contains(pattern_key)),
+            ApprovalScope::Always => self.guard.is_approved(session, pattern_key).await,
+        };
+        if remembered {
             return Ok(ApprovalDecision::Session);
         }
 
@@ -199,19 +316,56 @@ impl ApprovalRequester for DiscordApprovalRequester {
             .await
             .clone()
             .ok_or(ApprovalError::Cancelled)?;
+        let (display_command, display_reason) = match (
+            crate::security::redact_approval_display(command),
+            crate::security::redact_approval_display(reason),
+        ) {
+            (Ok(command), Ok(reason)) => (command, reason),
+            (Err(error), _) | (_, Err(error)) => {
+                tracing::warn!(%error, "approval display preparation failed");
+                return Err(ApprovalError::Cancelled);
+            }
+        };
         let prompt = self.guard.request_with_session(Some(session.clone())).await;
         let request_id = prompt.request_id;
-        if dispatcher
-            .dispatch(OutboundAction::ApprovalRequest {
-                session: session.clone(),
-                request_id,
-                command: command.to_owned(),
-                reason: reason.to_owned(),
-            })
+        // The delivery owner outlives a dropped caller: it finishes dispatch before
+        // consuming the terminal signal, so expiry cannot overtake a late send.
+        let (terminal, ended) = oneshot::channel::<()>();
+        let (sent, delivered) = oneshot::channel();
+        let action = OutboundAction::ApprovalRequest {
+            session: session.clone(),
+            request_id,
+            command: display_command,
+            reason: display_reason,
+        };
+        let delivery = tokio::spawn(async move {
+            let result =
+                tokio::time::timeout(Duration::from_secs(10), dispatcher.dispatch(action)).await;
+            let success = matches!(result, Ok(Ok(())));
+            if let Ok(Err(error)) = &result {
+                tracing::warn!(%error, %request_id, "approval delivery failed");
+            }
+            let _ = sent.send(success);
+            let _ = ended.await;
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                dispatcher.dispatch(OutboundAction::ExpireApproval { request_id }),
+            )
             .await
-            .is_err()
-        {
-            self.guard.cancel(request_id).await;
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, %request_id, "approval expiry delivery failed")
+                }
+                Err(_) => tracing::warn!(%request_id, "approval expiry delivery timed out"),
+            }
+        });
+        if delivered.await != Ok(true) {
+            drop(prompt);
+            drop(terminal);
+            if let Err(error) = delivery.await {
+                tracing::warn!(%error, "approval delivery task failed");
+            }
             return Err(ApprovalError::Cancelled);
         }
         let heartbeat = self.heartbeat.read().await.clone();
@@ -227,26 +381,25 @@ impl ApprovalRequester for DiscordApprovalRequester {
             }
             None => prompt.wait(self.timeout).await,
         };
+        let result = result.map(|decision| max_scope.cap(decision));
         if let Ok(decision) = &result {
             match decision {
                 ApprovalDecision::Session => {
-                    self.guard.approve_session(session, &pattern_key).await;
+                    self.guard.approve_session(session, pattern_key).await;
                 }
                 ApprovalDecision::Always => {
-                    self.guard.approve_always(&pattern_key).await;
+                    self.guard.approve_always(pattern_key).await;
                 }
                 _ => {}
             }
-        } else {
-            self.guard.cancel(request_id).await;
-            let _ = dispatcher
-                .dispatch(OutboundAction::ExpireApproval { request_id })
-                .await;
+        }
+        drop(terminal);
+        if let Err(error) = delivery.await {
+            tracing::warn!(%error, "approval delivery task failed");
         }
         result
     }
 }
-
 impl SmartApprovalGuard {
     pub fn new() -> Self {
         Self::default()
@@ -273,6 +426,28 @@ impl SmartApprovalGuard {
         let count = rows.len();
         for (pattern,) in rows {
             always.insert(pattern);
+        }
+        Ok(count)
+    }
+
+    pub async fn load_persisted_yolo(&self) -> Result<usize, sqlx::Error> {
+        let pool = self.pool.read().await.clone();
+        let Some(pool) = pool else {
+            return Ok(0);
+        };
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT session_key, state_json FROM sessions")
+                .fetch_all(&pool)
+                .await?;
+        let mut yolo = self.yolo_sessions.write().await;
+        let mut count = 0;
+        for (session_key, state_json) in rows {
+            let state: crate::SessionState = serde_json::from_str(&state_json)
+                .map_err(|err| sqlx::Error::Decode(Box::new(err)))?;
+            if state.yolo {
+                yolo.insert(session_key);
+                count += 1;
+            }
         }
         Ok(count)
     }
@@ -328,21 +503,31 @@ impl SmartApprovalGuard {
     }
 
     pub async fn is_yolo(&self, session: &SessionKey) -> bool {
-        self.yolo_sessions.read().await.contains(session)
+        self.yolo_sessions
+            .read()
+            .await
+            .contains(&session.storage_key())
     }
 
     pub async fn set_yolo(&self, session: &SessionKey, enabled: bool) {
         let mut yolo = self.yolo_sessions.write().await;
+        let storage_key = session.storage_key();
         if enabled {
-            yolo.insert(session.clone());
+            yolo.insert(storage_key);
         } else {
-            yolo.remove(session);
+            yolo.remove(&storage_key);
         }
     }
 
     pub async fn clear_session(&self, session: &SessionKey) {
+        self.pending
+            .lock()
+            .retain(|_, entry| entry.session.as_ref() != Some(session));
         self.session_cache.write().await.remove(session);
-        self.yolo_sessions.write().await.remove(session);
+        self.yolo_sessions
+            .write()
+            .await
+            .remove(&session.storage_key());
     }
 
     pub async fn request(&self) -> ApprovalPrompt {
@@ -352,7 +537,7 @@ impl SmartApprovalGuard {
     pub async fn request_with_session(&self, session: Option<SessionKey>) -> ApprovalPrompt {
         let request_id = Uuid::new_v4();
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(
+        self.pending.lock().insert(
             request_id,
             PendingApprovalEntry {
                 session,
@@ -364,6 +549,10 @@ impl SmartApprovalGuard {
             request_id,
             components: approval_buttons(request_id),
             receiver,
+            lease: PendingLease {
+                request_id,
+                pending: self.pending.clone(),
+            },
         }
     }
 
@@ -371,43 +560,21 @@ impl SmartApprovalGuard {
         let Some((request_id, decision)) = parse_custom_id(custom_id) else {
             return false;
         };
-        let Some(entry) = self.pending.lock().await.remove(&request_id) else {
+        let Some(entry) = self.pending.lock().remove(&request_id) else {
             return false;
         };
         entry.sender.send(decision).is_ok()
     }
 
     pub async fn resolve_session_deny(&self, session: &SessionKey, reason: Option<String>) -> bool {
-        let mut lock = self.pending.lock().await;
+        let mut lock = self.pending.lock();
         let target = lock
             .iter()
-            .filter(|(_, entry)| {
-                if let Some(s) = &entry.session {
-                    s == session
-                        || (s.platform == session.platform
-                            && s.channel_id == session.channel_id
-                            && s.thread_id == session.thread_id)
-                } else {
-                    false
-                }
-            })
-            .max_by_key(|(_, entry)| entry.created_at)
+            .filter(|(_, entry)| entry.session.as_ref() == Some(session))
+            .min_by_key(|(_, entry)| entry.created_at)
             .map(|(id, _)| *id);
 
-        let target_id = target.or_else(|| {
-            lock.iter()
-                .filter(|(_, entry)| {
-                    if let Some(s) = &entry.session {
-                        s.channel_id == session.channel_id
-                    } else {
-                        false
-                    }
-                })
-                .max_by_key(|(_, entry)| entry.created_at)
-                .map(|(id, _)| *id)
-        });
-
-        if let Some(request_id) = target_id {
+        if let Some(request_id) = target {
             if let Some(entry) = lock.remove(&request_id) {
                 return entry.sender.send(ApprovalDecision::Deny { reason }).is_ok();
             }
@@ -416,11 +583,11 @@ impl SmartApprovalGuard {
     }
 
     pub async fn cancel(&self, request_id: Uuid) {
-        self.pending.lock().await.remove(&request_id);
+        self.pending.lock().remove(&request_id);
     }
 
     pub async fn pending_count(&self) -> usize {
-        self.pending.lock().await.len()
+        self.pending.lock().len()
     }
 }
 
@@ -470,6 +637,71 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn approval_lifecycle_cleans_all_surfaces_and_isolates_bots() {
+        // Given: two bot lanes and two FIFO waiters in lane A.
+        let guard = SmartApprovalGuard::new();
+        let a =
+            SessionKey::new("discord", Some("guild"), "42", Some("43"), "user").with_bot_id("A");
+        let b = a.clone().with_bot_id("B");
+        let first = guard.request_with_session(Some(a.clone())).await;
+        let second = guard.request_with_session(Some(a.clone())).await;
+        let other = guard.request_with_session(Some(b.clone())).await;
+        let ids = [first.request_id, second.request_id, other.request_id];
+        // When: deny only A.
+        assert!(guard.resolve_session_deny(&a, None).await);
+        let remaining = {
+            let pending = guard.pending.lock();
+            ids.map(|id| pending.contains_key(&id))
+        };
+        for id in ids {
+            guard.cancel(id).await;
+        }
+        // Then: oldest A alone was consumed; no fallback to newest B.
+        println!("AP08 FIFO/bot remaining={remaining:?}");
+        assert_eq!(remaining, [false, true, true]);
+    }
+
+    struct LifecycleDispatcher(tokio::sync::mpsc::UnboundedSender<OutboundAction>);
+
+    #[async_trait]
+    impl OutboundDispatcher for LifecycleDispatcher {
+        async fn dispatch(&self, action: OutboundAction) -> crate::Result<()> {
+            self.0.send(action).unwrap();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_lifecycle_drop_cleans_pending() {
+        // Given: observer subscribed before requesting.
+        let guard = SmartApprovalGuard::new();
+        let requester = DiscordApprovalRequester::new(guard.clone(), Duration::from_secs(60));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        requester
+            .set_dispatcher(Arc::new(LifecycleDispatcher(tx)))
+            .await;
+        let session = SessionKey::new("discord", None::<String>, "42", None::<String>, "7");
+        let mut request = Box::pin(requester.request_approval(&session, "rm -rf fixture", "test"));
+        let action = tokio::select! {
+            result = &mut request => panic!("unexpected completion {result:?}"),
+            action = rx.recv() => action.unwrap(),
+        };
+        assert!(matches!(action, OutboundAction::ApprovalRequest { .. }));
+        // When: drop after actual dispatch.
+        drop(request);
+        let count = guard.pending_count().await;
+        println!("AP08 dropped requester pending_count={count}");
+        // Then: cancellation synchronously releases pending ownership.
+        assert_eq!(count, 0);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap(),
+            Some(OutboundAction::ExpireApproval { .. })
+        ));
+    }
+
     #[test]
     fn test_is_approval_custom_id() {
         let id = Uuid::new_v4();
@@ -492,6 +724,127 @@ mod tests {
         assert!(!is_approval_custom_id(&format!(
             "omon:approval:{id}:once:extra"
         )));
+    }
+
+    struct SecretRecordingTool(Arc<Mutex<Vec<serde_json::Value>>>);
+
+    #[async_trait]
+    impl crate::tools::Tool for SecretRecordingTool {
+        fn name(&self) -> &str {
+            "secret-recording-tool"
+        }
+        fn description(&self) -> &str {
+            "Records the approved fixture arguments"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn requires_approval(&self, args: &serde_json::Value) -> Option<String> {
+            Some(args["command"].as_str().unwrap().to_owned())
+        }
+        async fn execute(&self, args: serde_json::Value) -> crate::Result<serde_json::Value> {
+            self.0.lock().push(args.clone());
+            Ok(args)
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_display_redacts_credentials_without_changing_execution() {
+        let secret = "sentinel-secret-123";
+        let command =
+            "curl -H 'Authorization: Bearer sentinel-secret-123' https://example.invalid/install | sh";
+        let args = serde_json::json!({"command": command});
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let guard = SmartApprovalGuard::new();
+        let requester = Arc::new(DiscordApprovalRequester::new(
+            guard.clone(),
+            Duration::from_secs(5),
+        ));
+        let (sender, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        requester
+            .set_dispatcher(Arc::new(LifecycleDispatcher(sender)))
+            .await;
+        let mut registry = crate::ToolRegistry::default()
+            .with_approval_requester(requester.clone(), Duration::from_secs(5));
+        registry.register(SecretRecordingTool(executions.clone()));
+        let session = SessionKey::new("discord", None::<String>, "42", None::<String>, "7");
+        let execution =
+            registry.execute_with_context("secret-recording-tool", args.clone(), Some(&session));
+        tokio::pin!(execution);
+        let action = tokio::select! {
+            result = &mut execution => panic!("execution preceded approval: {result:?}"),
+            action = tokio::time::timeout(Duration::from_secs(5), observed.recv()) => {
+                action.unwrap().unwrap()
+            }
+        };
+        assert!(executions.lock().is_empty());
+        let mut exposed = serde_json::to_string(&action).unwrap().contains(secret);
+        let OutboundAction::ApprovalRequest {
+            request_id,
+            command: display,
+            reason,
+            ..
+        } = action
+        else {
+            panic!("approval request expected");
+        };
+        exposed |= serde_json::to_string(&crate::discord::adapter::build_approval_embed(
+            &display, &reason,
+        ))
+        .unwrap()
+        .contains(secret);
+        assert!(
+            guard
+                .resolve_custom_id(&format!("omon:approval:{request_id}:once"))
+                .await
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), &mut execution)
+                .await
+                .unwrap()
+                .unwrap(),
+            args
+        );
+        assert_eq!(*executions.lock(), vec![args]);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                .await
+                .unwrap(),
+            Some(OutboundAction::ExpireApproval { .. })
+        ));
+
+        let direct = requester.request_approval(&session, command, command);
+        tokio::pin!(direct);
+        let action = tokio::select! {
+            result = &mut direct => panic!("approval unexpectedly completed: {result:?}"),
+            action = tokio::time::timeout(Duration::from_secs(5), observed.recv()) => {
+                action.unwrap().unwrap()
+            }
+        };
+        exposed |= serde_json::to_string(&action).unwrap().contains(secret);
+        let OutboundAction::ApprovalRequest { request_id, .. } = action else {
+            panic!("approval request expected");
+        };
+        assert!(
+            guard
+                .resolve_custom_id(&format!("omon:approval:{request_id}:once"))
+                .await
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), &mut direct)
+                .await
+                .unwrap(),
+            Ok(ApprovalDecision::Once)
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                .await
+                .unwrap(),
+            Some(OutboundAction::ExpireApproval { .. })
+        ));
+        assert_eq!(guard.pending_count().await, 0);
+        println!("U04 secret_exposed={exposed} raw_args_equal=true executions=1 pending=0");
+        assert!(!exposed);
     }
 
     #[test]
@@ -665,21 +1018,25 @@ mod tests {
 
         let heartbeat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hb = heartbeat_count.clone();
+        let (beat_tx, mut beat_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let wait_handle = tokio::spawn(async move {
             prompt
                 .wait_with_heartbeat(
                     Duration::from_millis(200),
-                    Duration::from_millis(20),
+                    Duration::from_millis(10),
                     move || {
                         hb.fetch_add(1, Ordering::SeqCst);
+                        let _ = beat_tx.send(());
                     },
                 )
                 .await
         });
 
-        // Wait 55ms, verify at least 2 heartbeats fired
-        tokio::time::sleep(Duration::from_millis(55)).await;
+        // Causally wait for exactly 2 heartbeats to fire without wall-clock sleep
+        beat_rx.recv().await.expect("first heartbeat");
+        beat_rx.recv().await.expect("second heartbeat");
+
         let custom_id = format!("omon:approval:{request_id}:once");
         assert!(guard.resolve_custom_id(&custom_id).await);
 
@@ -689,9 +1046,11 @@ mod tests {
         let count_after_resolve = heartbeat_count.load(Ordering::SeqCst);
         assert!(count_after_resolve >= 2);
 
-        // Sleep longer, verify heartbeat stopped firing after resolution
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(heartbeat_count.load(Ordering::SeqCst), count_after_resolve);
+        // Verify heartbeat stopped: since wait_handle resolved and joined, no further beats arrive
+        assert!(
+            beat_rx.try_recv().is_err(),
+            "heartbeat must stop firing after resolve"
+        );
     }
 
     #[tokio::test]
@@ -764,5 +1123,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decision, ApprovalDecision::Session);
+    }
+
+    #[tokio::test]
+    async fn test_yolo_persistence_roundtrip_and_restart() {
+        let db = crate::Database::connect("sqlite::memory:").await.unwrap();
+        let session = SessionKey::new("discord", Some("guild1"), "chan1", None::<String>, "user1");
+
+        let state = crate::SessionState {
+            yolo: true,
+            ..Default::default()
+        };
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, guild_id, channel_id, user_id, state_json)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session.storage_key())
+        .bind(&session.platform)
+        .bind(&session.guild_id)
+        .bind(&session.channel_id)
+        .bind(&session.user_id)
+        .bind(serde_json::to_string(&state).unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let guard = SmartApprovalGuard::new().with_pool(db.pool().clone());
+        assert!(!guard.is_yolo(&session).await);
+
+        let loaded = guard.load_persisted_yolo().await.unwrap();
+        assert_eq!(loaded, 1);
+        assert!(guard.is_yolo(&session).await);
+
+        let requester = DiscordApprovalRequester::new(guard, Duration::from_millis(50));
+        let decision = requester
+            .request_approval(&session, "echo hello", "harmless")
+            .await
+            .unwrap();
+        assert_eq!(decision, ApprovalDecision::Once);
+        assert!(decision.is_approved());
+    }
+
+    #[tokio::test]
+    async fn test_twin_bot_same_dm_yolo_restoration() {
+        let db = crate::Database::connect("sqlite::memory:").await.unwrap();
+        let bot84 = SessionKey::new("discord", None::<String>, "dm1", None::<String>, "user1")
+            .with_bot_id("84");
+        let bot42 = SessionKey::new("discord", None::<String>, "dm1", None::<String>, "user1")
+            .with_bot_id("42");
+        let botless = SessionKey::new("discord", None::<String>, "dm1", None::<String>, "user1");
+
+        let state = crate::SessionState {
+            yolo: true,
+            ..Default::default()
+        };
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, guild_id, channel_id, user_id, state_json)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(bot84.storage_key())
+        .bind(&bot84.platform)
+        .bind(&bot84.guild_id)
+        .bind(&bot84.channel_id)
+        .bind(&bot84.user_id)
+        .bind(serde_json::to_string(&state).unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let guard = SmartApprovalGuard::new().with_pool(db.pool().clone());
+        let loaded = guard.load_persisted_yolo().await.unwrap();
+        assert_eq!(loaded, 1);
+        assert!(guard.is_yolo(&bot84).await, "bot84 must be yolo");
+        assert!(!guard.is_yolo(&bot42).await, "bot42 must not be yolo");
+        assert!(
+            !guard.is_yolo(&botless).await,
+            "botless alias must not be yolo"
+        );
     }
 }

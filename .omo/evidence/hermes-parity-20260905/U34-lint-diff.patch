@@ -1,0 +1,32 @@
+--- a/src/discord/table_render/mod.rs
++++ b/src/discord/table_render/mod.rs
+@@ -162,11 +162,10 @@ pub fn render_table_to_svg(table: &MarkdownTable) -> String {
+             let max_line_chars = ((width - cell_padding_x * 2.0) / font_size).max(1.0) as usize;
+             let mut current = String::new();
+             for word in paragraph.split_whitespace() {
+-                if current.chars().count() + word.chars().count() + 1 > max_line_chars {
+-                    if !current.is_empty() {
+-                        wrapped.push(current.clone());
+-                        current.clear();
+-                    }
++                if current.chars().count() + word.chars().count() + 1 > max_line_chars
++                    && !current.is_empty()
++                {
++                    wrapped.push(current.clone());
++                    current.clear();
+                 }
+                 if !current.is_empty() {
+                     current.push(' ');
+@@ -297,8 +296,10 @@ fn html_escape(text: &str) -> String {
+ }
+ 
+ pub fn svg_to_png(svg_str: &str, scale: f32) -> Result<Vec<u8>, String> {
+-    let mut opt = usvg::Options::default();
+-    opt.font_family = "sans-serif".to_string();
++    let mut opt = usvg::Options {
++        font_family: "sans-serif".to_string(),
++        ..Default::default()
++    };
+     opt.fontdb_mut().load_system_fonts();
+ 
+     let tree = usvg::Tree::from_str(svg_str, &opt).map_err(|e| e.to_string())?;

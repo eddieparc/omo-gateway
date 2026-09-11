@@ -1,0 +1,6 @@
+[
+  "cargo clippy --lib -- -D warnings",
+  "cargo test --lib discord::table_render::tests -- --nocapture",
+  "rustfmt --check --edition 2021 src/discord/table_render/mod.rs",
+  "git diff --check -- src/discord/table_render/mod.rs"
+]

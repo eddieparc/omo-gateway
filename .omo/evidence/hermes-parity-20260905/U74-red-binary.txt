@@ -1,0 +1,22 @@
+status: exited_101 exit_code: 101
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 47s
+     Running unittests src/entry.rs (target/debug/deps/omo_gateway-15aa4be91e6c88a1)
+
+running 1 test
+
+thread 'legacy::runner_tests::restart_chain_preserves_pending_until_explicit_input' (13244885) panicked at src/main.rs:1819:9:
+assertion `left == right` failed: slow restart loop must not automatically rerun work
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test legacy::runner_tests::restart_chain_preserves_pending_until_explicit_input ... FAILED
+
+failures:
+
+failures:
+    legacy::runner_tests::restart_chain_preserves_pending_until_explicit_input
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--bin omo-gateway`

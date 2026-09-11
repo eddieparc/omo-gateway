@@ -4,23 +4,16 @@ use regex::Regex;
 
 static GATEWAY_LIFECYCLE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
-        // Branch A: hermes / omon gateway restart|stop or omon restart
         Regex::new(r"(?i)\b(?:hermes|omon)\s+(?:gateway\s+)?(?:restart|stop)\b").unwrap(),
         Regex::new(r"(?i)\bomon(?:-gateway)?\s+restart\b").unwrap(),
-        Regex::new(r"(?i)\bomon[_\-\s].*restart\b").unwrap(),
-        // Branch B: launchctl operations
-        Regex::new(r"(?i)\blaunchctl\s+kickstart\b").unwrap(),
         Regex::new(
             r"(?i)\blaunchctl\s+(?:kickstart|unload|load|stop|restart)\b[^\n]*\b(?:omon|hermes)",
         )
         .unwrap(),
-        // Branch C: systemctl operations
         Regex::new(
             r"(?i)\bsystemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\b(?:omon|hermes)",
         )
         .unwrap(),
-        Regex::new(r"(?i)\bsystemctl\s+(?:-\S+\s+)*restart\b").unwrap(),
-        // Branch D: pkill / kill / killall targeting gateway
         Regex::new(r"(?i)\bp?kill(?:all)?\b[^\n]*\b(?:omon|hermes)\b[^\n]*\bgateway").unwrap(),
         Regex::new(r"(?i)\bp?kill(?:all)?\b[^\n]*\bgateway\b[^\n]*\b(?:omon|hermes)").unwrap(),
         Regex::new(r"(?i)\bp?kill(?:all)?\b[^\n]*\b(?:omon-gateway|hermes-gateway)\b").unwrap(),
@@ -56,7 +49,6 @@ mod tests {
             "systemctl restart omon-gateway",
             "systemctl restart hermes-gateway.service",
             "systemctl --user restart hermes-gateway",
-            "systemctl restart nginx",
             "hermes gateway restart",
             "hermes gateway stop",
             "omon gateway restart",
@@ -83,6 +75,8 @@ mod tests {
             "git status",
             "ls -la /tmp",
             "systemctl status postgresql",
+            "systemctl restart nginx",
+            "launchctl kickstart gui/501/com.example.worker",
             "echo 'hello omon gateway'",
             "python3 -c 'print(\"running cron task\")'",
             "curl -s https://api.weather.com/v1",

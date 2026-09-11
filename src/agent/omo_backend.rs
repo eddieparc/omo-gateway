@@ -1,5 +1,5 @@
 // allow: SIZE_OK — OMO WebSocket protocol state machine
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,11 +18,12 @@ use super::backend::AgentBackend;
 
 use super::omo_config::OmoBackendConfig;
 use super::omo_protocol::{
-    approval_denial_response, initialize_request, is_approval_request, thread_resume_request,
-    thread_start_request, turn_start_request,
+    approval_allow_response, approval_denial_response, initialize_request, is_approval_request,
+    thread_resume_request, thread_start_request, turn_start_request,
 };
 use crate::models::{
-    render_user_prompt, InboundEvent, OutboundAction, SessionContext, StreamChunk,
+    filter_reasoning, is_explicit_silence, render_user_prompt, InboundEvent, OutboundAction,
+    SessionContext, StreamChunk,
 };
 use crate::{OmonError, OutboundDispatcher, Result};
 
@@ -32,11 +33,19 @@ type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::Tc
 /// policy-denial loop otherwise burns the entire turn deadline flailing.
 pub const APPROVAL_DENIAL_TURN_LIMIT: u32 = 5;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveTurn {
+    pub thread_id: String,
+    /// None means submission may have reached the peer but no start ACK was observed.
+    pub turn_id: Option<String>,
+}
+
 pub struct OmoBackend {
     pub config: OmoBackendConfig,
     pub pool: Option<SqlitePool>,
     pub dispatcher: Arc<dyn OutboundDispatcher>,
     pub thread_ids: Arc<ParkingMutex<HashMap<String, String>>>,
+    pub active_turns: Arc<ParkingMutex<HashMap<String, ActiveTurn>>>,
 }
 
 impl OmoBackend {
@@ -46,6 +55,7 @@ impl OmoBackend {
             pool: None,
             dispatcher,
             thread_ids: Arc::new(ParkingMutex::new(HashMap::new())),
+            active_turns: Arc::new(ParkingMutex::new(HashMap::new())),
         }
     }
 
@@ -54,7 +64,7 @@ impl OmoBackend {
         self
     }
 
-    async fn connect_ws(&self) -> Result<WsStream> {
+    async fn connect_ws(&self, deadline: tokio::time::Instant) -> Result<WsStream> {
         let mut request = self
             .config
             .appserver_url
@@ -70,15 +80,22 @@ impl OmoBackend {
         }
 
         let mut last_err = None;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let retry_limit = deadline.min(tokio::time::Instant::now() + Duration::from_secs(15));
         let mut attempt = 0;
-        while tokio::time::Instant::now() < deadline {
+        while tokio::time::Instant::now() < retry_limit {
             attempt += 1;
             if attempt > 1 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                let sleep_until =
+                    (tokio::time::Instant::now() + Duration::from_millis(500)).min(retry_limit);
+                tokio::time::sleep_until(sleep_until).await;
+                if tokio::time::Instant::now() >= retry_limit {
+                    break;
+                }
             }
             let connect_fut = tokio_tungstenite::connect_async(request.clone());
-            match tokio::time::timeout(self.config.connect_timeout, connect_fut).await {
+            let timeout_at =
+                deadline.min(tokio::time::Instant::now() + self.config.connect_timeout);
+            match tokio::time::timeout_at(timeout_at, connect_fut).await {
                 Ok(Ok((ws, _))) => return Ok(ws),
                 Ok(Err(e)) => {
                     last_err = Some(OmonError::Llm(format!(
@@ -87,12 +104,19 @@ impl OmoBackend {
                     )));
                 }
                 Err(_) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(OmonError::Llm("turn exceeded total deadline".into()));
+                    }
                     last_err = Some(OmonError::Llm(format!(
                         "timeout connecting to omo app-server at {}",
                         self.config.appserver_url
                     )));
                 }
             }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(OmonError::Llm("turn exceeded total deadline".into()));
         }
 
         Err(last_err.unwrap_or_else(|| {
@@ -103,15 +127,38 @@ impl OmoBackend {
         }))
     }
 
-    async fn do_initialize(&self, ws: &mut WsStream) -> Result<()> {
+    async fn do_initialize(&self, ws: &mut WsStream, deadline: tokio::time::Instant) -> Result<()> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(OmonError::Llm("turn exceeded total deadline".into()));
+        }
         ws.send(initialize_request())
             .await
             .map_err(|e| OmonError::Llm(format!("failed to send initialize: {e}")))?;
 
-        while let Some(msg) = tokio::time::timeout(self.config.request_timeout, ws.next())
-            .await
-            .map_err(|_| OmonError::Llm("timeout waiting for initialize response".into()))?
-        {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(OmonError::Llm(
+                    "turn exceeded total deadline: timeout waiting for initialize response".into(),
+                ));
+            }
+            let timeout_at =
+                deadline.min(tokio::time::Instant::now() + self.config.request_timeout);
+            let Some(msg) = tokio::time::timeout_at(timeout_at, ws.next())
+                .await
+                .map_err(|_| {
+                    if tokio::time::Instant::now() >= deadline {
+                        OmonError::Llm(
+                            "turn exceeded total deadline: timeout waiting for initialize response"
+                                .into(),
+                        )
+                    } else {
+                        OmonError::Llm("timeout waiting for initialize response".into())
+                    }
+                })?
+            else {
+                break;
+            };
+
             let msg =
                 msg.map_err(|e| OmonError::Llm(format!("ws error during initialize: {e}")))?;
             if let Message::Text(text) = msg {
@@ -155,9 +202,16 @@ impl OmoBackend {
         &self,
         ws: &mut WsStream,
         session: &mut SessionContext,
+        deadline: tokio::time::Instant,
     ) -> Result<String> {
         let storage_key = session.key.storage_key();
-        let is_cron = session.key.user_id.starts_with("cron:");
+        let is_cron = session.key.user_id.starts_with("cron:")
+            || session
+                .state
+                .metadata
+                .get("cron_scheduler_delivery")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         if is_cron {
             session.state.metadata.remove("omo_thread_id");
             self.thread_ids.lock().remove(&storage_key);
@@ -169,14 +223,35 @@ impl OmoBackend {
             .map(String::from)
             .or_else(|| self.thread_ids.lock().get(&storage_key).cloned())
         {
-            let mut start_replacement = false;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(OmonError::Llm("turn exceeded total deadline".into()));
+            }
             ws.send(thread_resume_request(&id)).await.map_err(|error| {
                 OmonError::Llm(format!("failed to send thread/resume: {error}"))
             })?;
-            while let Some(message) = tokio::time::timeout(self.config.request_timeout, ws.next())
-                .await
-                .map_err(|_| OmonError::Llm("timeout waiting for thread/resume response".into()))?
-            {
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(OmonError::Llm(
+                        "turn exceeded total deadline: timeout waiting for thread/resume response"
+                            .into(),
+                    ));
+                }
+                let timeout_at =
+                    deadline.min(tokio::time::Instant::now() + self.config.request_timeout);
+                let Some(message) = tokio::time::timeout_at(timeout_at, ws.next())
+                    .await
+                    .map_err(|_| {
+                        if tokio::time::Instant::now() >= deadline {
+                            OmonError::Llm(
+                                "turn exceeded total deadline: timeout waiting for thread/resume response".into(),
+                            )
+                        } else {
+                            OmonError::Llm("timeout waiting for thread/resume response".into())
+                        }
+                    })?
+                else {
+                    break;
+                };
                 let message = message.map_err(|error| {
                     OmonError::Llm(format!("ws error in thread/resume: {error}"))
                 })?;
@@ -194,8 +269,9 @@ impl OmoBackend {
                             {
                                 session.state.metadata.remove("omo_thread_id");
                                 self.thread_ids.lock().remove(&storage_key);
-                                start_replacement = true;
-                                break;
+                                return Err(OmonError::Llm(format!(
+                                    "continuity_error: remote thread rollout missing for {id}: {message}"
+                                )));
                             }
                             return Err(OmonError::Llm(format!("thread/resume error: {error}")));
                         }
@@ -204,15 +280,18 @@ impl OmoBackend {
                             .metadata
                             .insert("omo_thread_id".into(), json!(id));
                         self.thread_ids.lock().insert(storage_key, id.clone());
+                        if !is_cron {
+                            if let Some(pool) = &self.pool {
+                                persist_session_binding(pool, session, &id).await?;
+                            }
+                        }
                         return Ok(id);
                     }
                 }
             }
-            if !start_replacement {
-                return Err(OmonError::Llm(
-                    "closed before thread/resume response".into(),
-                ));
-            }
+            return Err(OmonError::Llm(
+                "closed before thread/resume response".into(),
+            ));
         }
 
         let model = session
@@ -281,18 +360,42 @@ impl OmoBackend {
             None
         };
 
+        if tokio::time::Instant::now() >= deadline {
+            return Err(OmonError::Llm("turn exceeded total deadline".into()));
+        }
+
         ws.send(thread_start_request(
             session.state.system_prompt.as_deref(),
             model,
             workspace.as_ref(),
+            session.state.enabled_toolsets.as_deref(),
         ))
         .await
         .map_err(|e| OmonError::Llm(format!("failed to send thread/start: {e}")))?;
 
-        while let Some(msg) = tokio::time::timeout(self.config.request_timeout, ws.next())
-            .await
-            .map_err(|_| OmonError::Llm("timeout waiting for thread/start response".into()))?
-        {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(OmonError::Llm(
+                    "turn exceeded total deadline: timeout waiting for thread/start response"
+                        .into(),
+                ));
+            }
+            let timeout_at =
+                deadline.min(tokio::time::Instant::now() + self.config.request_timeout);
+            let Some(msg) = tokio::time::timeout_at(timeout_at, ws.next())
+                .await
+                .map_err(|_| {
+                    if tokio::time::Instant::now() >= deadline {
+                        OmonError::Llm(
+                            "turn exceeded total deadline: timeout waiting for thread/start response".into(),
+                        )
+                    } else {
+                        OmonError::Llm("timeout waiting for thread/start response".into())
+                    }
+                })?
+            else {
+                break;
+            };
             let msg = msg.map_err(|e| OmonError::Llm(format!("ws error in thread/start: {e}")))?;
             if let Message::Text(text) = msg {
                 let val: Value = serde_json::from_str(text.as_str())
@@ -309,6 +412,9 @@ impl OmoBackend {
                                 .metadata
                                 .insert("omo_thread_id".into(), json!(id_str));
                             self.thread_ids.lock().insert(storage_key, id_str.clone());
+                            if let Some(pool) = &self.pool {
+                                persist_session_binding(pool, session, &id_str).await?;
+                            }
                         }
                         return Ok(id_str);
                     }
@@ -327,12 +433,14 @@ impl OmoBackend {
         sequence: u64,
         content: String,
         is_final: bool,
+        reply_to: Option<String>,
     ) -> Result<()> {
         let chunk = StreamChunk {
             stream_id,
             sequence,
             content,
             is_final,
+            reply_to,
         };
         self.dispatcher
             .dispatch(OutboundAction::Stream {
@@ -344,17 +452,59 @@ impl OmoBackend {
 }
 
 impl OmoBackend {
-    async fn run_once(&self, session: &mut SessionContext, event: InboundEvent) -> Result<()> {
-        let mut ws = self.connect_ws().await?;
-        self.do_initialize(&mut ws).await?;
-        let thread_id = self.resolve_thread_id(&mut ws, session).await?;
+    async fn setup_turn(
+        &self,
+        session: &mut SessionContext,
+        deadline: tokio::time::Instant,
+        effective_total_timeout: Duration,
+    ) -> Result<(WsStream, String)> {
+        let mut ws = self.connect_ws(deadline).await?;
+        self.do_initialize(&mut ws, deadline).await?;
+        let thread_id = self.resolve_thread_id(&mut ws, session, deadline).await?;
 
+        if tokio::time::Instant::now() >= deadline {
+            return Err(OmonError::Llm(format!(
+                "turn exceeded total deadline of {effective_total_timeout:?}"
+            )));
+        }
+
+        Ok((ws, thread_id))
+    }
+
+    async fn execute_turn(
+        &self,
+        mut ws: WsStream,
+        thread_id: String,
+        session: &mut SessionContext,
+        event: InboundEvent,
+        deadline: tokio::time::Instant,
+        effective_total_timeout: Duration,
+    ) -> Result<()> {
         let user_prompt = render_user_prompt(&event);
         let model = session
             .state
             .active_model
             .as_deref()
             .or(self.config.default_model.as_deref());
+        // Own the submission before the first socket-write poll. The actor drops
+        // this future before cancel(), so ambiguous ownership must outlive it.
+        {
+            let mut active_turns = self.active_turns.lock();
+            match active_turns.entry(session.key.storage_key()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(ActiveTurn {
+                        thread_id: thread_id.clone(),
+                        turn_id: None,
+                    });
+                }
+                Entry::Occupied(_) => {
+                    return Err(OmonError::Llm(
+                        "previous omo turn outcome is unresolved; refusing another turn/start"
+                            .into(),
+                    ));
+                }
+            }
+        }
         ws.send(turn_start_request(&thread_id, &user_prompt, model))
             .await
             .map_err(|e| OmonError::Llm(format!("failed to send turn/start: {e}")))?;
@@ -379,6 +529,11 @@ impl OmoBackend {
         }
 
         let stream_id = Uuid::new_v4();
+        let reply_to = if !event.platform_message_id.is_empty() {
+            Some(event.platform_message_id.clone())
+        } else {
+            None
+        };
         let mut sequence: u64 = 0;
         let mut full_content = String::new();
         let mut tool_call_counts: std::collections::BTreeMap<String, usize> = Default::default();
@@ -386,290 +541,625 @@ impl OmoBackend {
         let mut started_ids: std::collections::HashSet<String> = Default::default();
         let mut approval_denials: u32 = 0;
 
-        let started_at = std::time::Instant::now();
+        let started_at = tokio::time::Instant::now();
         let mut turn_id: Option<String> = None;
         let mut turn_started_ack = false;
-        let mut last_activity_at = std::time::Instant::now();
-        let effective_total_timeout = if is_cron_session {
-            self.config.total_timeout
-        } else {
-            self.config.total_timeout.min(Duration::from_secs(300))
-        };
+        let mut last_activity_at = tokio::time::Instant::now();
+        let no_content_grace = self.config.no_content_grace;
 
-        while let Some(msg) = tokio::time::timeout(self.config.request_timeout, ws.next())
-            .await
-            .map_err(|_| OmonError::Llm("timeout during turn streaming".into()))?
-        {
-            if !turn_started_ack && started_at.elapsed() > Duration::from_secs(30) {
+        let ack_deadline = started_at
+            + Duration::from_secs(30).min(deadline.saturating_duration_since(started_at));
+
+        let cleanup_reserve = if effective_total_timeout >= Duration::from_secs(10) {
+            Duration::from_secs(5)
+        } else if effective_total_timeout >= Duration::from_secs(1) {
+            effective_total_timeout / 5
+        } else {
+            Duration::ZERO
+        };
+        let work_deadline = deadline.checked_sub(cleanup_reserve).unwrap_or(deadline);
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if !turn_started_ack && now >= ack_deadline {
                 return Err(OmonError::Llm(
                     "timeout waiting for turn/start acknowledgement from omo app-server".into(),
                 ));
             }
-            if last_activity_at.elapsed() > self.config.request_timeout {
-                return Err(OmonError::Llm("timeout during turn streaming".into()));
-            }
 
-            let msg = msg.map_err(|e| OmonError::Llm(format!("ws streaming error: {e}")))?;
-            if let Message::Text(text) = msg {
-                last_activity_at = std::time::Instant::now();
-                let val: Value = serde_json::from_str(text.as_str())
-                    .map_err(|e| OmonError::Llm(format!("invalid json: {e}")))?;
-                let method = val.get("method").and_then(Value::as_str).unwrap_or("");
+            let effective_work_deadline = if turn_id.is_some() {
+                work_deadline
+            } else {
+                deadline
+            };
 
-                if method != "turn/completed" && started_at.elapsed() > effective_total_timeout {
-                    if let Some(turn_id) = &turn_id {
-                        let interrupt = json!({
-                            "jsonrpc": "2.0",
-                            "id": 9_001,
-                            "method": "turn/interrupt",
-                            "params": { "threadId": thread_id, "turnId": turn_id }
-                        });
-                        let _ = ws.send(Message::text(interrupt.to_string())).await;
-                        // Give the frame a moment to reach the daemon before the
-                        // connection drops.
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    return Err(OmonError::Llm(format!(
-                        "turn exceeded total deadline of {:?}; turn/interrupt sent",
-                        effective_total_timeout
-                    )));
-                }
-
-                if val.get("id").and_then(Value::as_u64) == Some(3) {
-                    if let Some(error) = val.get("error") {
-                        return Err(OmonError::Llm(format!("turn/start error: {error}")));
-                    }
-                    turn_started_ack = true;
-                    if let Some(id) = val.pointer("/result/turn/id").and_then(Value::as_str) {
-                        turn_id = Some(id.to_string());
-                    }
-                    continue;
-                }
-
-                if let (Some(req_id), Some(method)) =
-                    (val.get("id"), val.get("method").and_then(Value::as_str))
-                {
-                    if is_approval_request(method) {
-                        approval_denials += 1;
-                        if approval_denials >= APPROVAL_DENIAL_TURN_LIMIT {
-                            tracing::error!(
-                                denials = approval_denials,
-                                "approval denial loop: aborting turn instead of flailing until the deadline"
-                            );
-                            if let Some(turn_id) = &turn_id {
-                                let interrupt = json!({
-                                    "jsonrpc": "2.0",
-                                    "id": 9_002,
-                                    "method": "turn/interrupt",
-                                    "params": { "threadId": thread_id, "turnId": turn_id }
-                                });
-                                let _ = ws.send(Message::text(interrupt.to_string())).await;
-                            }
-                            return Err(OmonError::Llm(format!(
-                                "tool approval denied {approval_denials} times by gateway policy; turn aborted"
-                            )));
-                        }
-                        let _ = ws.send(approval_denial_response(req_id)).await;
-                        continue;
-                    }
-                }
-
-                match method {
-                    "turn/started" => {
-                        approval_denials = 0;
-                        if let Some(tid) = val.pointer("/params/turnId").and_then(Value::as_str) {
-                            turn_id = Some(tid.to_string());
-                        }
-                    }
-                    "item/started" | "item/completed" => {
-                        approval_denials = 0;
-                        let is_started =
-                            val.get("method").and_then(Value::as_str) == Some("item/started");
-                        let Some(item) = val.pointer("/params/item") else {
-                            continue;
-                        };
-                        let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
-
-                        if is_started && !item_id.is_empty() && started_ids.insert(item_id.to_string()) {
-                            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-                            if !matches!(item_type, "agentMessage" | "userMessage" | "reasoning" | "") {
-                                total_tool_calls += 1;
-                                let tool_name = item
-                                    .get("command")
-                                    .or_else(|| item.get("tool"))
-                                    .or_else(|| item.get("name"))
-                                    .or_else(|| item.get("path"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or(item_type);
-                                let short_name = tool_name
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or(tool_name);
-                                *tool_call_counts.entry(short_name.to_string()).or_insert(0) += 1;
-                            }
-                        }
-
-                        if !is_started {
-                            match item.get("type").and_then(Value::as_str) {
-                                Some("agentMessage") => {
-                                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                                        full_content.clear();
-                                        full_content.push_str(text);
+            if now >= effective_work_deadline {
+                if let Some(turn_id) = &turn_id {
+                    let interrupt = json!({
+                        "jsonrpc": "2.0",
+                        "id": 9_001,
+                        "method": "turn/interrupt",
+                        "params": { "threadId": thread_id, "turnId": turn_id }
+                    });
+                    let _ = ws.send(Message::text(interrupt.to_string())).await;
+                    let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if !rem.is_zero() {
+                        let drain_fut = async {
+                            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                                if let Ok(val) = serde_json::from_str::<Value>(&text) {
+                                    if val.get("id").and_then(Value::as_u64) == Some(9_001) {
+                                        return Some(val);
+                                    }
+                                    let m = val.get("method").and_then(Value::as_str).unwrap_or("");
+                                    if m == "item/agentMessage/delta" {
+                                        if let Some(delta) =
+                                            val.pointer("/params/delta").and_then(Value::as_str)
+                                        {
+                                            full_content.push_str(delta);
+                                        }
+                                    } else if m == "item/completed" {
+                                        if let Some("agentMessage") =
+                                            val.pointer("/params/item/type").and_then(Value::as_str)
+                                        {
+                                            if let Some(text) = val
+                                                .pointer("/params/item/text")
+                                                .and_then(Value::as_str)
+                                            {
+                                                full_content.clear();
+                                                full_content.push_str(text);
+                                            }
+                                        }
+                                    } else if m == "turn/completed" {
+                                        return Some(val);
                                     }
                                 }
-                                _ => {}
                             }
-                        }
-                    }
-                    "item/agentMessage/delta" => {
-                        if let Some(delta) = val.pointer("/params/delta").and_then(Value::as_str) {
-                            if !delta.is_empty() {
-                                full_content.push_str(delta);
-                                let _ = self
+                            None
+                        };
+                        if let Ok(Some(val)) = tokio::time::timeout(rem, drain_fut).await {
+                            let status = val.pointer("/params/turn/status").and_then(Value::as_str);
+                            let interrupt_confirmed = val.get("method").is_none()
+                                && val.get("id").and_then(Value::as_u64) == Some(9_001)
+                                && val.get("error").is_none()
+                                && val.get("result").is_some();
+                            let terminal_confirmed = val.get("method").and_then(Value::as_str)
+                                == Some("turn/completed")
+                                && val.pointer("/params/threadId").and_then(Value::as_str)
+                                    == Some(thread_id.as_str())
+                                && val
+                                    .pointer("/params/turn/id")
+                                    .or_else(|| val.pointer("/params/turnId"))
+                                    .and_then(Value::as_str)
+                                    == Some(turn_id.as_str())
+                                && matches!(status, Some("interrupted" | "completed" | "failed"));
+                            if interrupt_confirmed || terminal_confirmed {
+                                self.active_turns.lock().remove(&session.key.storage_key());
+                            }
+                            if status == Some("completed")
+                                && (!full_content.is_empty() || total_tool_calls > 0)
+                            {
+                                let scrubbed_content = filter_reasoning(&full_content);
+                                if is_explicit_silence(&scrubbed_content) {
+                                    if let Some(ack_command) = session
+                                        .state
+                                        .metadata
+                                        .get("cron_ack_command")
+                                        .and_then(Value::as_str)
+                                        .filter(|command| !command.trim().is_empty())
+                                    {
+                                        crate::cron::ack::run_ack_logged(ack_command).await;
+                                    }
+                                    return Ok(());
+                                }
+
+                                let rendered = if is_cron_session || total_tool_calls == 0 {
+                                    if scrubbed_content.trim().is_empty() {
+                                        "✅ Done.".to_string()
+                                    } else {
+                                        scrubbed_content.clone()
+                                    }
+                                } else {
+                                    let breakdown: Vec<String> = tool_call_counts
+                                        .iter()
+                                        .map(|(tool, count)| {
+                                            if *count > 1 {
+                                                format!("`{tool}` ×{count}")
+                                            } else {
+                                                format!("`{tool}`")
+                                            }
+                                        })
+                                        .collect();
+                                    let summary_badge = if breakdown.is_empty() {
+                                        format!("-# 🛠️ 도구 {total_tool_calls}회 실행됨")
+                                    } else {
+                                        format!(
+                                            "-# 🛠️ 도구 {total_tool_calls}회 실행 ({})",
+                                            breakdown.join(", ")
+                                        )
+                                    };
+                                    if scrubbed_content.trim().is_empty() {
+                                        format!("✅ Done.\n\n{summary_badge}")
+                                    } else {
+                                        format!("{}\n\n{}", scrubbed_content, summary_badge)
+                                    }
+                                };
+
+                                session
+                                    .state
+                                    .metadata
+                                    .insert("cron_agent_output".into(), json!(rendered.clone()));
+
+                                let suppress_emission = session
+                                    .state
+                                    .metadata
+                                    .get("cron_suppress_direct_emission")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+
+                                if suppress_emission {
+                                    return Ok(());
+                                }
+
+                                let obl_id = format!("obl:turn:{}", stream_id);
+                                if let Some(pool) = &self.pool {
+                                    ensure_session_row(pool, session).await?;
+                                    let ledger = crate::DeliveryLedgerService::new(pool.clone());
+                                    ledger
+                                        .record_obligation(&obl_id, &session.key, &rendered)
+                                        .await?;
+                                    ledger.mark_obligation_attempting(&obl_id).await?;
+                                }
+
+                                let delivered = self
                                     .emit_chunk(
                                         session,
                                         stream_id,
                                         sequence,
-                                        full_content.clone(),
-                                        false,
+                                        rendered.clone(),
+                                        true,
+                                        reply_to.clone(),
                                     )
                                     .await;
-                                sequence = sequence.saturating_add(1);
+
+                                if let Some(pool) = &self.pool {
+                                    persist_message(pool, session, &rendered).await?;
+                                    let ledger = crate::DeliveryLedgerService::new(pool.clone());
+                                    if delivered.is_ok() {
+                                        ledger.mark_obligation_delivered(&obl_id).await?;
+                                    } else if let Err(ref e) = delivered {
+                                        ledger
+                                            .mark_obligation_failed(&obl_id, &e.to_string())
+                                            .await?;
+                                    }
+                                }
+
+                                delivered?;
+
+                                if let Some(ack_command) = session
+                                    .state
+                                    .metadata
+                                    .get("cron_ack_command")
+                                    .and_then(Value::as_str)
+                                    .filter(|command| !command.trim().is_empty())
+                                {
+                                    crate::cron::ack::run_ack_logged(ack_command).await;
+                                }
+                                return Ok(());
                             }
                         }
                     }
-                    "turn/completed" | "thread/status/changed" => {
-                        let is_terminal = if method == "turn/completed" {
-                            let is_for_current_thread = val
-                                .pointer("/params/threadId")
-                                .and_then(Value::as_str)
-                                .map(|id| id == thread_id)
-                                .unwrap_or(true);
-                            if !is_for_current_thread {
-                                continue;
-                            }
-                            if val.pointer("/params/turn/status").and_then(Value::as_str) == Some("failed") {
-                                let err_msg = val
-                                    .pointer("/params/turn/error")
-                                    .and_then(Value::as_str)
-                                    .or_else(|| val.pointer("/params/turn/error/message").and_then(Value::as_str))
-                                    .unwrap_or("turn failed");
-                                return Err(OmonError::Llm(format!("omo turn failed: {err_msg}")));
-                            }
-                            true
-                        } else if method == "thread/status/changed" {
-                            let is_for_current_thread = val
-                                .pointer("/params/threadId")
-                                .and_then(Value::as_str)
-                                .map(|id| id == thread_id)
-                                .unwrap_or(false);
-                            let is_idle = val.pointer("/params/status/type").and_then(Value::as_str) == Some("idle");
-                            is_for_current_thread && is_idle
-                        } else {
-                            false
-                        };
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return Err(OmonError::Llm(format!(
+                    "turn exceeded total deadline of {:?}; turn/interrupt sent",
+                    effective_total_timeout
+                )));
+            }
 
-                        if !is_terminal {
+            if now >= last_activity_at + self.config.request_timeout {
+                if let Some(turn_id) = &turn_id {
+                    let interrupt = json!({
+                        "jsonrpc": "2.0",
+                        "id": 9_003,
+                        "method": "turn/interrupt",
+                        "params": { "threadId": thread_id, "turnId": turn_id }
+                    });
+                    let _ = ws.send(Message::text(interrupt.to_string())).await;
+                }
+                return Err(OmonError::Llm("timeout during turn streaming".into()));
+            }
+
+            let mut next_timeout = effective_work_deadline;
+            if !turn_started_ack {
+                next_timeout = next_timeout.min(ack_deadline);
+            }
+            next_timeout = next_timeout.min(last_activity_at + self.config.request_timeout);
+
+            let msg = match tokio::time::timeout_at(next_timeout, ws.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
+
+            let msg = msg.map_err(|e| OmonError::Llm(format!("ws streaming error: {e}")))?;
+            let val = match &msg {
+                Message::Text(text) => {
+                    last_activity_at = tokio::time::Instant::now();
+                    Some(
+                        serde_json::from_str::<Value>(text.as_str())
+                            .map_err(|e| OmonError::Llm(format!("invalid json: {e}")))?,
+                    )
+                }
+                _ => None,
+            };
+            // Deadline checks run on EVERY frame — ping/pong included — so a
+            // keepalive stream cannot mask a wedged turn past the cap.
+            let method = val
+                .as_ref()
+                .and_then(|v| v.get("method"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if method != "turn/completed" && tokio::time::Instant::now() >= effective_work_deadline
+            {
+                if let Some(turn_id) = &turn_id {
+                    let interrupt = json!({
+                        "jsonrpc": "2.0",
+                        "id": 9_001,
+                        "method": "turn/interrupt",
+                        "params": { "threadId": thread_id, "turnId": turn_id }
+                    });
+                    let _ = ws.send(Message::text(interrupt.to_string())).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                return Err(OmonError::Llm(format!(
+                    "turn exceeded total deadline of {:?}; turn/interrupt sent",
+                    effective_total_timeout
+                )));
+            }
+
+            let Some(val) = val else {
+                continue;
+            };
+
+            if val.get("method").is_none()
+                && val.get("id").and_then(Value::as_u64) == Some(3)
+                && !turn_started_ack
+            {
+                if let Some(error) = val.get("error") {
+                    self.active_turns.lock().remove(&session.key.storage_key());
+                    return Err(OmonError::Llm(format!("turn/start error: {error}")));
+                }
+                let id = val
+                    .pointer("/result/turn/id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        OmonError::Llm("turn/start acknowledgement missing turn id".into())
+                    })?;
+                let turn_id_str = id.to_string();
+                self.active_turns.lock().insert(
+                    session.key.storage_key(),
+                    ActiveTurn {
+                        thread_id: thread_id.clone(),
+                        turn_id: Some(turn_id_str.clone()),
+                    },
+                );
+                turn_id = Some(turn_id_str);
+                turn_started_ack = true;
+                continue;
+            }
+
+            if let (Some(req_id), Some(method)) =
+                (val.get("id"), val.get("method").and_then(Value::as_str))
+            {
+                if is_approval_request(method) {
+                    if let Some(ref toolsets) = session.state.enabled_toolsets {
+                        let is_command = method.contains("commandExecution")
+                            || val.pointer("/params/command").is_some()
+                            || val.pointer("/params/item/command").is_some();
+                        let allows_terminal = toolsets
+                            .iter()
+                            .any(|t| t == "terminal" || t == "bash" || t == "shell");
+                        if is_command && !allows_terminal {
+                            tracing::warn!(
+                                session = %session.key,
+                                "tool declined: commandExecution is not in enabled_toolsets {:?}",
+                                toolsets
+                            );
+                            let _ = ws.send(approval_denial_response(req_id)).await;
                             continue;
                         }
+                    }
 
-                        let has_content = !full_content.is_empty() || total_tool_calls > 0;
-                        if !has_content {
-                            // A terminal frame with no streamed content (observed:
-                            // the daemon raced a premature turn/completed at +6s
-                            // while the real turn was still running) must not end
-                            // the turn — ignore premature completion and keep streaming.
-                            continue;
+                    if session.state.yolo {
+                        tracing::info!(
+                            session = %session.key,
+                            "approving daemon tool request under active YOLO mode"
+                        );
+                        let _ = ws.send(approval_allow_response(req_id)).await;
+                        continue;
+                    }
+                    approval_denials += 1;
+                    if approval_denials >= APPROVAL_DENIAL_TURN_LIMIT {
+                        tracing::error!(
+                                denials = approval_denials,
+                                "approval denial loop: aborting turn instead of flailing until the deadline"
+                            );
+                        if let Some(turn_id) = &turn_id {
+                            let interrupt = json!({
+                                "jsonrpc": "2.0",
+                                "id": 9_002,
+                                "method": "turn/interrupt",
+                                "params": { "threadId": thread_id, "turnId": turn_id }
+                            });
+                            let _ = ws.send(Message::text(interrupt.to_string())).await;
                         }
+                        return Err(OmonError::Llm(format!(
+                                "tool approval denied {approval_denials} times by gateway policy; turn aborted"
+                            )));
+                    }
+                    let _ = ws.send(approval_denial_response(req_id)).await;
+                    continue;
+                }
+            }
 
-                        let rendered = if is_cron_session || total_tool_calls == 0 {
-                            if full_content.trim().is_empty() {
-                                "✅ Done.".to_string()
-                            } else {
-                                full_content.clone()
+            // Only the successful start response owns the active turn identity.
+            // Subscription replay (including thread idle without a turn ID) is
+            // not evidence that this turn has produced output or completed.
+            let frame_turn_id = val
+                .pointer("/params/turnId")
+                .or_else(|| val.pointer("/params/turn/id"))
+                .and_then(Value::as_str);
+            let turn_bearing = method.starts_with("turn/")
+                || method.starts_with("item/")
+                || method == "thread/status/changed"
+                || (method == "error"
+                    && (val.pointer("/params/turnId").is_some()
+                        || val.pointer("/params/turn").is_some()));
+            if turn_bearing
+                && (!turn_started_ack
+                    || val.pointer("/params/threadId").and_then(Value::as_str)
+                        != Some(thread_id.as_str())
+                    || frame_turn_id != turn_id.as_deref())
+            {
+                continue;
+            }
+
+            match method.as_str() {
+                "turn/started" => {
+                    approval_denials = 0;
+                }
+                "item/started" | "item/completed" => {
+                    approval_denials = 0;
+                    let is_started =
+                        val.get("method").and_then(Value::as_str) == Some("item/started");
+                    let Some(item) = val.pointer("/params/item") else {
+                        continue;
+                    };
+                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+
+                    if is_started && !item_id.is_empty() && started_ids.insert(item_id.to_string())
+                    {
+                        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                        if !matches!(item_type, "agentMessage" | "userMessage" | "reasoning" | "") {
+                            total_tool_calls += 1;
+                            let tool_name = item
+                                .get("command")
+                                .or_else(|| item.get("tool"))
+                                .or_else(|| item.get("name"))
+                                .or_else(|| item.get("path"))
+                                .and_then(Value::as_str)
+                                .unwrap_or(item_type);
+                            let short_name =
+                                tool_name.split_whitespace().next().unwrap_or(tool_name);
+                            *tool_call_counts.entry(short_name.to_string()).or_insert(0) += 1;
+                        }
+                    }
+
+                    if !is_started {
+                        if let Some("agentMessage") = item.get("type").and_then(Value::as_str) {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                full_content.clear();
+                                full_content.push_str(text);
                             }
-                        } else {
-                            let breakdown: Vec<String> = tool_call_counts
-                                .iter()
-                                .map(|(tool, count)| {
-                                    if *count > 1 {
-                                        format!("`{tool}` ×{count}")
-                                    } else {
-                                        format!("`{tool}`")
-                                    }
-                                })
-                                .collect();
-                            let summary_badge = if breakdown.is_empty() {
-                                format!("-# 🛠️ 도구 {total_tool_calls}회 실행됨")
-                            } else {
-                                format!(
-                                    "-# 🛠️ 도구 {total_tool_calls}회 실행 ({})",
-                                    breakdown.join(", ")
+                        }
+                    }
+                }
+                "item/agentMessage/delta" => {
+                    if let Some(delta) = val.pointer("/params/delta").and_then(Value::as_str) {
+                        if !delta.is_empty() {
+                            full_content.push_str(delta);
+                            let _ = self
+                                .emit_chunk(
+                                    session,
+                                    stream_id,
+                                    sequence,
+                                    full_content.clone(),
+                                    false,
+                                    reply_to.clone(),
                                 )
-                            };
-
-                            if full_content.trim().is_empty() {
-                                format!("✅ Done.\n\n{summary_badge}")
-                            } else {
-                                format!("{}\n\n{}", full_content, summary_badge)
-                            }
-                        };
-                        // A terminal frame with no streamed content (observed:
-                        // the daemon raced a premature turn/completed at +6s
-                        // while the real turn was still running) must not end
-                        // the turn — record a success whose delivery is empty
-                        // or fail it outright. Ignore the frame and keep
-                        // streaming until real completion or the deadlines.
-                        let delivered = self
-                            .emit_chunk(session, stream_id, sequence, rendered.clone(), true)
-                            .await;
-                        if let Some(pool) = &self.pool {
-                            ensure_session_row(pool, session).await?;
-                            persist_message(pool, session, &rendered).await?;
+                                .await;
+                            sequence = sequence.saturating_add(1);
                         }
-                        if delivered.is_ok() {
-                            if let Some(ack_command) = session
-                                .state
-                                .metadata
-                                .get("cron_ack_command")
+                    }
+                }
+                "turn/completed" => {
+                    match val.pointer("/params/turn/status").and_then(Value::as_str) {
+                        Some("interrupted") => {
+                            self.active_turns.lock().remove(&session.key.storage_key());
+                            return Err(OmonError::Llm("omo turn interrupted".into()));
+                        }
+                        Some("failed") => {
+                            self.active_turns.lock().remove(&session.key.storage_key());
+                            let err_msg = val
+                                .pointer("/params/turn/error")
                                 .and_then(Value::as_str)
-                                .filter(|command| !command.trim().is_empty())
-                            {
-                                crate::cron::ack::run_ack_logged(ack_command).await;
-                            }
+                                .or_else(|| {
+                                    val.pointer("/params/turn/error/message")
+                                        .and_then(Value::as_str)
+                                })
+                                .unwrap_or("turn failed");
+                            return Err(OmonError::Llm(format!("omo turn failed: {err_msg}")));
+                        }
+                        Some("completed") => {}
+                        _ => continue,
+                    }
+
+                    let scrubbed_content = filter_reasoning(&full_content);
+                    if is_explicit_silence(&scrubbed_content) {
+                        self.active_turns.lock().remove(&session.key.storage_key());
+                        if let Some(ack_command) = session
+                            .state
+                            .metadata
+                            .get("cron_ack_command")
+                            .and_then(Value::as_str)
+                            .filter(|command| !command.trim().is_empty())
+                        {
+                            crate::cron::ack::run_ack_logged(ack_command).await;
                         }
                         return Ok(());
                     }
-                    "error" | "turn/error" => {
-                        let is_turn_error = val.pointer("/params/turnId").is_some()
-                            || val.pointer("/params/turn").is_some()
-                            || method == "turn/error";
-                        if !is_turn_error {
-                            tracing::warn!(
-                                %thread_id,
-                                ?val,
-                                "non-fatal notification error from omo app-server; continuing turn"
-                            );
+
+                    let has_content = !scrubbed_content.is_empty() || total_tool_calls > 0;
+                    if !has_content {
+                        // A terminal frame with no streamed content is only
+                        // ignored during the startup race window (observed:
+                        // the daemon raced a premature turn/completed at +6s
+                        // while the real turn was still running). Past that
+                        // window an empty terminal is a real empty turn —
+                        // e.g. an upstream LLM failure the daemon recorded
+                        // as a successful empty completion — and must fail
+                        // the turn instead of stalling until the deadline.
+                        if started_at.elapsed() < no_content_grace {
                             continue;
                         }
-                        let err_msg = val
-                            .pointer("/params/message")
-                            .or_else(|| val.pointer("/params/error"))
-                            .or_else(|| val.pointer("/params/error/message"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown error from omo app-server");
-                        return Err(OmonError::Llm(format!(
-                            "omo app-server turn error: {err_msg}"
-                        )));
+                        self.active_turns.lock().remove(&session.key.storage_key());
+                        return Err(OmonError::Llm(
+                            "omo turn ended with no content (likely upstream LLM failure)".into(),
+                        ));
                     }
-                    _ => {}
+                    self.active_turns.lock().remove(&session.key.storage_key());
+
+                    let rendered = if is_cron_session || total_tool_calls == 0 {
+                        if scrubbed_content.trim().is_empty() {
+                            "✅ Done.".to_string()
+                        } else {
+                            scrubbed_content.clone()
+                        }
+                    } else {
+                        let breakdown: Vec<String> = tool_call_counts
+                            .iter()
+                            .map(|(tool, count)| {
+                                if *count > 1 {
+                                    format!("`{tool}` ×{count}")
+                                } else {
+                                    format!("`{tool}`")
+                                }
+                            })
+                            .collect();
+                        let summary_badge = if breakdown.is_empty() {
+                            format!("-# 🛠️ 도구 {total_tool_calls}회 실행됨")
+                        } else {
+                            format!(
+                                "-# 🛠️ 도구 {total_tool_calls}회 실행 ({})",
+                                breakdown.join(", ")
+                            )
+                        };
+
+                        if scrubbed_content.trim().is_empty() {
+                            format!("✅ Done.\n\n{summary_badge}")
+                        } else {
+                            format!("{}\n\n{}", scrubbed_content, summary_badge)
+                        }
+                    };
+                    session
+                        .state
+                        .metadata
+                        .insert("cron_agent_output".into(), json!(rendered.clone()));
+
+                    let suppress_emission = session
+                        .state
+                        .metadata
+                        .get("cron_suppress_direct_emission")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+
+                    if suppress_emission {
+                        return Ok(());
+                    }
+
+                    let obl_id = format!("obl:turn:{}", stream_id);
+                    if let Some(pool) = &self.pool {
+                        ensure_session_row(pool, session).await?;
+                        let ledger = crate::DeliveryLedgerService::new(pool.clone());
+                        ledger
+                            .record_obligation(&obl_id, &session.key, &rendered)
+                            .await?;
+                        ledger.mark_obligation_attempting(&obl_id).await?;
+                    }
+
+                    let delivered = self
+                        .emit_chunk(
+                            session,
+                            stream_id,
+                            sequence,
+                            rendered.clone(),
+                            true,
+                            reply_to.clone(),
+                        )
+                        .await;
+                    if let Some(pool) = &self.pool {
+                        persist_message(pool, session, &rendered).await?;
+                        let ledger = crate::DeliveryLedgerService::new(pool.clone());
+                        if delivered.is_ok() {
+                            ledger.mark_obligation_delivered(&obl_id).await?;
+                        } else if let Err(ref e) = delivered {
+                            ledger
+                                .mark_obligation_failed(&obl_id, &e.to_string())
+                                .await?;
+                        }
+                    }
+                    delivered?;
+                    if let Some(ack_command) = session
+                        .state
+                        .metadata
+                        .get("cron_ack_command")
+                        .and_then(Value::as_str)
+                        .filter(|command| !command.trim().is_empty())
+                    {
+                        crate::cron::ack::run_ack_logged(ack_command).await;
+                    }
+                    return Ok(());
                 }
+                "error" | "turn/error" => {
+                    let is_turn_error = val.pointer("/params/turnId").is_some()
+                        || val.pointer("/params/turn").is_some()
+                        || method == "turn/error";
+                    if !is_turn_error {
+                        tracing::warn!(
+                            %thread_id,
+                            ?val,
+                            "non-fatal notification error from omo app-server; continuing turn"
+                        );
+                        continue;
+                    }
+                    let err_msg = val
+                        .pointer("/params/message")
+                        .or_else(|| val.pointer("/params/error"))
+                        .or_else(|| val.pointer("/params/error/message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error from omo app-server");
+                    return Err(OmonError::Llm(format!(
+                        "omo app-server turn error: {err_msg}"
+                    )));
+                }
+                _ => {}
             }
         }
         // Reaching the end of the stream without a terminal frame means the
-        // daemon connection closed mid-turn. Failing here (retryable — the
-        // message matches the connection-error retry contract) prevents a
-        // silent Ok with whatever partial content was collected.
+        // daemon connection closed mid-turn. Preserve ownership: disconnect
+        // proves neither rejection nor completion, and must not enable resubmission.
         Err(OmonError::Llm(
             "connection closed before turn completion".into(),
         ))
@@ -679,29 +1169,193 @@ impl OmoBackend {
 #[async_trait]
 impl AgentBackend for OmoBackend {
     async fn run(&self, session: &mut SessionContext, event: InboundEvent) -> Result<()> {
-        // One automatic retry when the daemon connection drops mid-turn
-        // (ECONNRESET from a daemon restart); the persisted threadId keeps
-        // the conversation continuous across the retry.
-        let outcome = self.run_once(session, event.clone()).await;
-        let retryable = matches!(
-            &outcome,
-            Err(OmonError::Llm(msg))
-                if msg.contains("Connection reset")
-                    || msg.contains("os error 54")
-                    || msg.contains("Broken pipe")
-                    || msg.contains("connection closed")
-                    || msg.contains("Handshake not finished")
-                    || msg.contains("Connection refused")
-                    || msg.contains("os error 61")
-                    || msg.contains("failed to connect to omo app-server")
-        );
-        if retryable {
-            tracing::warn!("omo daemon connection reset or refused mid-turn; retrying once after cooldown");
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            return self.run_once(session, event).await;
-        }
-        outcome
+        let is_cron_session = session.key.user_id.starts_with("cron:")
+            || session
+                .state
+                .metadata
+                .get("cron_scheduler_delivery")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let effective_total_timeout = if is_cron_session {
+            self.config.total_timeout
+        } else {
+            self.config.total_timeout.min(Duration::from_secs(300))
+        };
+        let deadline = tokio::time::Instant::now() + effective_total_timeout;
+
+        // Positive pre-submit setup: connect, initialize, resolve thread.
+        // If a transport error occurs BEFORE turn/start submission, retry once
+        // within the deadline budget.
+        let setup_outcome = self
+            .setup_turn(session, deadline, effective_total_timeout)
+            .await;
+        let (ws, thread_id) = match setup_outcome {
+            Ok(pair) => pair,
+            Err(err) => {
+                let retryable = matches!(
+                    &err,
+                    OmonError::Llm(msg)
+                        if msg.contains("Connection reset")
+                            || msg.contains("os error 54")
+                            || msg.contains("Broken pipe")
+                            || msg.contains("connection closed")
+                            || msg.contains("closed before")
+                            || msg.contains("Handshake not finished")
+                            || msg.contains("Connection refused")
+                            || msg.contains("os error 61")
+                            || msg.contains("failed to connect to omo app-server")
+                            || msg.contains("ws error in initialize")
+                            || msg.contains("ws error during initialize")
+                            || msg.contains("ws error in thread/")
+                            || msg.contains("ws error during thread/")
+                            || msg.contains("os error 10053")
+                            || msg.contains("os error 10054")
+                            || msg.contains("os error 10061")
+                            || msg.contains("중단되었습니다")
+                            || msg.contains("현재 연결은")
+                );
+                if retryable {
+                    tracing::warn!(
+                        "omo daemon connection reset or refused before turn submission; retrying once after cooldown"
+                    );
+                    let cooldown = Duration::from_millis(500);
+                    if tokio::time::Instant::now() + cooldown >= deadline {
+                        tokio::time::sleep_until(deadline).await;
+                        return Err(OmonError::Llm(format!(
+                            "turn exceeded total deadline of {effective_total_timeout:?}"
+                        )));
+                    }
+                    tokio::time::sleep(cooldown).await;
+                    self.setup_turn(session, deadline, effective_total_timeout)
+                        .await?
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        // Execution phase: turn/start socket write begins here. Once submission
+        // may have begun or the turn is accepted, we must NEVER resubmit the turn
+        // automatically even on disconnect, because the peer does not deduplicate turns.
+        self.execute_turn(
+            ws,
+            thread_id,
+            session,
+            event,
+            deadline,
+            effective_total_timeout,
+        )
+        .await
     }
+
+    async fn cancel(&self, session: &SessionContext) -> Result<()> {
+        let storage_key = session.key.storage_key();
+        let active = self.active_turns.lock().get(&storage_key).cloned();
+        let Some(active) = active else {
+            return Ok(());
+        };
+        let Some(turn_id) = active.turn_id.as_deref() else {
+            return Err(OmonError::Llm(format!(
+                "cancellation unresolved: turn/start on thread {} may have been accepted, but no turn id was acknowledged",
+                active.thread_id
+            )));
+        };
+
+        // Bounded cancellation: reserve up to 5s for interrupt/terminal cleanup
+        let cancel_timeout = self.config.request_timeout.min(Duration::from_secs(5));
+        let cancel_deadline = tokio::time::Instant::now() + cancel_timeout;
+        let result = tokio::time::timeout_at(cancel_deadline, async {
+            let mut ws = self.connect_ws(cancel_deadline).await?;
+            self.do_initialize(&mut ws, cancel_deadline).await?;
+
+            let interrupt_id = 9_001u64;
+            let interrupt = json!({
+                "jsonrpc": "2.0",
+                "id": interrupt_id,
+                "method": "turn/interrupt",
+                "params": {
+                    "threadId": active.thread_id,
+                    "turnId": turn_id,
+                }
+            });
+            ws.send(Message::text(interrupt.to_string()))
+                .await
+                .map_err(|e| OmonError::Llm(format!("failed to send turn/interrupt: {e}")))?;
+
+            while let Some(msg) = ws.next().await {
+                let msg = msg
+                    .map_err(|e| OmonError::Llm(format!("ws error during turn/interrupt: {e}")))?;
+                if let Message::Text(text) = msg {
+                    let val: Value = serde_json::from_str(&text).map_err(|e| {
+                        OmonError::Llm(format!("invalid json in interrupt ack: {e}"))
+                    })?;
+                    if val.get("method").is_none()
+                        && val.get("id").and_then(Value::as_u64) == Some(interrupt_id)
+                    {
+                        if let Some(error) = val.get("error") {
+                            return Err(OmonError::Llm(format!(
+                                "turn/interrupt error from peer: {error}"
+                            )));
+                        }
+                        if val.get("result").is_some() {
+                            return Ok(());
+                        }
+                        return Err(OmonError::Llm(
+                            "turn/interrupt acknowledgement missing result".into(),
+                        ));
+                    }
+                    if val.get("method").and_then(Value::as_str) == Some("turn/completed") {
+                        let status = val.pointer("/params/turn/status").and_then(Value::as_str);
+                        let frame_turn = val
+                            .pointer("/params/turn/id")
+                            .or_else(|| val.pointer("/params/turnId"))
+                            .and_then(Value::as_str);
+                        if val.pointer("/params/threadId").and_then(Value::as_str)
+                            == Some(active.thread_id.as_str())
+                            && frame_turn == Some(turn_id)
+                            && (status == Some("interrupted")
+                                || status == Some("completed")
+                                || status == Some("failed"))
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(OmonError::Llm(
+                "connection closed before turn/interrupt acknowledged".into(),
+            ))
+        })
+        .await
+        .map_err(|_| OmonError::Llm("timeout waiting for turn/interrupt acknowledgement".into()))?;
+        if result.is_ok() {
+            let mut active_turns = self.active_turns.lock();
+            if active_turns.get(&storage_key) == Some(&active) {
+                active_turns.remove(&storage_key);
+            }
+        }
+        result
+    }
+}
+
+async fn persist_session_binding(
+    pool: &sqlx::SqlitePool,
+    session: &SessionContext,
+    omo_thread_id: &str,
+) -> Result<()> {
+    ensure_session_row(pool, session).await?;
+    sqlx::query(
+        "UPDATE sessions
+         SET state_json = json_set(COALESCE(NULLIF(state_json, ''), '{}'), '$.metadata.omo_thread_id', ?),
+             updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         WHERE session_key = ?",
+    )
+    .bind(omo_thread_id)
+    .bind(session.key.storage_key())
+    .execute(pool)
+    .await
+    .map_err(|e| OmonError::Database(format!("persist thread binding: {e}")))?;
+    Ok(())
 }
 
 async fn ensure_session_row(pool: &sqlx::SqlitePool, session: &SessionContext) -> Result<()> {

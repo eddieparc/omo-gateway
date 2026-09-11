@@ -1,0 +1,10 @@
+[
+  "cargo test --test test_multiplexer flush_failure_replays_completed_turn_on_restart -- --exact --nocapture",
+  "cargo test --test test_multiplexer -- --nocapture",
+  "cargo test --lib storage::db::tests -- --nocapture",
+  "cargo test --lib multiplexer::actor::tests -- --nocapture",
+  "cargo test --bin omo-gateway test_recover_resume_pending -- --nocapture",
+  "cargo build",
+  "git diff --check src/multiplexer/actor.rs src/storage/db.rs tests/test_multiplexer.rs",
+  "rustfmt --edition 2021 --check src/multiplexer/actor.rs src/storage/db.rs tests/test_multiplexer.rs"
+]

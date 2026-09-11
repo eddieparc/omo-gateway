@@ -1,0 +1,3 @@
+d0b05cb8913a05f0b40d47fc62c66ee4674f4aca8c11c4760d0b6b2ba0e3b4a0  src/agent/omo_backend.rs
+8f5b821841aaaee33f2d6d9390c591a5cd2ecee51293eb0a2baa98a967190309  src/agent/omo_config.rs
+dd23d51f825104cd4b4192256a8524370de9dfe171aceafa24d93d7eba3f7964  .omo/evidence/hermes-parity-20260905/baseline.patch

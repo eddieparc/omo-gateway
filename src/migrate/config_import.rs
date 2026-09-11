@@ -4,11 +4,18 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const SCALAR_ENV_KEYS: [&str; 4] = [
+const SCALAR_ENV_KEYS: [&str; 11] = [
     "DISCORD_ALLOWED_USERS",
+    "DISCORD_ALLOWED_CHANNELS",
+    "DISCORD_IGNORED_CHANNELS",
+    "DISCORD_ALLOWED_ROLES",
+    "DISCORD_ALLOW_ALL_USERS",
+    "DISCORD_THREAD_SESSIONS_PER_USER",
+    "DISCORD_THREAD_REQUIRE_MENTION",
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_HOME_CHANNEL",
     "APPROVAL_MODE",
+    "APPROVALS_DESTRUCTIVE_SLASH_CONFIRM",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,23 +38,68 @@ struct HermesConfig {
 #[derive(Debug, Default, Deserialize)]
 struct HermesModel {
     default: Option<String>,
-    #[serde(rename = "provider")]
-    _provider: Option<String>,
+    name: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
     #[serde(rename = "api_mode")]
     _api_mode: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct HermesApprovals {
-    mode: Option<String>,
+impl HermesModel {
+    fn effective_default(&self) -> Option<&str> {
+        self.default
+            .as_deref()
+            .or(self.name.as_deref())
+            .or(self.model.as_deref())
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct HermesApprovals {
+    mode: Option<String>,
+    destructive_slash_confirm: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct HermesDiscord {
+    #[serde(default = "default_true")]
+    enabled: bool,
     bot_token: Option<String>,
     token: Option<String>,
+    #[serde(default)]
+    allowed_users: Option<Vec<String>>,
+    #[serde(default)]
+    allowed_channels: Option<Vec<String>>,
+    #[serde(default)]
+    ignored_channels: Option<Vec<String>>,
+    #[serde(default)]
+    allowed_roles: Option<Vec<String>>,
+    #[serde(default)]
+    free_response_channels: Option<Vec<String>>,
+    #[serde(default)]
+    home_channel: Option<String>,
+}
+
+impl Default for HermesDiscord {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bot_token: None,
+            token: None,
+            allowed_users: None,
+            allowed_channels: None,
+            ignored_channels: None,
+            allowed_roles: None,
+            free_response_channels: None,
+            home_channel: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn import_config(
@@ -106,13 +158,12 @@ pub fn import_config(
     let backup_path = if env.exists(target_env) {
         let backup_path = backup_path(target_env, env.now());
         let current = env.read(target_env)?;
-        env.write(&backup_path, &current)?;
-        Some(backup_path)
+        Some(env.write_unique(&backup_path, &current)?)
     } else {
         None
     };
 
-    env.write(
+    env.write_atomic(
         target_env,
         render_merged_env(existing.as_ref(), &values).as_bytes(),
     )?;
@@ -206,51 +257,60 @@ fn parse_env(path: &Path, contents: &str) -> Result<BTreeMap<String, String>> {
 }
 
 fn parse_env_document(path: &Path, contents: &str) -> Result<EnvDocument> {
+    // Limit read-ahead to one physical line to retain each logical assignment's bytes.
+    struct Lines<'a> {
+        contents: &'a [u8],
+        offset: &'a std::cell::Cell<usize>,
+    }
+    impl std::io::Read for Lines<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let remaining = &self.contents[self.offset.get()..];
+            let end = remaining
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(remaining.len(), |i| i + 1);
+            let count = end.min(buf.len());
+            buf[..count].copy_from_slice(&remaining[..count]);
+            self.offset.set(self.offset.get() + count);
+            Ok(count)
+        }
+    }
+    let offset = std::cell::Cell::new(0);
+    let mut parser = dotenvy::from_read_iter(Lines {
+        contents: contents.as_bytes(),
+        offset: &offset,
+    });
     let mut lines = Vec::new();
     let mut values = BTreeMap::new();
-    for (index, raw_line) in contents.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            lines.push(EnvLine::Raw(raw_line.to_string()));
-            continue;
-        }
-        let (key, value) = line.split_once('=').ok_or_else(|| {
-            OmonError::Config(format!(
-                "failed to parse {} line {}: expected KEY=VALUE",
-                path.display(),
-                index + 1
-            ))
+    loop {
+        let start = offset.get();
+        let assignment = parser.next().transpose().map_err(|_| {
+            // dotenvy errors contain source values; do not disclose secrets.
+            OmonError::Config(format!("failed to parse environment {}", path.display()))
         })?;
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(OmonError::Config(format!(
-                "failed to parse {} line {}: empty key",
-                path.display(),
-                index + 1
-            )));
+        let raw = &contents[start..offset.get()];
+        let Some((key, value)) = assignment else {
+            lines.push(EnvLine::Raw(raw.to_string()));
+            break;
+        };
+        let prefix = raw
+            .split_inclusive('\n')
+            .take_while(|line| {
+                let line = line.trim();
+                line.is_empty() || line.starts_with('#')
+            })
+            .map(str::len)
+            .sum::<usize>();
+        if prefix > 0 {
+            lines.push(EnvLine::Raw(raw[..prefix].to_string()));
         }
-        values.insert(
-            key.to_string(),
-            strip_matching_quotes(value.trim()).to_string(),
-        );
+        values.insert(key.clone(), value);
         lines.push(EnvLine::Assignment {
-            key: key.to_string(),
-            raw: raw_line.to_string(),
+            key,
+            raw: raw[prefix..].to_string(),
         });
     }
     Ok(EnvDocument { lines, values })
-}
-
-fn strip_matching_quotes(value: &str) -> &str {
-    if value.len() >= 2 {
-        let bytes = value.as_bytes();
-        if (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
-            || (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
-        {
-            return &value[1..value.len() - 1];
-        }
-    }
-    value
 }
 
 fn map_values(
@@ -260,16 +320,15 @@ fn map_values(
 ) -> BTreeMap<String, String> {
     let mut output = BTreeMap::new();
 
+    let default_model = root_config.model.effective_default();
+    insert_nonempty(&mut output, "DEFAULT_MODEL", default_model);
     insert_nonempty(
         &mut output,
-        "DEFAULT_MODEL",
-        root_config.model.default.as_deref(),
+        "LLM_PROVIDER",
+        root_config.model.provider.as_deref(),
     );
-    let claude = root_config
-        .model
-        .default
-        .as_deref()
-        .is_some_and(|model| model.to_ascii_lowercase().starts_with("claude"));
+    let claude =
+        default_model.is_some_and(|model| model.to_ascii_lowercase().starts_with("claude"));
     if claude {
         insert_nonempty(
             &mut output,
@@ -294,18 +353,29 @@ fn map_values(
         );
     }
 
-    let primary = root_env
-        .get("DISCORD_BOT_TOKEN")
-        .map(String::as_str)
-        .filter(|value| !value.is_empty());
-    insert_nonempty(&mut output, "DISCORD_BOT_TOKEN", primary);
+    let root_discord_token = if root_config.discord.enabled {
+        root_env
+            .get("DISCORD_BOT_TOKEN")
+            .map(String::as_str)
+            .or(root_config.discord.bot_token.as_deref())
+            .or(root_config.discord.token.as_deref())
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
 
     let mut seen_tokens = HashSet::new();
-    if let Some(primary) = primary {
-        seen_tokens.insert(primary.to_string());
+    let mut primary_token = root_discord_token.map(ToString::to_string);
+    if let Some(ref primary) = primary_token {
+        seen_tokens.insert(primary.clone());
     }
     let mut extra_tokens = Vec::new();
     for (profile_env, profile_config) in profiles {
+        if let Some(config) = profile_config {
+            if !config.discord.enabled {
+                continue;
+            }
+        }
         let token = profile_env
             .get("DISCORD_BOT_TOKEN")
             .map(String::as_str)
@@ -319,19 +389,75 @@ fn map_values(
                 })
             });
         if let Some(token) = token.filter(|value| !value.is_empty()) {
-            if seen_tokens.insert(token.to_string()) {
+            if primary_token.is_none() {
+                primary_token = Some(token.to_string());
+                seen_tokens.insert(token.to_string());
+            } else if seen_tokens.insert(token.to_string()) {
                 extra_tokens.push(token.to_string());
             }
         }
+    }
+    if let Some(ref primary) = primary_token {
+        output.insert("DISCORD_BOT_TOKEN".into(), primary.clone());
     }
     if !extra_tokens.is_empty() {
         output.insert("DISCORD_BOT_TOKENS".into(), extra_tokens.join(","));
     }
 
+    if root_config.discord.enabled {
+        if let Some(ref users) = root_config.discord.allowed_users {
+            if !users.is_empty() {
+                output
+                    .entry("DISCORD_ALLOWED_USERS".into())
+                    .or_insert_with(|| users.join(","));
+            }
+        }
+        if let Some(ref channels) = root_config.discord.allowed_channels {
+            if !channels.is_empty() {
+                output
+                    .entry("DISCORD_ALLOWED_CHANNELS".into())
+                    .or_insert_with(|| channels.join(","));
+            }
+        }
+        if let Some(ref channels) = root_config.discord.ignored_channels {
+            if !channels.is_empty() {
+                output
+                    .entry("DISCORD_IGNORED_CHANNELS".into())
+                    .or_insert_with(|| channels.join(","));
+            }
+        }
+        if let Some(ref roles) = root_config.discord.allowed_roles {
+            if !roles.is_empty() {
+                output
+                    .entry("DISCORD_ALLOWED_ROLES".into())
+                    .or_insert_with(|| roles.join(","));
+            }
+        }
+        if let Some(ref free) = root_config.discord.free_response_channels {
+            if !free.is_empty() {
+                output
+                    .entry("DISCORD_FREE_RESPONSE_CHANNELS".into())
+                    .or_insert_with(|| free.join(","));
+            }
+        }
+        if let Some(ref home) = root_config.discord.home_channel {
+            if !home.trim().is_empty() {
+                output
+                    .entry("DISCORD_HOME_CHANNEL".into())
+                    .or_insert_with(|| home.trim().to_string());
+            }
+        }
+    }
+
     for key in SCALAR_ENV_KEYS {
-        let root_value = root_env.get(key).map(String::as_str);
+        let root_value = if root_config.discord.enabled || !key.starts_with("DISCORD_") {
+            root_env.get(key).map(String::as_str)
+        } else {
+            None
+        };
         let profile_value = profiles
             .iter()
+            .filter(|(_, cfg)| cfg.as_ref().is_none_or(|c| c.discord.enabled))
             .find_map(|(profile_env, _)| profile_env.get(key).map(String::as_str));
         insert_nonempty(&mut output, key, root_value.or(profile_value));
     }
@@ -341,6 +467,11 @@ fn map_values(
             "APPROVAL_MODE",
             root_config.approvals.mode.as_deref(),
         );
+    }
+    if let Some(confirm) = root_config.approvals.destructive_slash_confirm {
+        output
+            .entry("APPROVALS_DESTRUCTIVE_SLASH_CONFIRM".into())
+            .or_insert_with(|| confirm.to_string());
     }
 
     output
@@ -371,6 +502,12 @@ fn merged_values(
     let mut merged = existing
         .map(|document| document.values.clone())
         .unwrap_or_default();
+    if !overlay.contains_key("DISCORD_BOT_TOKEN") {
+        merged.remove("DISCORD_BOT_TOKEN");
+    }
+    if !overlay.contains_key("DISCORD_BOT_TOKENS") {
+        merged.remove("DISCORD_BOT_TOKENS");
+    }
     merged.extend(overlay.clone());
     merged
 }
@@ -388,23 +525,28 @@ fn render_merged_env(existing: Option<&EnvDocument>, overlay: &BTreeMap<String, 
                 if let Some(value) = overlay.get(key) {
                     rendered.push_str(key);
                     rendered.push('=');
-                    rendered.push_str(value);
+                    render_env_value(&mut rendered, value);
+                    rendered.push('\n');
                     overlaid.insert(key.as_str());
+                } else if key == "DISCORD_BOT_TOKEN" || key == "DISCORD_BOT_TOKENS" {
+                    continue;
                 } else {
                     rendered.push_str(raw);
                 }
             }
             EnvLine::Raw(raw) => rendered.push_str(raw),
         }
-        rendered.push('\n');
     }
     for (key, value) in overlay {
         if overlaid.contains(key.as_str()) {
             continue;
         }
+        if !rendered.is_empty() && !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
         rendered.push_str(key);
         rendered.push('=');
-        rendered.push_str(value);
+        render_env_value(&mut rendered, value);
         rendered.push('\n');
     }
     rendered
@@ -415,10 +557,26 @@ fn render_env(values: &BTreeMap<String, String>) -> String {
     for (key, value) in values {
         rendered.push_str(key);
         rendered.push('=');
-        rendered.push_str(value);
+        render_env_value(&mut rendered, value);
         rendered.push('\n');
     }
     rendered
+}
+
+fn render_env_value(rendered: &mut String, value: &str) {
+    if !value.contains(|c: char| c.is_whitespace() || matches!(c, '#' | '$' | '\'' | '"' | '\\')) {
+        rendered.push_str(value);
+        return;
+    }
+    // Double quoting preserves whitespace/comments; escape dotenvy substitution and escapes.
+    rendered.push('"');
+    for c in value.chars() {
+        if matches!(c, '$' | '"' | '\\') {
+            rendered.push('\\');
+        }
+        rendered.push(c);
+    }
+    rendered.push('"');
 }
 
 fn masked_diff(
@@ -512,6 +670,157 @@ mod tests {
         FakeMigrationEnv::new(Utc.with_ymd_and_hms(2026, 8, 15, 14, 30, 45).unwrap())
     }
 
+    #[test]
+    fn dotenv_round_trip_special_values() {
+        // Given dotenv syntax and YAML secrets that must survive the real loader.
+        for secret in [
+            "a # b",
+            "$HOME ${HOME}",
+            " both ' and \" quotes \\",
+            "plain",
+        ] {
+            let env = fixture();
+            write(
+                &env,
+                "/hermes/config.yaml",
+                &format!(
+                    "model:\n  default: gpt-4o\n  api_key: {}\n",
+                    serde_json::to_string(secret).unwrap()
+                ),
+            );
+            write(
+                &env,
+                "/hermes/.env",
+                "export DISCORD_BOT_TOKEN='x' # comment\n",
+            );
+            let raw = "# untouched\r\nexport KEEP='literal $HOME # value' # keep\r\nMULTI=\"first\nsecond\"\n";
+            for existing in [false, true] {
+                if existing {
+                    write(&env, "/gateway/.env", raw);
+                }
+                // When importing to a new or existing document.
+                let result = import_config(
+                    &env,
+                    Path::new("/hermes"),
+                    Path::new("/gateway/.env"),
+                    false,
+                )
+                .unwrap();
+                let rendered = env.read_to_string(Path::new("/gateway/.env")).unwrap();
+                let temp = tempfile::tempdir().unwrap();
+                let file = temp.path().join("fixture.env");
+                std::fs::write(&file, &rendered).unwrap();
+                let loaded = dotenvy::from_path_iter(&file)
+                    .unwrap()
+                    .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+                    .unwrap();
+                // Then real dotenvy reload yields the original values, without env mutation.
+                assert_eq!(
+                    loaded.get("DISCORD_BOT_TOKEN").map(String::as_str),
+                    Some("x")
+                );
+                assert_eq!(
+                    loaded.get("OPENAI_API_KEY").map(String::as_str),
+                    Some(secret)
+                );
+                if existing {
+                    assert!(rendered.starts_with(raw));
+                }
+                assert_eq!(
+                    result.values.get("OPENAI_API_KEY").map(String::as_str),
+                    Some(secret)
+                );
+                println!("C04 secret={secret:?} existing={existing} reload_equal=true raw_preserved=true");
+            }
+        }
+    }
+
+    #[test]
+    fn dotenv_raw_documents_round_trip() {
+        // Given unrelated documents, including multiline values and missing final newlines.
+        for raw in [
+            "",
+            "# comment without newline",
+            "export KEEP='literal $HOME # value' # comment",
+            "# prefix\r\n\r\nexport KEEP='literal $HOME # value' # keep\r\nMULTI=\"first\n# second\nthird\"\n# tail",
+        ] {
+            let env = fixture();
+            write(&env, "/hermes/config.yaml", "{}");
+            write(&env, "/gateway/.env", raw);
+            // When importing an empty overlay.
+            import_config(&env, Path::new("/hermes"), Path::new("/gateway/.env"), false)
+                .unwrap();
+            // Then every original byte, including EOF and line endings, remains intact.
+            assert_eq!(env.read_to_string(Path::new("/gateway/.env")).unwrap(), raw);
+            println!("C04 raw_bytes={} exact_round_trip=true", raw.len());
+        }
+    }
+
+    #[test]
+    fn dotenv_existing_assignments_reload_special_values() {
+        // Given existing exported keys surrounded by unrelated raw bytes.
+        let env = fixture();
+        let secret = "a # b $HOME ${HOME} 'single' \"double\" \\";
+        write(
+            &env,
+            "/hermes/config.yaml",
+            &format!(
+                "model:\n  default: gpt-4o\n  api_key: {}\n",
+                serde_json::to_string(secret).unwrap()
+            ),
+        );
+        write(
+            &env,
+            "/hermes/.env",
+            "export DISCORD_BOT_TOKEN=\"x\\$HOME \\\\ path \\\"quote\\\"\" # comment\n",
+        );
+        let prefix = "# keep prefix\r\nexport KEEP='literal $HOME # value' # keep\r\n";
+        let tail = "# keep tail without newline";
+        write(
+            &env,
+            "/gateway/.env",
+            &format!(
+            "{prefix}export OPENAI_API_KEY='old' # replaced\nexport DISCORD_BOT_TOKEN='old'\n{tail}"
+        ),
+        );
+        // When the real importer replaces those keys and appends DEFAULT_MODEL after the tail.
+        import_config(
+            &env,
+            Path::new("/hermes"),
+            Path::new("/gateway/.env"),
+            false,
+        )
+        .unwrap();
+        let rendered = env.read_to_string(Path::new("/gateway/.env")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("fixture.env");
+        std::fs::write(&file, &rendered).unwrap();
+        let loaded = dotenvy::from_path_iter(&file)
+            .unwrap()
+            .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+            .unwrap();
+        // Then escaping, export replacement and the EOF separator survive actual dotenv reload.
+        assert_eq!(
+            loaded.get("OPENAI_API_KEY").map(String::as_str),
+            Some(secret)
+        );
+        assert_eq!(
+            loaded.get("DISCORD_BOT_TOKEN").map(String::as_str),
+            Some("x$HOME \\ path \"quote\"")
+        );
+        assert_eq!(
+            loaded.get("KEEP").map(String::as_str),
+            Some("literal $HOME # value")
+        );
+        assert_eq!(
+            loaded.get("DEFAULT_MODEL").map(String::as_str),
+            Some("gpt-4o")
+        );
+        assert!(rendered.starts_with(prefix));
+        assert!(rendered.contains(&format!("\n{tail}\nDEFAULT_MODEL=")));
+        println!("C04 replacement_reload_equal=true source_escapes_equal=true raw_preserved=true eof_separator=true");
+    }
+
     fn write(env: &FakeMigrationEnv, path: &str, contents: &str) {
         env.write(Path::new(path), contents.as_bytes()).unwrap();
     }
@@ -603,6 +912,7 @@ mod tests {
             [
                 "DEFAULT_MODEL",
                 "DISCORD_BOT_TOKEN",
+                "LLM_PROVIDER",
                 "OPENAI_API_BASE",
                 "OPENAI_API_KEY"
             ]
@@ -774,7 +1084,7 @@ mod tests {
         let merged = "# gateway settings\nDATABASE_URL=sqlite://custom.db\nDEFAULT_MODEL=gpt-4o\nOMON_WORKSPACE_ROOT=/x\nDISCORD_ALLOWED_USERS=42\nDISCORD_BOT_TOKEN=primary\nDISCORD_BOT_TOKENS=secondary\n";
         let backup = PathBuf::from("/gateway/.env.bak-20260815T143045Z");
         assert_eq!(result.backup_path.as_deref(), Some(backup.as_path()));
-        assert!(env.rename_calls().is_empty());
+        assert_eq!(env.rename_calls().len(), 1);
         assert_eq!(env.read_to_string(&backup).unwrap(), original);
         assert_eq!(
             env.read_to_string(Path::new("/gateway/.env")).unwrap(),
@@ -784,7 +1094,11 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].0, backup);
         assert_eq!(writes[0].1, original.as_bytes());
-        assert_eq!(writes[1].0, PathBuf::from("/gateway/.env"));
+        assert_eq!(writes[1].0.parent(), Some(Path::new("/gateway")));
+        assert_eq!(
+            env.rename_calls()[0],
+            (writes[1].0.clone(), PathBuf::from("/gateway/.env"))
+        );
         assert_eq!(writes[1].1, merged.as_bytes());
         assert!(result.diff.contains("= DATABASE_URL="));
         assert!(result.diff.contains("= OMON_WORKSPACE_ROOT="));
@@ -899,6 +1213,64 @@ mod tests {
                 .get("DISCORD_ALLOWED_USERS")
                 .map(String::as_str),
             Some("99")
+        );
+    }
+
+    #[test]
+    fn imports_effective_discord_policy() {
+        let env = fixture();
+        write(
+            &env,
+            "/hermes/config.yaml",
+            r#"
+model:
+  name: gpt-4o
+discord:
+  enabled: true
+  allowed_users: ["42"]
+  ignored_channels: ["99"]
+"#,
+        );
+        write(&env, "/hermes/.env", "DISCORD_BOT_TOKEN=token_x\n");
+
+        write(
+            &env,
+            "/hermes/profiles/disabled_bot/config.yaml",
+            r#"
+discord:
+  enabled: false
+  token: disabled_token
+"#,
+        );
+
+        let res = import_config(
+            &env,
+            Path::new("/hermes"),
+            Path::new("/gateway/.env"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            res.values.get("DEFAULT_MODEL").map(String::as_str),
+            Some("gpt-4o")
+        );
+        assert_eq!(
+            res.values.get("DISCORD_ALLOWED_USERS").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            res.values
+                .get("DISCORD_IGNORED_CHANNELS")
+                .map(String::as_str),
+            Some("99")
+        );
+        assert_eq!(
+            res.values.get("DISCORD_BOT_TOKEN").map(String::as_str),
+            Some("token_x")
+        );
+        assert!(
+            !res.values.contains_key("DISCORD_BOT_TOKENS"),
+            "Disabled bot token must not be included in active tokens"
         );
     }
 }
