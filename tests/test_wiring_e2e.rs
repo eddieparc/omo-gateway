@@ -269,8 +269,22 @@ async fn test_e2e_actor_omo_backend_persists_assistant_message() {
         .await
         .expect("route event to actor");
 
-    // Allow actor task to finish processing and persist messages
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // Wait (bounded) for the actor task to finish processing and persist
+    // messages. A fixed sleep flakes on loaded machines; poll the actual
+    // condition instead.
+    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while server
+        .received_developer_instructions
+        .lock()
+        .as_deref()
+        .is_none()
+    {
+        assert!(
+            std::time::Instant::now() < wait_deadline,
+            "actor never delivered developer instructions to the fake app-server"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     // Then:
     // 1. Fake app-server received developer instructions from profile route

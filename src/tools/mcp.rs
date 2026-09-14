@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -144,15 +144,7 @@ impl McpClientTool {
             tokio::io::copy(&mut stderr, &mut sink).await
         });
 
-        let read = async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) = lines.next_line().await.map_err(mcp_error)? {
-                if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                    return Ok(value);
-                }
-            }
-            Err(mcp_error("MCP server closed without a JSON-RPC response"))
-        };
+        let read = read_stdio_response(stdout);
         let result = tokio::time::timeout(self.timeout, read)
             .await
             .map_err(|_| mcp_error("MCP stdio request timed out"))?;
@@ -196,7 +188,8 @@ impl McpClientTool {
         {
             return parse_sse_response(response, self.timeout).await;
         }
-        response.json().await.map_err(mcp_error)
+        let body = read_bounded_body(response.bytes_stream()).await?;
+        serde_json::from_slice(&body).map_err(mcp_error)
     }
 }
 
@@ -297,32 +290,114 @@ impl Tool for McpClientTool {
     }
 }
 
+/// Pre-decode byte limits. A single frame (stdio line or SSE event) and the
+/// aggregate response body are both bounded so a hostile or broken MCP server
+/// cannot force unbounded buffering.
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+async fn read_stdio_response<R>(reader: R) -> Result<Value, OmonError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(reader.take(MAX_RESPONSE_BYTES as u64));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Bound the read itself: a server that never emits a newline must not be
+        // able to grow this buffer without limit.
+        let read = (&mut reader)
+            .take(MAX_FRAME_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(mcp_error)?;
+        if read == 0 {
+            return Err(mcp_error("MCP server closed without a JSON-RPC response"));
+        }
+        if read > MAX_FRAME_BYTES {
+            return Err(mcp_error("MCP stdio line exceeded byte limit"));
+        }
+        if let Ok(value) = serde_json::from_slice::<Value>(&line) {
+            return Ok(value);
+        }
+    }
+}
+
+async fn read_bounded_body<S, B, E>(stream: S) -> Result<Vec<u8>, OmonError>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let mut stream = std::pin::pin!(stream);
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(mcp_error)?;
+        if body.len() + chunk.as_ref().len() > MAX_RESPONSE_BYTES {
+            return Err(mcp_error("MCP response exceeded byte limit"));
+        }
+        body.extend_from_slice(chunk.as_ref());
+    }
+    Ok(body)
+}
+
 async fn parse_sse_response(
     response: reqwest::Response,
     timeout: Duration,
 ) -> Result<Value, OmonError> {
-    let read = async move {
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        while let Some(chunk) = stream.next().await {
-            buffer.push_str(&String::from_utf8_lossy(&chunk.map_err(mcp_error)?));
-            while let Some(index) = buffer.find('\n') {
-                let line = buffer[..index].trim_end_matches('\r').to_owned();
-                buffer.drain(..=index);
-                if let Some(data) = line.strip_prefix("data:").map(str::trim) {
-                    if let Ok(value) = serde_json::from_str::<Value>(data) {
-                        return Ok(value);
-                    }
-                }
-            }
-        }
-        Err(mcp_error(
-            "MCP SSE stream closed without a JSON-RPC response",
-        ))
-    };
+    let read = parse_sse_stream(response.bytes_stream());
     tokio::time::timeout(timeout, read)
         .await
         .map_err(|_| mcp_error("MCP SSE response timed out"))?
+}
+
+async fn parse_sse_stream<S, B, E>(stream: S) -> Result<Value, OmonError>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let mut stream = std::pin::pin!(stream);
+    // Raw bytes are accumulated and decoded only at character boundaries: a
+    // multi-byte UTF-8 sequence split across two network chunks must not be
+    // replaced with U+FFFD and returned as a successful response.
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buffer = String::new();
+    let mut consumed = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(mcp_error)?;
+        consumed += chunk.as_ref().len();
+        if consumed > MAX_RESPONSE_BYTES {
+            return Err(mcp_error("MCP SSE response exceeded byte limit"));
+        }
+        pending.extend_from_slice(chunk.as_ref());
+        let decodable = match std::str::from_utf8(&pending) {
+            Ok(_) => pending.len(),
+            Err(error) => match error.error_len() {
+                // Invalid bytes: decode lossily up to and including them.
+                Some(len) => error.valid_up_to() + len,
+                // Incomplete trailing sequence: keep it for the next chunk.
+                None => error.valid_up_to(),
+            },
+        };
+        buffer.push_str(&String::from_utf8_lossy(&pending[..decodable]));
+        pending.drain(..decodable);
+        while let Some(index) = buffer.find('\n') {
+            let line = buffer[..index].trim_end_matches('\r').to_owned();
+            buffer.drain(..=index);
+            if let Some(data) = line.strip_prefix("data:").map(str::trim) {
+                if let Ok(value) = serde_json::from_str::<Value>(data) {
+                    return Ok(value);
+                }
+            }
+        }
+        if buffer.len() + pending.len() > MAX_FRAME_BYTES {
+            return Err(mcp_error("MCP SSE frame exceeded byte limit"));
+        }
+    }
+    Err(mcp_error(
+        "MCP SSE stream closed without a JSON-RPC response",
+    ))
 }
 
 fn decode_response(response: Value, id: u64) -> Result<Value, OmonError> {
@@ -340,4 +415,72 @@ fn decode_response(response: Value, id: u64) -> Result<Value, OmonError> {
 
 fn mcp_error(error: impl std::fmt::Display) -> OmonError {
     OmonError::ToolExecution(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sse_stream_decodes_multibyte_utf8_split_across_chunks() {
+        let payload = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"text\":\"한글\"}}\n";
+        // Split in the middle of the first multi-byte character.
+        let split = payload.find('한').expect("payload contains 한") + 1;
+        let bytes = payload.as_bytes();
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(bytes[..split].to_vec()), Ok(bytes[split..].to_vec())];
+
+        let value = parse_sse_stream(futures_util::stream::iter(chunks))
+            .await
+            .expect("split multi-byte SSE frame must decode");
+
+        assert_eq!(value["result"]["text"], json!("한글"));
+    }
+
+    #[tokio::test]
+    async fn sse_stream_rejects_oversized_frame() {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = (0..(MAX_FRAME_BYTES / 1024 + 2))
+            .map(|_| Ok(vec![b'x'; 1024]))
+            .collect();
+
+        let error = parse_sse_stream(futures_util::stream::iter(chunks))
+            .await
+            .expect_err("an unbounded SSE frame must be rejected");
+
+        assert!(
+            error.to_string().contains("exceeded byte limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_body_stream_is_bounded() {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = (0..(MAX_RESPONSE_BYTES / 65536 + 2))
+            .map(|_| Ok(vec![b'x'; 65536]))
+            .collect();
+
+        let error = read_bounded_body(futures_util::stream::iter(chunks))
+            .await
+            .expect_err("an oversized JSON body must be rejected");
+
+        assert!(
+            error.to_string().contains("exceeded byte limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_line_is_bounded() {
+        let mut payload = vec![b'x'; MAX_FRAME_BYTES + 1024];
+        payload.push(b'\n');
+
+        let error = read_stdio_response(payload.as_slice())
+            .await
+            .expect_err("an oversized stdio line must be rejected");
+
+        assert!(
+            error.to_string().contains("exceeded byte limit"),
+            "unexpected error: {error}"
+        );
+    }
 }

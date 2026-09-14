@@ -214,7 +214,23 @@ fn check_drain_requested_at(
     }
     match fs::read_to_string(&path) {
         Ok(content) => validate_marker_at(&content, current_epoch, now),
-        Err(_) => None,
+        Err(error) => {
+            // The marker exists but cannot be read (permissions, transient IO,
+            // wrong file type). Absent means "not draining"; unreadable must
+            // never be mistaken for absent, so fail CLOSED.
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "drain marker exists but is unreadable; failing closed and treating the gateway as draining"
+            );
+            Some(DrainRequest {
+                action: "drain".to_string(),
+                requested_at: None,
+                principal: Some("unreadable-marker".to_string()),
+                epoch: None,
+                suppress_notification: false,
+            })
+        }
     }
 }
 
@@ -638,5 +654,54 @@ mod tests {
         let cleared = clear_drain_request(dir).unwrap();
         assert!(cleared);
         assert!(check_drain_requested(dir, current_instantiation_epoch()).is_none());
+    }
+
+    #[test]
+    fn unreadable_drain_marker_is_treated_as_draining() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let epoch = current_instantiation_epoch();
+        let now = Utc::now();
+
+        // Absent marker stays "not draining".
+        assert!(check_drain_requested_at(dir, epoch, now).is_none());
+
+        // Present but unreadable: a directory at the marker path makes every
+        // read fail the same way a permissions or transient IO failure does.
+        let path = drain_request_path(dir);
+        fs::create_dir(&path).unwrap();
+        assert!(fs::read_to_string(&path).is_err());
+
+        let detected = check_drain_requested_at(dir, epoch, now);
+        println!("unreadable_marker detected={detected:?}");
+        let req = detected.expect("unreadable marker must fail CLOSED and read as draining");
+        assert_eq!(req.action, "drain");
+        assert_eq!(req.principal.as_deref(), Some("unreadable-marker"));
+
+        // The watcher built on the same predicate must publish the drain state.
+        let watcher = DrainWatcher::new(dir.to_path_buf(), Duration::from_secs(3));
+        let rx = watcher.receiver();
+        assert!(watcher.scan_at(epoch, now));
+        assert!(*rx.borrow());
+
+        fs::remove_dir(&path).unwrap();
+        assert!(check_drain_requested_at(dir, epoch, now).is_none());
+
+        // A real permission denial behaves identically (skipped when running as root).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc::geteuid() } != 0 {
+                fs::write(&path, r#"{"action":"drain"}"#).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+                let denied = check_drain_requested_at(dir, epoch, now);
+                println!("permission_denied_marker detected={denied:?}");
+                assert!(
+                    denied.is_some(),
+                    "a marker we cannot read must never report not-draining"
+                );
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
     }
 }

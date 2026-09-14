@@ -43,6 +43,8 @@ pub enum ApprovalError {
     Timeout,
     #[error("approval request was cancelled")]
     Cancelled,
+    #[error("failed to persist always-allow approval: {0}")]
+    Persistence(String),
 }
 
 pub const DEFAULT_APPROVAL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -388,7 +390,14 @@ impl DiscordApprovalRequester {
                     self.guard.approve_session(session, pattern_key).await;
                 }
                 ApprovalDecision::Always => {
-                    self.guard.approve_always(pattern_key).await;
+                    // A failed persistence must surface to the requester:
+                    // silently downgrading to a non-durable grant would be
+                    // the exact "reports success when persistence fails"
+                    // defect this lane fixes.
+                    self.guard
+                        .approve_always(pattern_key)
+                        .await
+                        .map_err(|error| ApprovalError::Persistence(error.to_string()))?;
                 }
                 _ => {}
             }
@@ -462,37 +471,65 @@ impl SmartApprovalGuard {
         false
     }
 
+    /// Upper bounds for the in-memory approval caches. A long-running
+    /// gateway must not grow these without limit: keys embed the full
+    /// command + reason text, and every distinct (session, command) pair
+    /// from an agent run adds an entry.
+    const MAX_SESSIONS: usize = 512;
+    const MAX_PATTERNS_PER_SESSION: usize = 128;
+
     pub async fn approve_session(&self, session: &SessionKey, pattern_key: &str) {
         let mut cache = self.session_cache.write().await;
-        cache
-            .entry(session.clone())
-            .or_default()
-            .insert(pattern_key.to_string());
-    }
-
-    pub async fn approve_always(&self, pattern_key: &str) {
-        self.always_cache
-            .write()
-            .await
-            .insert(pattern_key.to_string());
-
-        let pool = self.pool.read().await.clone();
-        if let Some(pool) = pool {
-            let pattern = pattern_key.to_string();
-            if let Err(error) = sqlx::query(
-                "INSERT INTO approval_allowlist (pattern_key) VALUES (?) ON CONFLICT(pattern_key) DO NOTHING",
-            )
-            .bind(&pattern)
-            .execute(&pool)
-            .await
-            {
-                tracing::warn!(%error, pattern = %pattern, "failed to persist always-allow approval");
+        let patterns = cache.entry(session.clone()).or_default();
+        patterns.insert(pattern_key.to_string());
+        // Bound the per-session set; evicting an arbitrary entry is safe for
+        // a cache (worst case: one command re-asks for approval).
+        while patterns.len() > Self::MAX_PATTERNS_PER_SESSION {
+            let victim = patterns.iter().next().cloned();
+            match victim {
+                Some(v) => {
+                    patterns.remove(&v);
+                }
+                None => break,
+            }
+        }
+        // Bound the number of tracked sessions; drop an arbitrary one.
+        while cache.len() > Self::MAX_SESSIONS {
+            let victim = cache.keys().next().cloned();
+            match victim {
+                Some(v) => {
+                    cache.remove(&v);
+                }
+                None => break,
             }
         }
     }
 
-    pub async fn approve_permanent(&self, pattern_key: &str) {
-        self.approve_always(pattern_key).await;
+    /// Records a permanent allow. The durable row is written BEFORE the
+    /// in-memory grant is published: persisting after would let a failed
+    /// INSERT leave an active grant the user believes is permanent but that
+    /// vanishes on restart. Returns Err only when persistence failed and no
+    /// grant was published.
+    pub async fn approve_always(&self, pattern_key: &str) -> Result<(), sqlx::Error> {
+        let pool = self.pool.read().await.clone();
+        if let Some(pool) = pool {
+            let pattern = pattern_key.to_string();
+            sqlx::query(
+                "INSERT INTO approval_allowlist (pattern_key) VALUES (?) ON CONFLICT(pattern_key) DO NOTHING",
+            )
+            .bind(&pattern)
+            .execute(&pool)
+            .await?;
+        }
+        self.always_cache
+            .write()
+            .await
+            .insert(pattern_key.to_string());
+        Ok(())
+    }
+
+    pub async fn approve_permanent(&self, pattern_key: &str) -> Result<(), sqlx::Error> {
+        self.approve_always(pattern_key).await
     }
 
     pub async fn load_permanent(&self, patterns: impl IntoIterator<Item = String>) {
@@ -942,7 +979,7 @@ mod tests {
         assert!(!guard.is_approved(&session_a, pattern).await);
         assert!(!guard.is_approved(&session_b, pattern).await);
 
-        guard.approve_always(pattern).await;
+        guard.approve_always(pattern).await.unwrap();
 
         assert!(guard.is_approved(&session_a, pattern).await);
         assert!(guard.is_approved(&session_b, pattern).await);
@@ -1095,7 +1132,7 @@ mod tests {
 
         assert!(!guard_1.is_approved(&session, &pattern_key).await);
 
-        guard_1.approve_always(&pattern_key).await;
+        guard_1.approve_always(&pattern_key).await.unwrap();
         assert!(guard_1.is_approved(&session, &pattern_key).await);
 
         // 2. Verify row exists in DB
@@ -1200,5 +1237,75 @@ mod tests {
             !guard.is_yolo(&botless).await,
             "botless alias must not be yolo"
         );
+    }
+
+    #[tokio::test]
+    async fn approve_always_persists_before_publishing_and_fails_closed() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = SmartApprovalGuard::new().with_pool(pool.clone());
+        let pattern = "terminal:cargo:*";
+
+        // Success path: durable row exists AND cache published.
+        store.approve_always(pattern).await.unwrap();
+        assert!(store.always_cache.read().await.contains(pattern));
+        let persisted: Option<(String,)> =
+            sqlx::query_as("SELECT pattern_key FROM approval_allowlist WHERE pattern_key = ?")
+                .bind(pattern)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted.as_ref().map(|(p,)| p.as_str()), Some(pattern));
+
+        // Failure path: a closed pool makes the INSERT fail; the grant must
+        // NOT be published and the error must surface instead of a warn.
+        let failing = SmartApprovalGuard::new().with_pool(pool.clone());
+        pool.close().await;
+        let err = failing.approve_always("terminal:rm:*").await;
+        assert!(err.is_err(), "closed pool must surface a persistence error");
+        assert!(
+            !failing.always_cache.read().await.contains("terminal:rm:*"),
+            "a failed persistence attempt must not leave an active grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_caches_are_bounded() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = SmartApprovalGuard::new().with_pool(pool);
+        let session = SessionKey::new("discord", None::<String>, "42", None::<String>, "7");
+
+        for i in 0..(SmartApprovalGuard::MAX_PATTERNS_PER_SESSION + 20) {
+            store
+                .approve_session(&session, &format!("cmd:pattern-{i}"))
+                .await;
+        }
+        {
+            let cache = store.session_cache.read().await;
+            let patterns = cache.get(&session).unwrap();
+            assert!(
+                patterns.len() <= SmartApprovalGuard::MAX_PATTERNS_PER_SESSION,
+                "per-session pattern cache must be bounded, got {}",
+                patterns.len()
+            );
+        }
+
+        for i in 0..(SmartApprovalGuard::MAX_SESSIONS + 20) {
+            let s = SessionKey::new(
+                "discord",
+                None::<String>,
+                format!("chan-{i}"),
+                None::<String>,
+                "user",
+            );
+            store.approve_session(&s, "cmd:x").await;
+        }
+        {
+            let cache = store.session_cache.read().await;
+            assert!(
+                cache.len() <= SmartApprovalGuard::MAX_SESSIONS,
+                "session cache must be bounded, got {}",
+                cache.len()
+            );
+        }
     }
 }

@@ -220,12 +220,18 @@ pub fn probe_credentials(default_model: &str) -> CheckResult {
     }
 }
 
-/// Probes connected/configured platform bots count.
+/// Probes configured platform bots count.
+///
+/// The count passed here is the number of bots CONFIGURED in the environment,
+/// not the number with live gateway connections (that state is not reachable
+/// from readiness collection). The metric is named to match reality; labeling
+/// it "connected_bots" made readiness report green while the gateway could
+/// not receive messages.
 pub fn probe_gateway(bot_count: usize) -> CheckResult {
     if bot_count == 0 {
         CheckResult::degraded("no platform bot tokens configured")
     } else {
-        CheckResult::ok().with_metric("connected_bots", bot_count)
+        CheckResult::ok().with_metric("configured_bots", bot_count)
     }
 }
 
@@ -447,10 +453,13 @@ mod tests {
 
         let active = probe_gateway(2);
         assert_eq!(active.status, "ok");
+        // The metric must name what the number actually is: configured bots,
+        // not live connections.
         assert_eq!(
-            active.metrics.get("connected_bots"),
+            active.metrics.get("configured_bots"),
             Some(&serde_json::json!(2))
         );
+        assert!(!active.metrics.contains_key("connected_bots"));
     }
 
     #[test]

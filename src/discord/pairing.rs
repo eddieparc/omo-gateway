@@ -388,6 +388,18 @@ impl PairingStore {
         // Propagate any database error instead of swallowing it as throttled success.
         let code = Self::request_pairing_code_tx(&mut tx, user_id, now).await?;
 
+        // The notification table exists only to rate-limit; a row older than
+        // the window can never throttle again, so drop it instead of letting
+        // an unauthenticated population grow the table without bound.
+        sqlx::query(
+            "DELETE FROM pairing_notifications
+             WHERE (strftime('%s', ?) - strftime('%s', last_notified_at)) > ?",
+        )
+        .bind(now)
+        .bind(RATE_LIMIT_SECONDS)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
 
         Ok(Some(code))
@@ -511,6 +523,16 @@ impl PairingStore {
 
         // Cache callbacks only after commit
         self.paired_cache.write().await.insert(user_id);
+
+        // The rate-limit row for this user served its purpose; drop it so the
+        // notification table does not accumulate one row per paired user.
+        if let Err(error) = sqlx::query("DELETE FROM pairing_notifications WHERE user_id = ?")
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!(%error, user_id, "failed to prune pairing notification row after pairing");
+        }
 
         Ok(PairingOutcome::Success { user_id })
     }
@@ -1065,5 +1087,77 @@ mod tests {
             "competing approval must receive InvalidCode (consumed)"
         );
         assert!(store.is_user_paired(user_id).await);
+    }
+
+    #[tokio::test]
+    async fn notification_rows_are_pruned_by_window_and_by_pairing() {
+        let pool = crate::storage::init_pool("sqlite::memory:").await.unwrap();
+        let store = PairingStore::new(pool.clone());
+        store.init_cache().await.unwrap();
+
+        let now = Utc::now();
+        let fresh_user = 111111111_u64;
+        let stale_user = 222222222_u64;
+        let driver_user = 333333333_u64;
+
+        // Fresh claim for fresh_user (keeps its row: it just throttled a DM).
+        assert!(store
+            .check_and_record_notification_at(fresh_user, now)
+            .await
+            .unwrap()
+            .is_some());
+
+        // A stale row: older than the rate-limit window, so it can never
+        // throttle again — dead state.
+        let stale_time = now - chrono::Duration::seconds(RATE_LIMIT_SECONDS + 60);
+        sqlx::query("INSERT INTO pairing_notifications (user_id, last_notified_at) VALUES (?, ?)")
+            .bind(stale_user.to_string())
+            .bind(stale_time)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Another notification claim triggers the prune in the same tx.
+        assert!(store
+            .check_and_record_notification_at(driver_user, now)
+            .await
+            .unwrap()
+            .is_some());
+
+        let stale_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pairing_notifications WHERE user_id = ?")
+                .bind(stale_user.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stale_rows, 0, "stale notification rows must be pruned");
+
+        let fresh_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pairing_notifications WHERE user_id = ?")
+                .bind(fresh_user.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fresh_rows, 1, "fresh rows must survive the prune");
+
+        // After successful pairing the user's row is no longer needed.
+        let code = store.request_pairing_code(fresh_user).await.unwrap();
+        let outcome = store.approve_code(&code, 424242).await.unwrap();
+        assert_eq!(
+            outcome,
+            PairingOutcome::Success {
+                user_id: fresh_user
+            }
+        );
+        let rows_after_pairing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pairing_notifications WHERE user_id = ?")
+                .bind(fresh_user.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows_after_pairing, 0,
+            "paired user's notification row must be deleted"
+        );
     }
 }

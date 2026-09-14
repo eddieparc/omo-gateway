@@ -21,7 +21,7 @@ pub enum LlmProvider {
     Ollama,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LlmConfig {
     pub provider: LlmProvider,
     pub model: String,
@@ -29,6 +29,21 @@ pub struct LlmConfig {
     pub base_url: Option<String>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+}
+
+impl std::fmt::Debug for LlmConfig {
+    /// Redacts `api_key` so tracing output and panics never carry the secret.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LlmConfig")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("base_url", &self.base_url)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .finish()
+    }
 }
 
 impl LlmConfig {
@@ -232,6 +247,7 @@ impl LlmClient {
             let stream_id = Uuid::new_v4();
             let mut sequence = 0;
             let mut buffer = String::new();
+            let mut pending = Vec::new();
             let mut tool_calls = BTreeMap::new();
             let mut bytes = response.bytes_stream();
             while let Some(next) = bytes.next().await {
@@ -242,7 +258,8 @@ impl LlmClient {
                         return;
                     }
                 };
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                pending.extend_from_slice(&bytes);
+                decode_stream_bytes(&mut pending, &mut buffer);
                 while let Some(index) = buffer.find('\n') {
                     let line = buffer[..index].trim_end_matches('\r').to_owned();
                     buffer.drain(..=index);
@@ -261,6 +278,9 @@ impl LlmClient {
                         }
                     }
                 }
+            }
+            if !pending.is_empty() {
+                buffer.push_str(&String::from_utf8_lossy(&pending));
             }
             if !buffer.trim().is_empty() {
                 accumulate_stream_tool_calls(provider, buffer.trim(), &mut tool_calls);
@@ -719,10 +739,82 @@ fn parse_tool_calls(provider: LlmProvider, value: &Value) -> Result<Vec<ToolCall
         .collect()
 }
 
+/// Appends every complete UTF-8 character available in `pending` to `buffer`,
+/// keeping an incomplete trailing sequence in `pending` for the next chunk so
+/// multi-byte characters split across chunk boundaries survive intact.
+fn decode_stream_bytes(pending: &mut Vec<u8>, buffer: &mut String) {
+    loop {
+        let error = match std::str::from_utf8(pending) {
+            Ok(text) => {
+                buffer.push_str(text);
+                pending.clear();
+                return;
+            }
+            Err(error) => error,
+        };
+        let valid = error.valid_up_to();
+        if let Ok(text) = std::str::from_utf8(&pending[..valid]) {
+            buffer.push_str(text);
+        }
+        match error.error_len() {
+            // Genuinely invalid bytes: replace them and keep decoding.
+            Some(length) => {
+                buffer.push('\u{FFFD}');
+                pending.drain(..valid + length);
+            }
+            // Truncated trailing character: keep it for the next chunk.
+            None => {
+                pending.drain(..valid);
+                return;
+            }
+        }
+    }
+}
+
 fn tokio_stream<T: Send + 'static>(
     receiver: mpsc::Receiver<T>,
 ) -> impl Stream<Item = T> + Send + 'static {
     futures_util::stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|item| (item, receiver))
     })
+}
+
+#[cfg(test)]
+mod stream_decode_tests {
+    use super::*;
+
+    #[test]
+    fn multibyte_split_across_chunks_decodes_intact() {
+        let original = "안녕하세요 오몬! 스트리밍 테스트입니다.";
+        let bytes = original.as_bytes();
+        // Split in the middle of a multi-byte character.
+        let split = 4;
+        assert!(!original.is_char_boundary(split));
+
+        let mut pending = Vec::new();
+        let mut buffer = String::new();
+        pending.extend_from_slice(&bytes[..split]);
+        decode_stream_bytes(&mut pending, &mut buffer);
+        pending.extend_from_slice(&bytes[split..]);
+        decode_stream_bytes(&mut pending, &mut buffer);
+
+        assert!(
+            !buffer.contains('\u{FFFD}'),
+            "decoded stream contains replacement characters: {buffer:?}"
+        );
+        assert_eq!(buffer, original);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn llm_config_debug_redacts_api_key() {
+        let mut config = LlmConfig::new(LlmProvider::OpenAi, "glm-5.3-flash");
+        config.api_key = Some("sk-super-secret-value".to_string());
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("sk-super-secret-value"),
+            "debug output leaked the api key: {rendered}"
+        );
+        assert!(rendered.contains("glm-5.3-flash"), "{rendered}");
+    }
 }

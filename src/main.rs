@@ -876,9 +876,16 @@ async fn run_gateway() -> Result<()> {
     let mut drain_rx = drain_watcher.receiver();
     let _drain_handle = drain_watcher.spawn();
 
+    #[cfg(unix)]
+    let mut sigterm_stream =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| OmonError::Config(format!("failed to listen for SIGTERM: {error}")))?;
+    let mut discord_task_failed = false;
+
     tokio::select! {
         Some(res) = join_set.join_next() => {
             if let Ok(Err(err)) = res {
+                discord_task_failed = true;
                 tracing::error!("Discord client exited with error: {:?}", err);
             }
         }
@@ -899,11 +906,36 @@ async fn run_gateway() -> Result<()> {
                 }
             }
         }
+        // Production stop paths (systemctl stop, launchctl kill, container
+        // stop) send SIGTERM, not SIGINT. Without this arm every graceful
+        // shutdown marker, in-flight turn, and resume-state write is skipped
+        // exactly when the process is stopped normally.
+        _ = async {
+            #[cfg(unix)]
+            {
+                sigterm_stream.recv().await;
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            info!("SIGTERM received; shutting down gracefully");
+            let _ = multiplexer.mark_in_flight_resume_pending().await;
+            for sm in shard_managers {
+                sm.shutdown_all().await;
+            }
+        }
     }
 
     scheduler.shutdown().await;
     scale_to_zero.shutdown().await;
     pool.close().await;
+    if discord_task_failed {
+        // A crashed Discord task must not look like a successful run to the
+        // supervisor; exit non-zero so systemd/launchd restarts us.
+        std::process::exit(1);
+    }
     warn!("omo-gateway stopped");
     Ok(())
 }
