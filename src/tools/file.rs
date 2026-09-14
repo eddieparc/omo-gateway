@@ -74,24 +74,33 @@ impl FileTool {
                 "read path must resolve to a regular file inside tool root".into(),
             ));
         }
-        let bytes = fs::read(path).await.map_err(tool_error)?;
-        if bytes.len() > self.max_read_bytes {
+        // Read bounded head/tail slices from a stat'd handle: loading the whole file first
+        // would exhaust memory on a multi-gigabyte artifact long before the limit applied.
+        let total_len = metadata.len();
+        if total_len > self.max_read_bytes as u64 {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let head_len = (self.max_read_bytes * 2) / 5;
             let tail_len = self.max_read_bytes.saturating_sub(head_len);
-            let head_bytes = &bytes[..head_len.min(bytes.len())];
-            let tail_start = bytes.len().saturating_sub(tail_len);
-            let tail_bytes = &bytes[tail_start..];
-            let omitted = bytes
-                .len()
-                .saturating_sub(head_bytes.len() + tail_bytes.len());
+            let mut file = fs::File::open(&path).await.map_err(tool_error)?;
+            let mut head_bytes = vec![0u8; head_len];
+            file.read_exact(&mut head_bytes).await.map_err(tool_error)?;
+            let mut tail_bytes = vec![0u8; tail_len];
+            file.seek(std::io::SeekFrom::Start(
+                total_len.saturating_sub(tail_len as u64),
+            ))
+            .await
+            .map_err(tool_error)?;
+            file.read_exact(&mut tail_bytes).await.map_err(tool_error)?;
+            let omitted = total_len.saturating_sub((head_bytes.len() + tail_bytes.len()) as u64);
             let text = format!(
                 "{}\n\n... [file truncated: {} bytes omitted] ...\n\n{}",
-                String::from_utf8_lossy(head_bytes),
+                String::from_utf8_lossy(&head_bytes),
                 omitted,
-                String::from_utf8_lossy(tail_bytes)
+                String::from_utf8_lossy(&tail_bytes)
             );
             return Ok(json!({"content": text, "truncated": true}));
         }
+        let bytes = fs::read(path).await.map_err(tool_error)?;
         let content = String::from_utf8(bytes)
             .map_err(|_| OmonError::ToolExecution("file is not valid UTF-8".into()))?;
         Ok(json!({"content": content}))
@@ -127,8 +136,19 @@ impl FileTool {
                     "write path resolves to a directory".into(),
                 ));
             }
-            Ok(_) => {
+            Ok(metadata) => {
                 self.ensure_inside_root(&target)?;
+                // A hard link makes the same inode reachable from outside the root, so a
+                // write here also mutates that alias and bypasses confinement.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.nlink() > 1 {
+                        return Err(OmonError::ToolExecution(
+                            "refusing to write a hard-linked file".into(),
+                        ));
+                    }
+                }
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(tool_error(error)),
@@ -413,6 +433,79 @@ mod tests {
             tool.extra_roots[0],
             std::fs::canonicalize(valid_extra.path()).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_oversized_file_is_bounded() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut tool = FileTool::new(dir.path());
+        tool.max_read_bytes = 40;
+
+        // A sparse file far larger than any sane allocation: reading it whole is
+        // impossible, reading bounded head/tail slices is trivial.
+        const SIZE: u64 = 1 << 50;
+        let head = b"HEAD-0123456789X";
+        let tail = b"TAIL-0123456789ABCDEFGHI";
+        let path = dir.path().join("huge.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(head).unwrap();
+        file.set_len(SIZE).unwrap();
+        file.seek(SeekFrom::Start(SIZE - tail.len() as u64))
+            .unwrap();
+        file.write_all(tail).unwrap();
+        drop(file);
+
+        let result = tool
+            .execute(json!({"operation": "read", "path": "huge.bin"}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["truncated"], true);
+        let content = result["content"].as_str().unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "{}\n\n... [file truncated: {} bytes omitted] ...\n\n{}",
+                String::from_utf8_lossy(head),
+                SIZE - 40,
+                String::from_utf8_lossy(tail)
+            )
+        );
+        assert!(
+            content.len() < 200,
+            "content should stay bounded, got {} bytes",
+            content.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_refuses_hard_linked_file() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let tool = FileTool::new(root.path());
+
+        let inside = root.path().join("note.txt");
+        std::fs::write(&inside, "original").unwrap();
+        let alias = outside.path().join("alias.txt");
+        std::fs::hard_link(&inside, &alias).unwrap();
+
+        let err = tool
+            .execute(json!({
+                "operation": "write",
+                "path": "note.txt",
+                "content": "attacker controlled"
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, OmonError::ToolExecution(msg) if msg.contains("hard-linked")),
+            "expected hard link refusal, got {:?}",
+            err
+        );
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "original");
     }
 
     #[tokio::test]

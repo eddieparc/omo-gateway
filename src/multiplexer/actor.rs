@@ -69,6 +69,9 @@ pub struct SessionActor {
     pool: SqlitePool,
     last_active_at: tokio::time::Instant,
     dirty: bool,
+    /// Set when a reset cleared the remote conversation binding, so the next flush
+    /// must delete it instead of preserving the stored one for session stickiness.
+    binding_cleared: bool,
     /// Outcome channel for the turn currently being executed, when the sender asked for one.
     pending_ack: Option<oneshot::Sender<Result<()>>>,
 }
@@ -183,6 +186,7 @@ impl SessionActor {
             pool,
             last_active_at: tokio::time::Instant::now(),
             dirty: false,
+            binding_cleared: false,
             pending_ack: None,
         })
     }
@@ -371,6 +375,7 @@ impl SessionActor {
                                     Some(ActorCommand::Reset { reply }) => {
                                         cancellation.cancel();
                                         self.context.state.metadata.remove("omo_thread_id");
+                                        self.binding_cleared = true;
                                         self.context.state = crate::SessionState::default();
                                         self.dirty = true;
                                         let _ = reply.send(Ok(()));
@@ -580,6 +585,7 @@ impl SessionActor {
                 ActorCommand::Reset { reply } => {
                     self.last_active_at = tokio::time::Instant::now();
                     self.context.state.metadata.remove("omo_thread_id");
+                    self.binding_cleared = true;
                     self.context.state = crate::SessionState::default();
                     self.dirty = true;
                     let flush_res = self.flush_if_dirty().await;
@@ -744,16 +750,22 @@ impl SessionActor {
         }
         self.flush().await?;
         self.dirty = false;
+        self.binding_cleared = false;
         Ok(())
     }
 
     async fn flush(&self) -> Result<()> {
         ensure_session(&self.pool, &self.context).await?;
         let state = serde_json::to_string(&self.context.state).map_err(serialization_error)?;
+        // An ordinary flush preserves an existing remote binding (session stickiness is a
+        // product requirement). A flush following a reset must NOT: restoring the binding
+        // there would resurrect pre-reset conversation context the user was told was cleared.
+        let preserve_binding = if self.binding_cleared { 0i64 } else { 1i64 };
         sqlx::query(
             "UPDATE sessions
              SET state_json = CASE
-                 WHEN json_extract(state_json, '$.metadata.omo_thread_id') IS NOT NULL
+                 WHEN ? = 1
+                      AND json_extract(state_json, '$.metadata.omo_thread_id') IS NOT NULL
                       AND json_extract(?, '$.metadata.omo_thread_id') IS NULL
                  THEN json_set(?, '$.metadata.omo_thread_id', json_extract(state_json, '$.metadata.omo_thread_id'))
                  ELSE ?
@@ -761,6 +773,7 @@ impl SessionActor {
              updated_at = ?
              WHERE session_key = ?",
         )
+        .bind(preserve_binding)
         .bind(&state)
         .bind(&state)
         .bind(&state)

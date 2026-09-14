@@ -1057,6 +1057,7 @@ pub async fn compress(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
         return Ok(());
     }
 
+    let cutoff_sequence = rows.last().map(|(seq, _, _)| *seq).unwrap_or(0);
     let history: Vec<(String, String)> = rows.into_iter().map(|(_, r, c)| (r, c)).collect();
     let chars_before: usize = history.iter().map(|(_, c)| c.len()).sum();
     let prompt = build_compression_prompt(&history);
@@ -1088,22 +1089,13 @@ pub async fn compress(ctx: PoiseContext<'_>) -> Result<(), CommandError> {
     let summary_content = format!("[Conversation Summary]\n{summary}");
     let chars_after = summary_content.len();
 
-    let mut tx = ctx.data().pool.begin().await?;
-    sqlx::query("DELETE FROM messages WHERE session_key = ?")
-        .bind(&storage_key)
-        .execute(&mut *tx)
-        .await?;
-
-    sqlx::query(
-        "INSERT INTO messages (id, session_key, role, content, metadata_json, created_at)
-         VALUES (?, ?, 'system', ?, '{\"compressed\": true}', CURRENT_TIMESTAMP)",
+    replace_history_with_summary(
+        &ctx.data().pool,
+        &storage_key,
+        cutoff_sequence,
+        &summary_content,
     )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(&storage_key)
-    .bind(&summary_content)
-    .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
 
     let (before, after, pct) = calculate_compression_stats(chars_before, chars_after);
     ctx.say(format!(
@@ -1491,6 +1483,37 @@ pub async fn undo_last_exchange(
         assistant_content,
         deleted_count: delete_res.rows_affected(),
     }))
+}
+
+/// Replace the summarized prefix of a session's history with a single summary message.
+///
+/// Only rows at or before `cutoff_sequence` (the last sequence present in the snapshot that
+/// was actually summarized) are deleted; messages that arrived during summarization survive.
+/// The summary reuses `cutoff_sequence` so it stays ordered before those later messages.
+pub async fn replace_history_with_summary(
+    pool: &SqlitePool,
+    session_key: &str,
+    cutoff_sequence: i64,
+    summary_content: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM messages WHERE session_key = ? AND sequence <= ?")
+        .bind(session_key)
+        .bind(cutoff_sequence)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO messages (sequence, id, session_key, role, content, metadata_json, created_at)
+         VALUES (?, ?, ?, 'system', ?, '{\"compressed\": true}', CURRENT_TIMESTAMP)",
+    )
+    .bind(cutoff_sequence)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(session_key)
+    .bind(summary_content)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
 
 #[cfg(test)]
@@ -1943,6 +1966,104 @@ mod tests {
         assert_eq!(after_rows.len(), 1);
         assert_eq!(after_rows[0].0, "system");
         assert!(after_rows[0].1.starts_with("[Conversation Summary]"));
+    }
+
+    #[tokio::test]
+    async fn test_compress_preserves_messages_arriving_after_snapshot() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let session_key = "test-compress-race-session";
+
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json) VALUES (?, 'discord', 'c1', 'u1', '{}')",
+        )
+        .bind(session_key)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        for i in 0..3 {
+            sqlx::query(
+                "INSERT INTO messages (id, session_key, role, content) VALUES (?, ?, 'user', ?)",
+            )
+            .bind(format!("um{i}"))
+            .bind(session_key)
+            .bind(format!("User message {i}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO messages (id, session_key, role, content) VALUES (?, ?, 'assistant', ?)",
+            )
+            .bind(format!("am{i}"))
+            .bind(session_key)
+            .bind(format!("Assistant response {i}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        // Snapshot taken by /compress before the (slow) LLM summarization.
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT sequence, role, content FROM messages WHERE session_key = ? ORDER BY sequence ASC",
+        )
+        .bind(session_key)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 6);
+        let cutoff_sequence = rows.last().map(|(seq, _, _)| *seq).unwrap();
+        let history: Vec<(String, String)> = rows.into_iter().map(|(_, r, c)| (r, c)).collect();
+
+        // A user message and its reply land while summarization is still in flight.
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content) VALUES ('late-user', ?, 'user', 'late question during compression')",
+        )
+        .bind(session_key)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_key, role, content) VALUES ('late-assistant', ?, 'assistant', 'late answer during compression')",
+        )
+        .bind(session_key)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let summary_content = format!("[Conversation Summary]\n{}", fallback_summary(&history));
+        replace_history_with_summary(db.pool(), session_key, cutoff_sequence, &summary_content)
+            .await
+            .unwrap();
+
+        let after_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, content FROM messages WHERE session_key = ? ORDER BY sequence ASC",
+        )
+        .bind(session_key)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            after_rows.len(),
+            3,
+            "summary plus the two messages that arrived after the snapshot must remain, got {after_rows:?}"
+        );
+        assert_eq!(after_rows[0].0, "system");
+        assert!(after_rows[0].1.starts_with("[Conversation Summary]"));
+        assert_eq!(
+            after_rows[1],
+            (
+                "user".to_string(),
+                "late question during compression".to_string()
+            )
+        );
+        assert_eq!(
+            after_rows[2],
+            (
+                "assistant".to_string(),
+                "late answer during compression".to_string()
+            )
+        );
     }
 
     #[test]

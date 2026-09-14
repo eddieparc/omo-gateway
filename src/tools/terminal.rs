@@ -363,23 +363,77 @@ impl TerminalTool {
 
         if let Some(env) = args.get("env").and_then(Value::as_object) {
             for (key, value) in env {
+                // The executable was already resolved and approved above. Letting a caller
+                // override executable-search or loader-injection variables would run a
+                // different binary than the one approval classified.
+                if is_protected_env_key(key) {
+                    return Err(OmonError::ToolExecution(format!(
+                        "terminal env may not override {key}"
+                    )));
+                }
                 let value = value.as_str().ok_or_else(|| {
                     OmonError::ToolExecution("terminal env values must be strings".into())
                 })?;
                 command.env(key, value);
             }
         }
-        let output = tokio::time::timeout(self.timeout, command.output())
-            .await
-            .map_err(|_| {
-                OmonError::ToolExecution(format!("process timed out after {:?}", self.timeout))
-            })?
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command
+            .spawn()
             .map_err(|error| OmonError::ToolExecution(error.to_string()))?;
-        let (stdout, stdout_truncated) = capture(&output.stdout, self.max_output_bytes);
-        let (stderr, stderr_truncated) = capture(&output.stderr, self.max_output_bytes);
+        // Drain both pipes concurrently into bounded buffers from process start, so a
+        // runaway child cannot exhaust memory before the timeout or truncation runs.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let cap = self.max_output_bytes;
+        let mut out_task = tokio::spawn(read_capped(stdout_pipe, cap));
+        let mut err_task = tokio::spawn(read_capped(stderr_pipe, cap));
+        // Kill the child as soon as EITHER pipe overflows its budget. Waiting for both
+        // would hang forever on a child that floods one pipe and never closes the other.
+        let run = async {
+            let mut out_done: Option<Vec<u8>> = None;
+            let mut err_done: Option<Vec<u8>> = None;
+            while out_done.is_none() || err_done.is_none() {
+                tokio::select! {
+                    res = &mut out_task, if out_done.is_none() => {
+                        let bytes = res.map_err(std::io::Error::other)??;
+                        if bytes.len() > cap {
+                            let _ = child.start_kill();
+                        }
+                        out_done = Some(bytes);
+                    }
+                    res = &mut err_task, if err_done.is_none() => {
+                        let bytes = res.map_err(std::io::Error::other)??;
+                        if bytes.len() > cap {
+                            let _ = child.start_kill();
+                        }
+                        err_done = Some(bytes);
+                    }
+                }
+            }
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>((
+                out_done.unwrap_or_default(),
+                err_done.unwrap_or_default(),
+                status,
+            ))
+        };
+        let (out_bytes, err_bytes, status) = match tokio::time::timeout(self.timeout, run).await {
+            Ok(result) => result.map_err(|error| OmonError::ToolExecution(error.to_string()))?,
+            Err(_) => {
+                return Err(OmonError::ToolExecution(format!(
+                    "process timed out after {:?}",
+                    self.timeout
+                )));
+            }
+        };
+        let (stdout, stdout_truncated) = capture(&out_bytes, self.max_output_bytes);
+        let (stderr, stderr_truncated) = capture(&err_bytes, self.max_output_bytes);
         Ok(json!({
-            "success": output.status.success(),
-            "exit_code": output.status.code(),
+            "success": status.success(),
+            "exit_code": status.code(),
             "stdout": stdout,
             "stderr": stderr,
             "stdout_truncated": stdout_truncated,
@@ -554,6 +608,40 @@ fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str, OmonError>
 
 fn canonical(path: &Path) -> Result<PathBuf, OmonError> {
     std::fs::canonicalize(path).map_err(|error| OmonError::ToolExecution(error.to_string()))
+}
+
+/// Environment variables a caller may never override: changing them would make the
+/// process execute or load something other than the approved executable.
+fn is_protected_env_key(key: &str) -> bool {
+    const PROTECTED: [&str; 7] = [
+        "PATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+    ];
+    PROTECTED.iter().any(|p| key.eq_ignore_ascii_case(p))
+}
+
+/// Reads at most `limit` bytes plus one marker byte, so `capture` can still report
+/// truncation while the process never buffers more than the budget allows.
+async fn read_capped<R>(pipe: Option<R>, limit: usize) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(reader) = pipe else {
+        return Ok(Vec::new());
+    };
+    let mut buf = Vec::new();
+    // limit + 1 so `capture` can still detect and report truncation.
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut buf)
+        .await?;
+    Ok(buf)
 }
 
 fn capture(bytes: &[u8], limit: usize) -> (String, bool) {
@@ -950,6 +1038,74 @@ mod approval_tests {
         assert_eq!(super::build_augmented_path(Some(""), Some("")), "");
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn caller_env_cannot_override_executable_search_or_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = TerminalTool::new(dir.path()).with_approval_policy(ApprovalPolicy::Never);
+
+        for key in [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            let err = tool
+                .execute(json!({
+                    "program": "echo",
+                    "args": ["hi"],
+                    "env": {key: "/tmp/attacker"}
+                }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, OmonError::ToolExecution(msg) if msg.contains(key)),
+                "caller override of {key} must be refused, got {err:?}"
+            );
+        }
+
+        // An ordinary variable is still accepted.
+        let ok = tool
+            .execute(json!({
+                "program": "echo",
+                "args": ["hi"],
+                "env": {"HARMLESS_VAR": "1"}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(ok["success"], true);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn runaway_output_is_capped_without_buffering_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = TerminalTool::new(dir.path())
+            .with_approval_policy(ApprovalPolicy::Never)
+            .with_max_output_bytes(4096);
+
+        // `yes` prints forever; the aggregate capture budget must stop it.
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            tool.execute(json!({"program": "yes", "args": ["saturate"]})),
+        )
+        .await
+        .expect("capped capture must finish long before the process timeout")
+        .unwrap();
+
+        assert_eq!(
+            result["stdout_truncated"], true,
+            "runaway stdout must be reported as truncated: {result}"
+        );
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.len() < 64 * 1024,
+            "captured stdout must stay bounded, got {} bytes",
+            stdout.len()
+        );
+    }
+
     #[test]
     fn augmented_path_from_environment_includes_default_homebrew_path() {
         let path = super::augmented_path_from_environment();
@@ -1317,5 +1473,27 @@ mod approval_tests {
             "expected program path escapes tool root, got {:?}",
             err
         );
+    }
+}
+
+#[cfg(test)]
+mod scratch_probe_tests {
+    #[test]
+    fn probe_detection_with_absolute_paths() {
+        for cmd in [
+            "rm -rf /",
+            "/bin/rm -rf /",
+            "/bin/rm -rf /etc",
+            "/sbin/reboot",
+            "reboot",
+            "/bin/rm -rf target",
+            "/usr/bin/sudo -S launchctl bootout system/foo",
+        ] {
+            println!(
+                "{cmd:?} hardline={:?} dangerous={}",
+                crate::security::detect_hardline_command(cmd),
+                crate::security::is_dangerous(cmd)
+            );
+        }
     }
 }

@@ -5,7 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 COPY README.md LICENSE ./
-RUN cargo build --locked --release --bin omon-gateway
+RUN cargo build --locked --release --bin omo-gateway
 
 FROM debian:bookworm-slim AS runtime
 
@@ -18,7 +18,7 @@ RUN apt-get update \
     && chown -R omon:omon /app
 
 WORKDIR /app
-COPY --from=builder /build/target/release/omon-gateway /usr/local/bin/omon-gateway
+COPY --from=builder /build/target/release/omo-gateway /usr/local/bin/omo-gateway
 
 ENV DATABASE_URL=sqlite:///app/data/omon_gateway.db \
     OMON_WORKSPACE_ROOT=/app/workspace \
@@ -27,6 +27,6 @@ ENV DATABASE_URL=sqlite:///app/data/omon_gateway.db \
 USER omon
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD test -r /proc/1/cmdline && grep -aq "omon-gateway" /proc/1/cmdline || exit 1
+    CMD test -r /proc/1/cmdline && grep -aq "omo-gateway" /proc/1/cmdline || exit 1
 
-ENTRYPOINT ["/usr/local/bin/omon-gateway"]
+ENTRYPOINT ["/usr/local/bin/omo-gateway"]

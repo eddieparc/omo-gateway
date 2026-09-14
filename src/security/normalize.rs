@@ -999,24 +999,46 @@ pub fn execution_flag_findings(command: &str) -> Vec<(String, Option<String>)> {
     findings
 }
 
+/// Maximum number of detection variants retained for one classification.
+const MAX_DETECTION_VARIANTS: usize = 512;
+/// Maximum total bytes retained across all detection variants for one classification.
+const MAX_DETECTION_VARIANT_BYTES: usize = 4 * 1024 * 1024;
+
 pub fn command_detection_variants(command: &str) -> Vec<String> {
     let normalized = normalize_command_for_detection(command);
     let (grep_safe, _) = grep_safe_detection_variant(&normalized);
     let mut variants = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // Each changed word retains a near-complete copy of the script, so an adversarial
+    // input that passes every length limit can still drive retention into gigabytes.
+    // Budget the aggregate: callers treat exhaustion as "could not fully analyse", which
+    // keeps a saturating input suspicious rather than silently under-scanned.
+    let mut retained_bytes = 0usize;
+    macro_rules! push_variant {
+        ($v:expr) => {{
+            let value = $v;
+            if variants.len() >= MAX_DETECTION_VARIANTS
+                || retained_bytes.saturating_add(value.len()) > MAX_DETECTION_VARIANT_BYTES
+            {
+                return variants;
+            }
+            retained_bytes += value.len();
+            variants.push(value);
+        }};
+    }
 
     seen.insert(grep_safe.clone());
-    variants.push(grep_safe.clone());
+    push_variant!(grep_safe.clone());
 
     let mut pending = vec![normalized.clone()];
     while let Some(variant) = pending.pop() {
         for (_, payload) in execution_flag_findings(&variant) {
             if let Some(p) = payload {
                 if seen.insert(p.clone()) {
-                    variants.push(p.clone());
+                    push_variant!(p.clone());
                     let marked_payload = mark_command_starts(&p);
                     if marked_payload != p && seen.insert(marked_payload.clone()) {
-                        variants.push(marked_payload);
+                        push_variant!(marked_payload);
                     }
                     pending.push(p);
                 }
@@ -1026,7 +1048,7 @@ pub fn command_detection_variants(command: &str) -> Vec<String> {
 
     let marked = mark_command_starts(&grep_safe);
     if marked != grep_safe && seen.insert(marked.clone()) {
-        variants.push(marked);
+        push_variant!(marked);
     }
 
     for (word_start, word_end, word) in iter_shell_command_word_spans(&normalized) {
@@ -1036,10 +1058,29 @@ pub fn command_detection_variants(command: &str) -> Vec<String> {
             var.push_str(&deobf);
             var.push_str(&normalized[word_end..]);
             if seen.insert(var.clone()) {
-                variants.push(var);
+                push_variant!(var);
             }
         }
     }
 
     variants
+}
+
+#[cfg(test)]
+mod variant_budget_tests {
+    use super::command_detection_variants;
+
+    #[test]
+    fn pathological_input_cannot_explode_variant_memory() {
+        // ~112 KB of input that passes every public length limit but drives the
+        // variant generator into multi-gigabyte retention.
+        let command = "'true';".repeat(16_000);
+        let variants = command_detection_variants(&command);
+        let retained: usize = variants.iter().map(|v| v.len()).sum();
+        assert!(
+            retained <= 8 * 1024 * 1024,
+            "variant generation must stay within an aggregate byte budget, retained {retained} bytes across {} variants",
+            variants.len()
+        );
+    }
 }

@@ -242,6 +242,22 @@ async fn validate_host_and_origin(
             )
                 .into_response();
         }
+    } else if !request.method().is_safe() {
+        // A state-changing request carrying a foreign Origin is a cross-site request from
+        // a page the operator merely visited; the loopback Host check alone does not stop it.
+        if let Some(origin_str) = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+        {
+            if !is_same_origin(origin_str, host_str) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "cross-origin state-changing request rejected",
+                )
+                    .into_response();
+            }
+        }
     }
 
     next.run(request).await
@@ -1916,7 +1932,14 @@ async fn update_bot(
             "name cannot be empty",
         ));
     }
-    let toolsets_str = payload.enabled_toolsets.map(|ts| ts.join(","));
+    // An omitted optional field must retain the stored value; binding None here would
+    // write SQL NULL and silently erase the bot's configuration on a name-only update.
+    let model = payload.model.or(existing.model);
+    let system_prompt = payload.system_prompt.or(existing.system_prompt);
+    let toolsets_str = payload
+        .enabled_toolsets
+        .map(|ts| ts.join(","))
+        .or(existing.enabled_toolsets);
     let settings_json = payload
         .custom_settings
         .map(|cs| cs.to_string())
@@ -1934,8 +1957,8 @@ async fn update_bot(
          WHERE bot_id = ?",
     )
     .bind(name)
-    .bind(&payload.model)
-    .bind(&payload.system_prompt)
+    .bind(&model)
+    .bind(&system_prompt)
     .bind(&toolsets_str)
     .bind(&settings_json)
     .bind(&now)
@@ -3095,6 +3118,142 @@ mod tests {
         assert!(
             admitted_local,
             "local same-origin WS must be accepted and admit message"
+        );
+    }
+
+    #[tokio::test]
+    async fn bot_update_with_only_name_preserves_other_fields() {
+        let state = test_state().await;
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/bots")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "bot_id": "bot-partial-update",
+                            "name": "original",
+                            "model": "gpt-4o",
+                            "system_prompt": "you are original",
+                            "enabled_toolsets": ["terminal", "file"],
+                            "custom_settings": {"temperature": 1},
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+
+        let update = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/bots/bot-partial-update")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"name": "renamed"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let updated = json_body(update).await;
+
+        assert_eq!(updated["name"], "renamed");
+        assert_eq!(
+            updated["model"], "gpt-4o",
+            "omitted model must retain stored value: {updated}"
+        );
+        assert_eq!(
+            updated["system_prompt"], "you are original",
+            "omitted system_prompt must retain stored value: {updated}"
+        );
+        assert_eq!(
+            updated["enabled_toolsets"],
+            json!(["terminal", "file"]),
+            "omitted enabled_toolsets must retain stored value: {updated}"
+        );
+        assert_eq!(
+            updated["custom_settings"],
+            json!({"temperature": 1}),
+            "omitted custom_settings must retain stored value: {updated}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_state_changing_http_requests_are_rejected() {
+        let state = test_state().await;
+        let app = router(state);
+
+        let body = || {
+            Body::from(
+                json!({"bot_id": "bot-origin-check", "name": "origin-check"}).to_string(),
+            )
+        };
+
+        let cross_origin_post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/bots")
+                    .header(header::HOST, "127.0.0.1:9119")
+                    .header(header::ORIGIN, "http://evil.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cross_origin_post.status(),
+            StatusCode::FORBIDDEN,
+            "POST with a foreign Origin must be rejected"
+        );
+
+        let same_origin_post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/bots")
+                    .header(header::HOST, "127.0.0.1:9119")
+                    .header(header::ORIGIN, "http://127.0.0.1:9119")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            same_origin_post.status(),
+            StatusCode::OK,
+            "POST with a matching Origin must be accepted"
+        );
+
+        let cross_origin_get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/bots")
+                    .header(header::HOST, "127.0.0.1:9119")
+                    .header(header::ORIGIN, "http://evil.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cross_origin_get.status(),
+            StatusCode::OK,
+            "GET with a foreign Origin must still be served"
         );
     }
 

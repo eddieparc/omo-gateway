@@ -184,6 +184,66 @@ pub fn match_user_deny_rule<'a>(command: &str, deny_patterns: &'a [String]) -> O
                 return Some(pattern);
             }
         }
+        // A deny glob names an executable and its arguments. Matching only the whole
+        // variant lets a wrapper prefix (env / sudo / exec / nohup, env assignments)
+        // launder the very command the operator unconditionally denied, so match the
+        // wrapper-stripped executable form as well.
+        for stripped in wrapper_stripped_forms(candidate) {
+            for pattern in &globs {
+                if wildcard_match(pattern, stripped.trim()) {
+                    return Some(pattern);
+                }
+            }
+        }
     }
     None
+}
+
+/// Yields each command-start span of `command` re-rooted at its real executable, i.e.
+/// with wrapper prefixes such as `env`, `sudo`, `exec` and leading `VAR=value`
+/// assignments removed. Returns nothing when there was no prefix to strip.
+fn wrapper_stripped_forms(command: &str) -> Vec<String> {
+    let mut forms = Vec::new();
+    for (start, _, _) in crate::security::normalize::iter_shell_command_word_spans(command) {
+        if start == 0 {
+            continue;
+        }
+        let candidate = command[start..].trim();
+        if !candidate.is_empty() && !forms.iter().any(|f| f == candidate) {
+            forms.push(candidate.to_string());
+        }
+    }
+    forms
+}
+
+#[cfg(test)]
+mod deny_bypass_tests {
+    use super::match_user_deny_rule;
+
+    #[test]
+    fn wrapper_prefixed_commands_still_trip_a_deny_glob() {
+        let deny = vec!["npm publish *".to_string()];
+
+        // Baseline: the bare form is denied today.
+        assert_eq!(
+            match_user_deny_rule("npm publish --access public", &deny),
+            Some("npm publish *"),
+            "bare command must be denied"
+        );
+
+        // Wrapper prefixes must not launder the same command past the operator's deny rule.
+        for wrapped in [
+            "env npm publish --access public",
+            "sudo npm publish --access public",
+            "exec npm publish --access public",
+            "nohup npm publish --access public",
+            "env FOO=bar npm publish --access public",
+        ] {
+            assert_eq!(
+                match_user_deny_rule(wrapped, &deny),
+                Some("npm publish *"),
+                "wrapper-prefixed command must still be denied: {wrapped}"
+            );
+        }
+    }
 }

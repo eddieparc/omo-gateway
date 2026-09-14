@@ -761,6 +761,7 @@ impl CronScheduler {
              (id, session_key, expression, payload_json, enabled, next_run_at, created_at, updated_at)
              VALUES (?, ?, ?, ?, 1, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
+             session_key = excluded.session_key,
              expression = excluded.expression,
              payload_json = excluded.payload_json,
              next_run_at = excluded.next_run_at,
@@ -1670,25 +1671,28 @@ impl CronScheduler {
         };
         let _ = self.notifications.send(notification);
         let profile = job.profile();
-        let mut session = if let Some(key) = &job.session_key {
-            SessionKey::from_storage_key(key).unwrap_or_else(|_| {
-                SessionKey::new(
+        let mut session = job
+            .session_key
+            .as_deref()
+            .and_then(|key| SessionKey::from_storage_key(key).ok())
+            .filter(|parsed| {
+                parsed.channel_id == destination.chat_id
+                    && parsed.thread_id.as_deref() == destination.thread_id.as_deref()
+                    && (destination.bot_id.is_none() || parsed.bot_id == destination.bot_id)
+            })
+            .unwrap_or_else(|| {
+                let session = SessionKey::new(
                     "discord",
                     None::<String>,
                     destination.chat_id.clone(),
                     destination.thread_id.clone(),
                     destination.user_id.clone().unwrap_or_else(|| "cron".into()),
-                )
-            })
-        } else {
-            SessionKey::new(
-                "discord",
-                None::<String>,
-                destination.chat_id.clone(),
-                destination.thread_id.clone(),
-                destination.user_id.clone().unwrap_or_else(|| "cron".into()),
-            )
-        };
+                );
+                match &destination.bot_id {
+                    Some(bot_id) => session.with_bot_id(bot_id.clone()),
+                    None => session,
+                }
+            });
         if session.bot_id.is_none() && !profile.is_empty() {
             session = session.with_bot_id(profile);
         }
@@ -2838,5 +2842,103 @@ mod tests {
         };
         let res_missing = scheduler.complete_success(&fake_claim, None).await;
         assert!(res_missing.is_err(), "missing run must return error");
+    }
+
+    struct RecordingDispatcher {
+        sessions: Arc<Mutex<Vec<SessionKey>>>,
+    }
+
+    #[async_trait]
+    impl OutboundDispatcher for RecordingDispatcher {
+        async fn dispatch(&self, action: OutboundAction) -> Result<()> {
+            if let OutboundAction::SendMessage { session, .. } = action {
+                self.sessions.lock().await.push(session);
+            }
+            Ok(())
+        }
+    }
+
+    async fn insert_session(pool: &SqlitePool, key: &SessionKey) {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO sessions (session_key, platform, channel_id, user_id, state_json, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, '{}', ?, ?)",
+        )
+        .bind(key.storage_key())
+        .bind(&key.platform)
+        .bind(&key.channel_id)
+        .bind(&key.user_id)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fan_out_dispatches_each_destination_to_its_own_channel() {
+        let database = crate::Database::connect("sqlite::memory:").await.unwrap();
+        let pool = database.pool();
+        let stored = SessionKey::new("discord", None::<String>, "111", None::<String>, "cron");
+        insert_session(pool, &stored).await;
+
+        let dispatched = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = CronScheduler::with_dispatcher(
+            pool.clone(),
+            Arc::new(SilentExecutor(Some("Report content".into()))),
+            Arc::new(RecordingDispatcher {
+                sessions: dispatched.clone(),
+            }),
+        );
+
+        let mut spec = CronJobSpec::new(
+            "interval:1m",
+            serde_json::json!({"deliver": "discord:111,discord:222"}),
+        );
+        spec.session_key = Some(stored.storage_key());
+        let job = scheduler.register(spec).await.unwrap();
+
+        scheduler.execute_job(&job).await.unwrap();
+
+        let channels: Vec<String> = dispatched
+            .lock()
+            .await
+            .iter()
+            .map(|session| session.channel_id.clone())
+            .collect();
+        assert_eq!(channels, vec!["111".to_string(), "222".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_register_with_id_updates_session_key_on_conflict() {
+        let database = crate::Database::connect("sqlite::memory:").await.unwrap();
+        let pool = database.pool();
+        let old_session = SessionKey::new("discord", None::<String>, "111", None::<String>, "cron");
+        let new_session = SessionKey::new("discord", None::<String>, "222", None::<String>, "cron");
+        insert_session(pool, &old_session).await;
+        insert_session(pool, &new_session).await;
+
+        let scheduler =
+            CronScheduler::new(pool.clone(), Arc::new(SilentExecutor(Some("done".into()))));
+
+        let mut spec = CronJobSpec::new("interval:1m", serde_json::json!({"channel_id": "111"}));
+        spec.session_key = Some(old_session.storage_key());
+        scheduler
+            .register_with_id("job_reroute", spec)
+            .await
+            .unwrap();
+
+        let mut updated = CronJobSpec::new("interval:1m", serde_json::json!({"channel_id": "222"}));
+        updated.session_key = Some(new_session.storage_key());
+        let job = scheduler
+            .register_with_id("job_reroute", updated)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            job.session_key.as_deref(),
+            Some(new_session.storage_key().as_str()),
+            "re-registering a job with a new session_key must update the stored session_key"
+        );
     }
 }
