@@ -1686,7 +1686,10 @@ impl CronScheduler {
                     None::<String>,
                     destination.chat_id.clone(),
                     destination.thread_id.clone(),
-                    destination.user_id.clone().unwrap_or_else(|| "cron".into()),
+                    destination
+                        .user_id
+                        .clone()
+                        .unwrap_or_else(|| format!("cron:{}", job.id)),
                 );
                 match &destination.bot_id {
                     Some(bot_id) => session.with_bot_id(bot_id.clone()),
@@ -1785,15 +1788,35 @@ pub async fn mirror_cron_delivery_to_session(
     let target_session_key = match target_session_key {
         Some(k) => Some(k),
         None => {
-            crate::mirror::find_session_by_origin(
+            let fallback_user = destination
+                .user_id
+                .clone()
+                .unwrap_or_else(|| format!("cron:{job_id}"));
+            let found = crate::mirror::find_session_by_origin(
                 pool,
                 &destination.platform,
                 &destination.chat_id,
                 destination.thread_id.as_deref(),
-                destination.user_id.as_deref(),
+                Some(&fallback_user),
                 destination.bot_id.as_deref(),
             )
-            .await?
+            .await?;
+            if found.is_some() {
+                found
+            } else {
+                let fallback = SessionKey::new(
+                    &destination.platform,
+                    None::<String>,
+                    destination.chat_id.clone(),
+                    destination.thread_id.clone(),
+                    fallback_user,
+                );
+                let fallback = match &destination.bot_id {
+                    Some(bid) => fallback.with_bot_id(bid.clone()),
+                    None => fallback,
+                };
+                Some(fallback.storage_key())
+            }
         }
     };
 

@@ -147,6 +147,24 @@ pub fn filter_reasoning(text: &str) -> String {
     replaced.trim().to_string()
 }
 
+/// Strips leading OmO Intent Gate routing lines (`> I read this as...`) from text.
+pub fn filter_intent_gate(text: &str) -> String {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with("> I read this as") {
+        return text.to_string();
+    }
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.peek() {
+        let l = line.trim();
+        if l.starts_with('>') || l.is_empty() {
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    lines.collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
 pub fn format_inlined_text(filename: &str, content: &str) -> String {
     format!("\n\n[Content of {filename}]:\n\n{content}")
 }
@@ -565,5 +583,28 @@ mod tests {
             formatted,
             "\n\n[Content of config.toml]:\n\nkey = \"value\"\n"
         );
+    }
+
+    #[test]
+    fn filter_intent_gate_removes_routing_line() {
+        let text = "> I read this as generating a digest - summarize chats. I'll stop when done.\n\n## Summary\n- Topic 1: details";
+        assert_eq!(
+            super::filter_intent_gate(text),
+            "## Summary\n- Topic 1: details"
+        );
+
+        let text_multiline_quote =
+            "> I read this as generating a digest\n> second quote line.\n\n## Summary";
+        assert_eq!(
+            super::filter_intent_gate(text_multiline_quote),
+            "## Summary"
+        );
+
+        let text_only_quote =
+            "> I read this as generating a digest - summarize chats. I'll stop when done.";
+        assert_eq!(super::filter_intent_gate(text_only_quote), "");
+
+        let normal_text = "## Normal output\nWithout intent gate";
+        assert_eq!(super::filter_intent_gate(normal_text), normal_text);
     }
 }

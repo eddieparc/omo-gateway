@@ -22,8 +22,8 @@ use super::omo_protocol::{
     thread_resume_request, thread_start_request, turn_start_request,
 };
 use crate::models::{
-    filter_reasoning, is_explicit_silence, render_user_prompt, InboundEvent, OutboundAction,
-    SessionContext, StreamChunk,
+    filter_intent_gate, filter_reasoning, is_explicit_silence, render_user_prompt, InboundEvent,
+    OutboundAction, SessionContext, StreamChunk,
 };
 use crate::{OmonError, OutboundDispatcher, Result};
 
@@ -33,11 +33,24 @@ type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::Tc
 /// policy-denial loop otherwise burns the entire turn deadline flailing.
 pub const APPROVAL_DENIAL_TURN_LIMIT: u32 = 5;
 
+/// Extra slack beyond a turn's own total deadline before a refusal-guard entry
+/// is presumed dead and a new submission may take its place.
+pub const ACTIVE_TURN_STALE_MARGIN: Duration = Duration::from_secs(600);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveTurn {
     pub thread_id: String,
     /// None means submission may have reached the peer but no start ACK was observed.
     pub turn_id: Option<String>,
+    /// When this submission was recorded, consumed by the stale-entry reclaim.
+    pub inserted_at: tokio::time::Instant,
+}
+
+/// A guard entry older than the turn's total deadline plus the stale margin
+/// cannot be a live turn: the deadline has elapsed, so reclaim the entry
+/// instead of bricking the session until the next gateway restart.
+fn active_turn_entry_is_stale(age: Duration, effective_total_timeout: Duration) -> bool {
+    age > effective_total_timeout + ACTIVE_TURN_STALE_MARGIN
 }
 
 pub struct OmoBackend {
@@ -352,6 +365,30 @@ impl OmoBackend {
                             ))
                         })?;
                 }
+                if is_cron {
+                    let settings_path = omo_dir.join("settings.json");
+                    let mut settings: serde_json::Map<String, Value> =
+                        if tokio::fs::try_exists(&settings_path).await.unwrap_or(false) {
+                            tokio::fs::read_to_string(&settings_path)
+                                .await
+                                .ok()
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default()
+                        } else {
+                            serde_json::Map::new()
+                        };
+                    let disabled = settings
+                        .entry("disabledBuiltinExtensions".to_string())
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                    if let Value::Array(arr) = disabled {
+                        if !arr.iter().any(|v| v.as_str() == Some("ttsr")) {
+                            arr.push(Value::String("ttsr".to_string()));
+                        }
+                    }
+                    if let Ok(content) = serde_json::to_string_pretty(&Value::Object(settings)) {
+                        let _ = tokio::fs::write(&settings_path, content.as_bytes()).await;
+                    }
+                }
                 Some(ws)
             } else {
                 None
@@ -488,6 +525,7 @@ impl OmoBackend {
             .or(self.config.default_model.as_deref());
         // Own the submission before the first socket-write poll. The actor drops
         // this future before cancel(), so ambiguous ownership must outlive it.
+        let submitted_at = tokio::time::Instant::now();
         {
             let mut active_turns = self.active_turns.lock();
             match active_turns.entry(session.key.storage_key()) {
@@ -495,19 +533,38 @@ impl OmoBackend {
                     entry.insert(ActiveTurn {
                         thread_id: thread_id.clone(),
                         turn_id: None,
+                        inserted_at: submitted_at,
                     });
                 }
-                Entry::Occupied(_) => {
-                    return Err(OmonError::Llm(
-                        "previous omo turn outcome is unresolved; refusing another turn/start"
-                            .into(),
-                    ));
+                Entry::Occupied(mut occupied) => {
+                    let age = submitted_at.duration_since(occupied.get().inserted_at);
+                    if !active_turn_entry_is_stale(age, effective_total_timeout) {
+                        return Err(OmonError::Llm(
+                            "previous omo turn outcome is unresolved; refusing another turn/start"
+                                .into(),
+                        ));
+                    }
+                    tracing::warn!(
+                        age_secs = age.as_secs(),
+                        "stale active-turn entry reclaimed; prior turn outcome presumed lost"
+                    );
+                    occupied.insert(ActiveTurn {
+                        thread_id: thread_id.clone(),
+                        turn_id: None,
+                        inserted_at: submitted_at,
+                    });
                 }
             }
         }
-        ws.send(turn_start_request(&thread_id, &user_prompt, model))
+        if let Err(e) = ws
+            .send(turn_start_request(&thread_id, &user_prompt, model))
             .await
-            .map_err(|e| OmonError::Llm(format!("failed to send turn/start: {e}")))?;
+        {
+            // The submission never reached the peer, so ownership ends here and
+            // a retry may proceed without waiting out the stale-entry margin.
+            self.active_turns.lock().remove(&session.key.storage_key());
+            return Err(OmonError::Llm(format!("failed to send turn/start: {e}")));
+        }
 
         let is_cron_session = session.key.user_id.starts_with("cron:")
             || session
@@ -638,7 +695,15 @@ impl OmoBackend {
                             if status == Some("completed")
                                 && (!full_content.is_empty() || total_tool_calls > 0)
                             {
-                                let scrubbed_content = filter_reasoning(&full_content);
+                                if full_content.contains("[output interrupted by stream rule]") {
+                                    return Err(OmonError::Llm(
+                                        "omo turn failed: output interrupted by stream rule".into(),
+                                    ));
+                                }
+                                let mut scrubbed_content = filter_reasoning(&full_content);
+                                if is_cron_session {
+                                    scrubbed_content = filter_intent_gate(&scrubbed_content);
+                                }
                                 if is_explicit_silence(&scrubbed_content) {
                                     if let Some(ack_command) = session
                                         .state
@@ -838,11 +903,17 @@ impl OmoBackend {
                         OmonError::Llm("turn/start acknowledgement missing turn id".into())
                     })?;
                 let turn_id_str = id.to_string();
-                self.active_turns.lock().insert(
+                let mut active_turns = self.active_turns.lock();
+                let inserted_at = active_turns
+                    .get(&session.key.storage_key())
+                    .map(|existing| existing.inserted_at)
+                    .unwrap_or_else(tokio::time::Instant::now);
+                active_turns.insert(
                     session.key.storage_key(),
                     ActiveTurn {
                         thread_id: thread_id.clone(),
                         turn_id: Some(turn_id_str.clone()),
+                        inserted_at,
                     },
                 );
                 turn_id = Some(turn_id_str);
@@ -954,6 +1025,8 @@ impl OmoBackend {
                             let short_name =
                                 tool_name.split_whitespace().next().unwrap_or(tool_name);
                             *tool_call_counts.entry(short_name.to_string()).or_insert(0) += 1;
+                        } else if item_type == "agentMessage" && total_tool_calls > 0 {
+                            full_content.clear();
                         }
                     }
 
@@ -970,17 +1043,25 @@ impl OmoBackend {
                     if let Some(delta) = val.pointer("/params/delta").and_then(Value::as_str) {
                         if !delta.is_empty() {
                             full_content.push_str(delta);
-                            let _ = self
-                                .emit_chunk(
-                                    session,
-                                    stream_id,
-                                    sequence,
-                                    full_content.clone(),
-                                    false,
-                                    reply_to.clone(),
-                                )
-                                .await;
-                            sequence = sequence.saturating_add(1);
+                            let suppress_emission = session
+                                .state
+                                .metadata
+                                .get("cron_suppress_direct_emission")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            if !suppress_emission {
+                                let _ = self
+                                    .emit_chunk(
+                                        session,
+                                        stream_id,
+                                        sequence,
+                                        full_content.clone(),
+                                        false,
+                                        reply_to.clone(),
+                                    )
+                                    .await;
+                                sequence = sequence.saturating_add(1);
+                            }
                         }
                     }
                 }
@@ -1006,7 +1087,17 @@ impl OmoBackend {
                         _ => continue,
                     }
 
-                    let scrubbed_content = filter_reasoning(&full_content);
+                    if full_content.contains("[output interrupted by stream rule]") {
+                        self.active_turns.lock().remove(&session.key.storage_key());
+                        return Err(OmonError::Llm(
+                            "omo turn failed: output interrupted by stream rule".into(),
+                        ));
+                    }
+
+                    let mut scrubbed_content = filter_reasoning(&full_content);
+                    if is_cron_session {
+                        scrubbed_content = filter_intent_gate(&scrubbed_content);
+                    }
                     if is_explicit_silence(&scrubbed_content) {
                         self.active_turns.lock().remove(&session.key.storage_key());
                         if let Some(ack_command) = session
@@ -1393,4 +1484,36 @@ async fn persist_message(pool: &SqlitePool, session: &SessionContext, content: &
     .await
     .map_err(|e| OmonError::Database(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod active_turn_staleness_tests {
+    use std::time::Duration;
+
+    use super::active_turn_entry_is_stale;
+
+    #[test]
+    fn fresh_entry_within_turn_budget_is_not_stale() {
+        // given
+        let budget = Duration::from_secs(1200);
+
+        // when / then
+        assert!(!active_turn_entry_is_stale(Duration::from_secs(0), budget));
+        assert!(!active_turn_entry_is_stale(
+            budget + super::ACTIVE_TURN_STALE_MARGIN - Duration::from_secs(1),
+            budget
+        ));
+    }
+
+    #[test]
+    fn entry_older_than_budget_plus_margin_is_stale() {
+        // given
+        let budget = Duration::from_secs(300);
+
+        // when / then
+        assert!(active_turn_entry_is_stale(
+            budget + super::ACTIVE_TURN_STALE_MARGIN + Duration::from_secs(1),
+            budget
+        ));
+    }
 }
